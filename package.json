@@ -1,0 +1,32 @@
+{
+  "name": "notion-plus-mcp-server",
+  "version": "0.1.0",
+  "description": "Local Notion MCP server with surgical block edits, schema-validated writes, bulk updates, and undo.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "notion-plus-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "test": "tsx --test test/*.test.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "typecheck": "tsc -p tsconfig.check.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@notionhq/client": "^5.26.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "4.23.15",
+    "typescript": "^5.6.0"
+  }
+}

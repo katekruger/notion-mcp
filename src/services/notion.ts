@@ -1,4 +1,4 @@
-import { Client, isNotionClientError, APIErrorCode, RequestTimeoutError } from "@notionhq/client";
+import { Client, isNotionClientError, APIErrorCode, LogLevel, RequestTimeoutError } from "@notionhq/client";
 
 let client: Client | null = null;
 
@@ -15,7 +15,10 @@ export function notion(): Client {
     );
   }
   // The official client retries 429/529 (honoring Retry-After) and, for safe methods, 500/503 with backoff.
-  client = new Client({ auth: token, retry: { maxRetries: 4 }, timeoutMs: REQUEST_TIMEOUT_MS });
+  client = new Client({ auth: token, retry: { maxRetries: 4 }, timeoutMs: REQUEST_TIMEOUT_MS,
+    // Expected misses (e.g. trying an id as a data source before a database) are handled; only log real errors.
+    logLevel: LogLevel.ERROR,
+  });
   return client;
 }
 

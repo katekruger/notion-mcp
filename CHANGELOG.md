@@ -15,6 +15,7 @@ All notable changes to this project are documented here. Versions follow [semver
 ### Changed
 - Oversized results shrink their longest list and stay valid JSON, with a count of omitted items, instead of being cut mid-text.
 - The server reports its version from package.json.
+- The Notion client only logs errors, not the expected not-found fallbacks.
 - README: corrected API limits that Notion has since lifted (status options, views, comment deletion, page moves).
 
 ## 0.1.0

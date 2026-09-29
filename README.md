@@ -15,22 +15,31 @@ A local MCP server for Notion built for precise edits. It changes exactly the bl
 
 ## Setup
 
-**1. Create a Notion integration.** Go to https://www.notion.so/profile/integrations, create an internal integration, enable read, update, and insert content, and copy the secret. To set people properties by name or email, also enable "Read user information including email addresses". Personal access tokens can't look up users at all; with one, pass user ids.
+**1. Create a Notion integration.** Go to https://www.notion.so/profile/integrations, create an internal integration, enable read content, update content, insert content, and (if you want automations to comment) insert comments, then copy the secret. To set people properties by name or email, also enable "Read user information including email addresses". Personal access tokens can't look up users at all; with one, pass user ids.
 
-**2. Share your workspace with it.** In Notion, open each top-level page you want Claude to reach, click `•••` → `Connections`, and add the integration. Everything under a shared page is included.
+**2. Share pages with it.** In Notion, open each top-level page or database you want Claude to reach, click `•••` → `Connections`, and add the integration. Everything under a shared page is included.
 
-**3. Install.**
+**3. Install.** Requires Node 20 or later.
 
 ```bash
 git clone https://github.com/katekruger/notion-mcp.git
 cd notion-mcp
-npm install
+npm ci
 npm run build
 ```
 
-**4. Connect it to Claude.**
+To update later: `git pull && npm ci && npm run build`, then restart Claude (or start a new Claude Code session).
 
-Claude Desktop: open Settings → Developer → Edit Config, and add this to `claude_desktop_config.json` (use the full path to your clone):
+**4. Connect it to Claude.** Use the full path to your clone.
+
+Claude Code:
+
+```bash
+claude mcp add notion-plus --env NOTION_TOKEN=ntn_your_secret_here -- node /ABSOLUTE/PATH/TO/notion-mcp/dist/index.js
+claude mcp list   # notion-plus should show as connected
+```
+
+Claude Desktop: open Settings → Developer → Edit Config, and add this to `claude_desktop_config.json`, then restart Claude Desktop:
 
 ```json
 {
@@ -44,17 +53,11 @@ Claude Desktop: open Settings → Developer → Edit Config, and add this to `cl
 }
 ```
 
-Restart Claude Desktop. The tools appear under the `notion-plus` server.
+Turn off the built-in Notion connector while using this one so Claude doesn't pick between two sets of Notion tools. Keep the token out of the repo: it belongs only in your Claude config (or a local `.env`, which is gitignored).
 
-Claude Code:
+**5. Check it works.** Ask Claude "search Notion for <a page title>". You should see `notion_search` results with ids. To call tools by hand instead, run `NOTION_TOKEN=ntn_... npm run inspect` to open the MCP Inspector.
 
-```bash
-claude mcp add notion-plus --env NOTION_TOKEN=ntn_your_secret_here -- node /ABSOLUTE/PATH/TO/notion-mcp/dist/index.js
-```
-
-Tip: turn off the built-in Notion connector while using this one so Claude doesn't pick between two sets of Notion tools.
-
-**5. Test it (optional).** Run `NOTION_TOKEN=ntn_... npm run inspect` to open the MCP Inspector and call tools by hand.
+**6. Optional: scheduled automations.** See [Automations](#automations) and [GitHub Actions](#github-actions) below.
 
 ## Tools
 
@@ -165,11 +168,29 @@ From Claude, add rules with `notion_automation_add` (it saves to the local rules
 
 ### GitHub Actions
 
-`.github/workflows/automations.yml` runs hourly and has a manual **Run workflow** button with `dry_run` (on by default for manual runs) and `rule` inputs.
+`.github/workflows/automations.yml` runs the rules hourly (at minute 17) from the committed `automations/rules.json`, and has a manual **Run workflow** button with `dry_run` (on by default for manual runs) and `rule` inputs.
 
-1. Create an internal integration for automations and share only the databases your rules touch with it. Enable insert comments if rules comment. A separate token limits what the scheduled job can reach.
-2. In the repo, go to Settings → Secrets and variables → Actions and add `NOTION_TOKEN`.
-3. Each run writes its summary to the job page and uploads the undo journal as an artifact (`notion-plus-journal-<run id>`, kept 90 days). To undo a scheduled run: download the artifact, unzip it to a folder, and run the MCP server or `npm run inspect` with `NOTION_PLUS_HOME` set to that folder, then call `notion_undo` with the id from the job summary.
+**One-time setup**
+
+1. **Make a token for the job.** Create a separate internal integration (step 1 of [Setup](#setup)) and share only the databases your rules touch with it. Enable insert comments if rules comment. This limits what the scheduled job can reach.
+2. **Add it as a repository secret.** Open the repo on GitHub, click the repo's **Settings** tab (the one after Insights, not the Settings in your profile menu), then **Secrets and variables → Actions → New repository secret**. Name it `NOTION_TOKEN` and paste the token. Direct link: `https://github.com/<owner>/notion-mcp/settings/secrets/actions`.
+3. **Test the workflow.** Go to **Actions → Notion automations → Run workflow**, leave "dry run" checked, and run it. A green run with "No enabled rules." in the summary means the token and workflow are working.
+
+**Adding a rule**
+
+1. In Claude, ask for it in plain words, for example: "Add an automation to the Projects database that stamps Completed Date with today when Status is Done and Completed Date is empty." Claude uses `notion_automation_add`, which checks the rule against the live database, shows the rows it would act on, and saves it to your local `automations/rules.json`.
+2. Commit and push `automations/rules.json`.
+3. Run the workflow once by hand with "dry run" checked and read the summary. After that, the hourly runs apply it.
+
+To pause a rule, set `"enabled": false` and push. To stop everything, disable the workflow under **Actions → Notion automations → ••• → Disable workflow**.
+
+**Undoing a scheduled run**
+
+Each run writes its summary (with an undo id per rule) to the run page and uploads the undo journal as an artifact named `notion-plus-journal-<run id>`, kept 90 days. To revert:
+
+1. Download the artifact from the run page and unzip it into a folder.
+2. Run `NOTION_TOKEN=ntn_... NOTION_PLUS_HOME=/path/to/that/folder npm run inspect`, or point your Claude config's `NOTION_PLUS_HOME` at it.
+3. Call `notion_undo` with the undo id from the run summary.
 
 GitHub may start scheduled runs a few minutes late, and turns off schedules in repos with no activity for 60 days.
 

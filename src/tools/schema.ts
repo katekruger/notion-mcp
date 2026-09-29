@@ -155,18 +155,23 @@ export function registerSafetyTools(server: McpServer): void {
       title: "Undo",
       description:
         "Revert a change made through this server. With no id, reverts the most recent change that hasn't been undone. " +
-        "Use notion_history to find ids. Undo restores the snapshot taken at write time, so it will also overwrite any edits " +
-        "made to the same fields afterward; check with the user if time has passed.",
-      inputSchema: { undo_id: z.string().optional() },
+        "Use notion_history to find ids. Undo restores the snapshot taken at write time. Before writing, it checks whether anything it " +
+        "would restore was edited later (by a person or a later change here) and refuses, listing those objects, unless force is true. " +
+        "Edits made within the same minute as the original write can't be detected (Notion rounds edit times to the minute).",
+      inputSchema: {
+        undo_id: z.string().optional(),
+        force: z.boolean().default(false).describe("Overwrite edits made after the original change. Only after confirming with the user."),
+      },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    safe(async ({ undo_id }) => {
-      const r = await undo(undo_id);
+    safe(async ({ undo_id, force }) => {
+      const r = await undo(undo_id, { force });
       return ok({
         undone: r.entry.id,
         summary: r.entry.summary,
         operations_applied: r.applied,
         ...(r.failed.length ? { failed: r.failed } : {}),
+        ...(r.conflicts.length ? { overwrote_later_edits: r.conflicts } : {}),
       });
     })
   );

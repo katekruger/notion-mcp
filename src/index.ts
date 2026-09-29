@@ -6,9 +6,10 @@ import { registerPageTools } from "./tools/pages.js";
 import { registerBlockTools } from "./tools/blocks.js";
 import { registerSafetyTools, registerSchemaTools } from "./tools/schema.js";
 import { registerAutomationTools } from "./tools/automations.js";
+import { VERSION } from "./version.js";
 
 const server = new McpServer(
-  { name: "notion-plus-mcp-server", version: "0.1.0" },
+  { name: "notion-plus-mcp-server", version: VERSION },
   {
     instructions:
       "Local Notion server focused on precise edits. Workflow: find ids with notion_search, read with notion_get_page " +

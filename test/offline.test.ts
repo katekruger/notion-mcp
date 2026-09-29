@@ -1,5 +1,5 @@
 // Offline checks for request-shaping logic. No network: Notion calls go to a fake client.
-import { test } from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import type { Client } from "@notionhq/client";
 import { setClientForTests } from "../src/services/notion.js";

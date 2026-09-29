@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, isNotFound, normalizeId, notion } from "../services/notion.js";
+import { call, read, isNotFound, normalizeId, notion } from "../services/notion.js";
 import { appendSpecs, markdownToSpecs, type BlockSpec } from "../services/blocks.js";
 import { textToTitle } from "../services/richtext.js";
 import {
@@ -178,7 +178,7 @@ export function registerPageTools(server: McpServer): void {
       let cursor: string | null = null;
       let more = false;
       do {
-        const res = await call(() =>
+        const res = await read(() =>
           notion().dataSources.query({
             data_source_id: ds.id,
             filter: combined,

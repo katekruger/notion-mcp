@@ -1,6 +1,6 @@
 import { collectPaginatedAPI, isFullBlock } from "@notionhq/client";
 import type { BlockObjectResponse, RichTextItemResponse } from "@notionhq/client";
-import { call, notion } from "./notion.js";
+import { call, read, notion } from "./notion.js";
 import { forApi, fromInlineMarkdown, plain, toRequest, type RichTextReq } from "./richtext.js";
 
 export const RICH_TEXT_TYPES = new Set([
@@ -47,7 +47,7 @@ export function blockText(block: BlockObjectResponse): string {
 
 export async function listChildren(blockId: string): Promise<BlockObjectResponse[]> {
   const items = await collectPaginatedAPI(
-    (args: { block_id: string; start_cursor?: string }) => call(() => notion().blocks.children.list(args)),
+    (args: { block_id: string; start_cursor?: string }) => read(() => notion().blocks.children.list(args)),
     { block_id: blockId }
   );
   return items.filter(isFullBlock);
@@ -245,6 +245,19 @@ function childrenInline(spec: BlockSpec): boolean {
   return kids.length <= MAX_CHILDREN_PER_REQUEST && kids.every((k) => !k.children?.length);
 }
 
+/** A multi-request write stopped partway. `createdIds` are the top-level blocks that did land. */
+export class PartialWriteError extends Error {
+  constructor(
+    readonly createdIds: string[],
+    readonly cause: unknown
+  ) {
+    super(
+      `Stopped after creating ${createdIds.length} top-level block(s): ${(cause as Error)?.message ?? String(cause)}`
+    );
+    this.name = "PartialWriteError";
+  }
+}
+
 /**
  * Append block specs under a parent, handling Notion's request limits:
  * at most 100 blocks per request and 2 levels of nesting per request.
@@ -256,6 +269,16 @@ export async function appendSpecs(parentId: string, specs: BlockSpec[], position
   const check = (list: BlockSpec[]): void => list.forEach((s) => { specToBlock({ ...s, children: undefined }); check(s.children ?? []); });
   check(specs);
   const createdIds: string[] = [];
+  try {
+    await appendChunks(parentId, specs, position, createdIds);
+  } catch (e) {
+    if (e instanceof PartialWriteError) throw new PartialWriteError(createdIds, e.cause);
+    throw new PartialWriteError(createdIds, e);
+  }
+  return createdIds;
+}
+
+async function appendChunks(parentId: string, specs: BlockSpec[], position: AppendPosition, createdIds: string[]): Promise<void> {
   let anchor = position.type === "after_block" ? position.after_block_id : null;
   for (let i = 0; i < specs.length; i += MAX_CHILDREN_PER_REQUEST) {
     const chunkSpecs = specs.slice(i, i + MAX_CHILDREN_PER_REQUEST);
@@ -269,15 +292,15 @@ export async function appendSpecs(parentId: string, specs: BlockSpec[], position
     // The new blocks come first, in order. With position start/after_block, Notion also returns
     // every existing sibling after them (verified live), so take only as many as we sent.
     const ids = res.results.slice(0, chunkSpecs.length).map((r) => r.id);
+    createdIds.push(...ids);
     if (ids.length !== chunkSpecs.length) {
       throw new Error(`Notion created ${ids.length} of ${chunkSpecs.length} blocks under ${parentId}; stopping so nesting stays correct.`);
     }
-    createdIds.push(...ids);
     anchor = ids[ids.length - 1] ?? anchor;
     for (let j = 0; j < chunkSpecs.length; j++) {
       const s = chunkSpecs[j];
-      if (s.children?.length && !childrenInline(s)) await appendSpecs(ids[j], s.children);
+      // Nested content lives inside ids[j], so trashing that block cleans up a partial nested write too.
+      if (s.children?.length && !childrenInline(s)) await appendChunks(ids[j], s.children, { type: "end" }, []);
     }
   }
-  return createdIds;
 }

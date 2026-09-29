@@ -1,6 +1,6 @@
 import { collectPaginatedAPI, isFullDataSource, isFullUser } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse, UserObjectResponse } from "@notionhq/client";
-import { call, isNotFound, normalizeId, notion } from "./notion.js";
+import { read, isNotFound, normalizeId, notion } from "./notion.js";
 import { forApi, fromInlineMarkdown, plain, toRequest } from "./richtext.js";
 
 export type PropertyConfig = DataSourceObjectResponse["properties"][string];
@@ -20,7 +20,7 @@ export function invalidateSchema(dataSourceId: string): void {
 async function fetchDataSource(id: string): Promise<DataSourceObjectResponse> {
   const hit = cache.get(id);
   if (hit && Date.now() - hit.at < TTL_MS) return hit.ds;
-  const res = await call(() => notion().dataSources.retrieve({ data_source_id: id }));
+  const res = await read(() => notion().dataSources.retrieve({ data_source_id: id }));
   if (!isFullDataSource(res)) throw new Error(`Could not read data source ${id}.`);
   cache.set(id, { at: Date.now(), ds: res });
   return res;
@@ -37,7 +37,7 @@ export async function resolveDataSource(idOrUrl: string, sourceName?: string): P
   } catch (e) {
     if (!isNotFound(e)) throw e;
   }
-  const db = await call(() => notion().databases.retrieve({ database_id: id }));
+  const db = await read(() => notion().databases.retrieve({ database_id: id }));
   const sources = "data_sources" in db ? db.data_sources : [];
   if (sources.length === 0) throw new Error(`Database ${id} has no data sources this integration can see.`);
   let chosen = sources[0];
@@ -97,7 +97,7 @@ async function allUsers(): Promise<UserObjectResponse[]> {
   let users;
   try {
     users = await collectPaginatedAPI(
-      (args: { start_cursor?: string }) => call(() => notion().users.list(args)),
+      (args: { start_cursor?: string }) => read(() => notion().users.list(args)),
       {}
     );
   } catch (e) {
@@ -359,7 +359,7 @@ async function retrieveAllItems(pageId: string, propertyId: string): Promise<unk
   const items: unknown[] = [];
   let cursor: string | undefined;
   do {
-    const res = (await call(() =>
+    const res = (await read(() =>
       notion().pages.properties.retrieve({ page_id: pageId, property_id: propertyId, ...(cursor ? { start_cursor: cursor } : {}) })
     )) as unknown as { object: string; results?: Record<string, unknown>[]; has_more?: boolean; next_cursor?: string | null };
     if (res.object !== "list" || !res.results) return items;

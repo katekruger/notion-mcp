@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client";
-import { call, normalizeId, notion } from "../services/notion.js";
+import { read, normalizeId, notion } from "../services/notion.js";
 import { flatten, getTree, renderTree } from "../services/blocks.js";
 import { buildPattern, plain } from "../services/richtext.js";
 import {
@@ -37,7 +37,7 @@ export function registerReadTools(server: McpServer): void {
       annotations: READ,
     },
     safe(async ({ query, type, limit }) => {
-      const res = await call(() =>
+      const res = await read(() =>
         notion().search({
           query,
           page_size: limit,
@@ -76,7 +76,7 @@ export function registerReadTools(server: McpServer): void {
     },
     safe(async ({ page, include_content, max_depth, max_blocks }) => {
       const id = normalizeId(page);
-      const p = await call(() => notion().pages.retrieve({ page_id: id }));
+      const p = await read(() => notion().pages.retrieve({ page_id: id }));
       if (!isFullPage(p)) throw new Error("Could not read that page.");
       const header = {
         id: p.id,
@@ -197,7 +197,7 @@ export function registerReadTools(server: McpServer): void {
       let first = true;
       while ((first || next) && rows.length < limit) {
         first = false;
-        const res = await call(() =>
+        const res = await read(() =>
           notion().dataSources.query({
             data_source_id: ds.id,
             page_size: Math.min(100, limit - rows.length),

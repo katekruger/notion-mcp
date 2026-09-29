@@ -1,6 +1,6 @@
-// Live smoke test: runs every tool handler against a real Notion workspace.
+// Live integration suite: runs every tool handler against a real Notion workspace.
 //
-//   NOTION_TOKEN=ntn_... NOTION_TEST_PAGE=<page url or id> npm run smoke
+//   NOTION_TOKEN=ntn_... NOTION_TEST_PAGE=<page url or id> npm run test:live
 //   (or put both in .env)
 //
 // Everything is created inside a fresh pair of databases under NOTION_TEST_PAGE and
@@ -64,11 +64,12 @@ async function must(name: string, args: Record<string, unknown>): Promise<Json> 
 
 const results: { step: string; ok: boolean; detail: string }[] = [];
 const touched = new Set<string>();
-async function step(name: string, fn: () => Promise<string | void>): Promise<void> {
+async function step(name: string, fn: () => Promise<unknown>): Promise<void> {
   touched.add(name.split(":")[0]);
   const started = Date.now();
   try {
-    const detail = (await fn()) ?? "";
+    const out = await fn();
+    const detail = typeof out === "string" ? out : "";
     results.push({ step: name, ok: true, detail });
     console.log(`  ok    ${name} (${Date.now() - started} ms)${detail ? ` - ${detail}` : ""}`);
   } catch (e) {
@@ -305,6 +306,21 @@ async function main(): Promise<void> {
     expect(r.isError && /edited at/.test(r.text), r.text);
   });
 
+  await step("notion_undo: refuses to overwrite a later edit, then force overwrites it", async () => {
+    const r = await must("notion_update_properties", { page: rowA, properties: { Points: 7 } });
+    // Notion reports edit times to the minute, so the outside edit must land in a later minute to be visible.
+    const wait = 61_000 - (Date.now() % 60_000);
+    await new Promise((res) => setTimeout(res, wait));
+    await call(() => n.pages.update({ page_id: rowA, properties: { Points: { number: 8 } } } as never));
+    const refused = await tool("notion_undo", { undo_id: r.undo_id });
+    expect(refused.isError && /Nothing was undone/.test(refused.text), refused.text);
+    expect((await prop(rowA, "Points")) === 8, "refused undo still wrote");
+    const forced = await must("notion_undo", { undo_id: r.undo_id, force: true });
+    expect(forced.overwrote_later_edits?.length === 1, JSON.stringify(forced));
+    expect((await prop(rowA, "Points")) === 1200, "forced undo did not restore Points");
+    return `waited ${Math.round(wait / 1000)}s for the next minute`;
+  });
+
   if (hasStatus) {
     await step("notion_bulk_update: dry_run, apply, undo", async () => {
       const dry = await must("notion_bulk_update", { database: main.db, where: { Status: "Not started" }, set: { Status: "In progress" } });
@@ -517,7 +533,8 @@ async function main(): Promise<void> {
       expect((await prop(rowA, "Automated")) === false, "marker not reverted");
       const t = (await call(() => n.pages.retrieve({ page_id: trashRow }))) as unknown as Json;
       expect(t.in_trash === false, "trashed row not restored");
-      return "comments stay (the API can't delete them); the journal says so";
+      const comments = (await call(() => n.comments.list({ block_id: rowB }))).results as Json[];
+      expect(!comments.some((c) => c.rich_text.map((x: Json) => x.plain_text).join("").includes("Closed by automation")), "automation comment not deleted");
     });
   }
 

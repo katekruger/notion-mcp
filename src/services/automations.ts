@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { z } from "zod";
-import { call, notion } from "./notion.js";
-import { appendSpecs, markdownToSpecs, type BlockSpec } from "./blocks.js";
+import { call, read, notion } from "./notion.js";
+import { appendSpecs, markdownToSpecs, PartialWriteError, type BlockSpec } from "./blocks.js";
 import { forApi, fromInlineMarkdown, plain } from "./richtext.js";
 import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyName, simplify, withFullProperties } from "./schema.js";
 import { record, type UndoOp } from "./journal.js";
@@ -310,7 +310,7 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
   const pages: PageObjectResponse[] = [];
   let cursor: string | null = null;
   do {
-    const res = await call(() =>
+    const res = await read(() =>
       notion().dataSources.query({
         data_source_id: ds.id,
         filter,
@@ -327,7 +327,6 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
   const targets = pages.slice(0, rule.limit);
 
   const undo: UndoOp[] = [];
-  let commented = 0;
   // Order within a row: property writes, content, comment, then trash last so earlier actions can still reach it.
   const ordered = [...rule.actions].sort((a, b) => rank(a) - rank(b));
   const markerName = rule.marker ? resolvePropertyName(ds, rule.marker).name : null;
@@ -357,12 +356,18 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
         if ("append" in a) {
           const content = render(a.append, ctx);
           const specs = typeof content === "string" ? markdownToSpecs(content) : content;
-          const ids = await appendSpecs(page.id, specs);
+          let ids: string[];
+          try {
+            ids = await appendSpecs(page.id, specs);
+          } catch (e) {
+            if (e instanceof PartialWriteError) undo.push(...e.createdIds.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true }) as UndoOp));
+            throw e;
+          }
           undo.push(...ids.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true }) as UndoOp));
         } else if ("comment" in a) {
           const text = render(a.comment, ctx);
-          await call(() => notion().comments.create({ parent: { page_id: page.id }, rich_text: forApi(fromInlineMarkdown(text)) } as never));
-          commented++;
+          const c = await call(() => notion().comments.create({ parent: { page_id: page.id }, rich_text: forApi(fromInlineMarkdown(text)) } as never));
+          undo.push({ kind: "comment_delete", comment_id: c.id });
         } else if ("trash" in a) {
           await call(() => notion().pages.update({ page_id: page.id, in_trash: true } as never));
           undo.push({ kind: "page_trash", page_id: page.id, in_trash: false });
@@ -375,13 +380,8 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
     }
   }
 
-  if (!opts.dryRun && (undo.length || commented)) {
-    result.undo_id = await record(
-      "automations",
-      `Rule "${rule.id}" acted on ${result.acted} rows in "${result.database}"`,
-      undo,
-      commented ? `${commented} comments can't be removed through the API; delete them in Notion if needed` : undefined
-    );
+  if (!opts.dryRun && undo.length) {
+    result.undo_id = await record("automations", `Rule "${rule.id}" acted on ${result.acted} rows in "${result.database}"`, undo);
   }
   return result;
 }

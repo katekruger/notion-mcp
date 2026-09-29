@@ -88,21 +88,21 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 
 **Safety**
 - `notion_history`: recent changes and their undo ids.
-- `notion_undo`: revert a change.
+- `notion_undo`: revert a change. Refuses if anything it would restore was edited afterward, and lists what; pass `force: true` to overwrite.
 
 **Automations** (see below)
 - `notion_automation_list`: show the rules.
 - `notion_automation_add`: check a rule against the live schema, save it, and preview what it would do.
 - `notion_automation_dry_run`: show what each rule would change right now. Never writes.
 
-The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time, so it will also overwrite later edits to the same fields. Undoing `notion_update_options` deletes the added options, which also clears them from any rows that used them since.
+The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing `notion_update_options` deletes the added options, which also clears them from any rows that used them since.
 
 ## Known Notion API limits
 
 - A block's type can't be changed in place; insert a new block and delete the old one.
-- Blocks can't be moved; insert a copy where you want it and delete the original.
-- Status options and Notion's built-in database automations can't be created or edited through the API.
-- Synced blocks, AI blocks, and some embeds are read-only.
+- Blocks can't be moved; insert a copy where you want it and delete the original. (Pages can be moved; a tool for both is planned.)
+- Notion's built-in database automations can't be created or edited through the API. Button blocks, AI blocks, and some embeds are read-only (the API returns them as `unsupported`).
+- Status options can now be added through the API; `notion_update_options` doesn't do it yet (planned). Views, including chart views, are also supported by the API and planned here.
 - Last-edited times are rounded to the minute, so the freshness check catches edits made in an earlier minute.
 - Select option names and colors can't be changed through the API. Renames are accepted and silently ignored; color changes are rejected. Rename options in Notion, or add a new option, move rows with `notion_bulk_update`, and delete the old option in Notion.
 - Leaving an option out of a schema update deletes it and clears it from every row.
@@ -112,6 +112,9 @@ The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; s
 - New databases take a few seconds to appear in `notion_search`.
 - Notion merges adjacent text segments with identical formatting when you read them back, and normalizes link URLs (for example adding a trailing `/`).
 - Undoing a large insert trashes blocks one request at a time (about 3 per second).
+- A comment can only be deleted by the integration that created it, so undo can remove comments this server added, but nothing else.
+- Requests time out after 30 seconds (`NOTION_TIMEOUT_MS`). Reads are retried after timeouts and dropped connections; writes are not, since the first attempt may have landed. Notion's 429 and 5xx responses are retried by the client, honoring `Retry-After`.
+- Results are capped at 25,000 characters. Long lists are shortened (with a count of what was left out) so the result stays valid JSON; narrow the request to see the rest.
 
 ## Automations
 
@@ -162,7 +165,7 @@ npm run automations -- --rule stamp-completed
 npm run automations                         # apply
 ```
 
-One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it. Comments can't be deleted through the API; undo leaves them.
+One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it, including deleting the comments it added.
 
 From Claude, add rules with `notion_automation_add` (it saves to the local rules file); commit `automations/rules.json` so the scheduled workflow picks them up.
 
@@ -197,13 +200,24 @@ GitHub may start scheduled runs a few minutes late, and turns off schedules in r
 ## Development
 
 ```bash
-npm test            # offline unit tests (no network)
+npm test            # offline unit tests with vitest (no network)
+npm run lint        # ESLint (typescript-eslint strict)
 npm run typecheck   # src, scripts, and tests
-npm run smoke       # live test against a real workspace
+npm run check       # all of the above plus the build; CI runs this on every push
+npm run test:live   # live integration suite against a real workspace
 ```
 
-`npm run smoke` needs `NOTION_TOKEN` and `NOTION_TEST_PAGE` (a page shared with the integration), from the environment or a local `.env` file (gitignored). It creates two throwaway databases under that page, runs every tool including dry runs and `notion_undo` for each write type, then moves them to the trash. It never writes outside the test page, and its undo journal goes to a temp folder. Set `SMOKE_KEEP=1` to keep the databases for inspection.
+`npm run test:live` (also `npm run smoke`) needs `NOTION_TOKEN` and `NOTION_TEST_PAGE` (a page shared with the integration), from the environment or a local `.env` file (gitignored). It creates two throwaway databases under that page, runs every tool including dry runs and `notion_undo` for each write type, then moves them to the trash. It never writes outside the test page, and its undo journal goes to a temp folder. Set `SMOKE_KEEP=1` to keep the databases for inspection.
+
+Versions follow semver; see [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 
-- Page templates, comments, and move/copy helpers.
+Built in phases, each ending with the build, unit tests, and the live suite passing:
+
+1. Foundations: tests, lint, CI, timeouts, partial-failure reporting, safer undo. (done, 0.2.0)
+2. Content: every creatable block type, rich text colors and mentions, markdown round trip, move/copy/duplicate, icons, covers, templates, comments.
+3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create.
+4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages.
+5. Automations: schedules, run state, more actions, full management from Claude.
+6. Distribution: MCP Bundle, tool evaluations, acceptance tests.

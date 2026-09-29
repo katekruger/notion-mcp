@@ -1,7 +1,7 @@
 // Property-write helpers shared by the page tools and the automations runner.
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, notion } from "./notion.js";
+import { read, notion } from "./notion.js";
 import { coerceValue, resolvePropertyName, restoreValue, simplify } from "./schema.js";
 import type { UndoOp } from "./journal.js";
 
@@ -32,7 +32,7 @@ export async function preparePayload(
 
 /** Retrieve a page, failing clearly on partial responses. */
 export async function getFullPage(id: string): Promise<PageObjectResponse> {
-  const p = await call(() => notion().pages.retrieve({ page_id: id }));
+  const p = await read(() => notion().pages.retrieve({ page_id: id }));
   if (!isFullPage(p)) throw new Error(`Could not read page ${id}.`);
   return p;
 }

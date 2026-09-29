@@ -1,6 +1,6 @@
 {
   "name": "notion-plus-mcp-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local Notion MCP server with surgical block edits, schema-validated writes, bulk updates, and undo.",
   "type": "module",
   "main": "dist/index.js",
@@ -12,10 +12,14 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "test": "tsx --test test/*.test.ts",
+    "test": "vitest run",
     "smoke": "tsx scripts/smoke.ts",
     "typecheck": "tsc -p tsconfig.check.json",
-    "automations": "node dist/automations-cli.js"
+    "automations": "node dist/automations-cli.js",
+    "test:watch": "vitest",
+    "test:live": "tsx scripts/smoke.ts",
+    "lint": "eslint .",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "engines": {
     "node": ">=20"
@@ -26,8 +30,12 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.0.0",
+    "eslint": "^9.39.5",
     "tsx": "4.23.15",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^3.2.7"
   }
 }

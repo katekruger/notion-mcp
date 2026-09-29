@@ -1,5 +1,5 @@
 // Offline checks for the automations engine: rules validation, templates, conditions, self-clearing.
-import { test } from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";

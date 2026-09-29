@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullBlock } from "@notionhq/client";
 import type { BlockObjectResponse } from "@notionhq/client";
-import { call, normalizeId, notion } from "../services/notion.js";
+import { call, read, normalizeId, notion } from "../services/notion.js";
 import {
   blockText,
   currentSegments,
@@ -13,14 +13,15 @@ import {
   restorePayload,
   RICH_TEXT_TYPES,
   appendSpecs,
+  PartialWriteError,
 } from "../services/blocks.js";
 import { buildPattern, forApi, fromInlineMarkdown, replaceInRichText, segmentText } from "../services/richtext.js";
 import { record, type UndoOp } from "../services/journal.js";
 import { blockSpecSchema, checkFresh } from "./pages.js";
-import { DESTRUCTIVE, ok, safe, WRITE } from "./util.js";
+import { DESTRUCTIVE, fail, ok, safe, WRITE } from "./util.js";
 
 async function getBlock(id: string): Promise<BlockObjectResponse> {
-  const b = await call(() => notion().blocks.retrieve({ block_id: id }));
+  const b = await read(() => notion().blocks.retrieve({ block_id: id }));
   if (!isFullBlock(b)) throw new Error(`Could not read block ${id}.`);
   return b;
 }
@@ -96,13 +97,27 @@ export function registerBlockTools(server: McpServer): void {
       if (specs.length === 0) throw new Error("Provide markdown or blocks to insert.");
       if (position === "after_block" && !after_block_id) throw new Error("position=after_block needs after_block_id.");
       const parentId = normalizeId(parent);
-      const createdIds = await appendSpecs(
-        parentId,
-        specs,
-        position === "after_block"
-          ? { type: "after_block", after_block_id: normalizeId(after_block_id as string) }
-          : { type: position }
-      );
+      let createdIds: string[];
+      try {
+        createdIds = await appendSpecs(
+          parentId,
+          specs,
+          position === "after_block"
+            ? { type: "after_block", after_block_id: normalizeId(after_block_id as string) }
+            : { type: position }
+        );
+      } catch (e) {
+        if (!(e instanceof PartialWriteError) || e.createdIds.length === 0) throw e instanceof PartialWriteError ? e.cause : e;
+        const undoId = await record(
+          "notion_insert_blocks",
+          `Partial insert: ${e.createdIds.length} of ${specs.length} blocks into ${parentId}`,
+          e.createdIds.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true }) as UndoOp)
+        );
+        return fail(
+          `${e.message}. ${e.createdIds.length} of ${specs.length} top-level blocks were written (ids: ${e.createdIds.join(", ")}). ` +
+            `notion_undo ${undoId} removes them; or insert the rest after_block ${e.createdIds[e.createdIds.length - 1]}.`
+        );
+      }
       const journalId = await record(
         "notion_insert_blocks",
         `Inserted ${createdIds.length} blocks into ${parentId}`,

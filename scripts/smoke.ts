@@ -26,6 +26,7 @@ const { registerBlockTools } = await import("../src/tools/blocks.js");
 const { registerSafetyTools, registerSchemaTools } = await import("../src/tools/schema.js");
 const { registerAutomationTools } = await import("../src/tools/automations.js");
 const { registerContentTools } = await import("../src/tools/content.js");
+const { registerDatabaseTools } = await import("../src/tools/database.js");
 const { runAll } = await import("../src/services/automations.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -37,7 +38,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerSafetyTools, registerAutomationTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerSafetyTools, registerAutomationTools]) {
   register(registry as never);
 }
 
@@ -440,14 +441,14 @@ async function main(): Promise<void> {
   });
 
   // ---------- schema writes + undo ----------
-  await step("notion_add_property: add then undo", async () => {
-    const r = await must("notion_add_property", { database: main.db, name: "Extra", type: "number" });
+  await step("notion_schema add: add then undo", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add", definition: { name: "Extra", type: "number" } });
     await must("notion_undo", { undo_id: r.undo_id });
     const s = await must("notion_get_schema", { database: main.db });
     expect(!s.properties.some((p: Json) => p.name === "Extra"), "Extra still present");
   });
-  await step("notion_update_options: add keeps rows; undo removes only the added option", async () => {
-    const r = await must("notion_update_options", { database: main.db, property: "Priority", add: ["Medium"] });
+  await step("notion_schema add_options: add keeps rows; undo removes only the added option", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add_options", property: "Priority", options: ["Medium"] });
     expect((await prop(rowA, "Priority")) === "High", "row A lost its option after adding one");
     await must("notion_update_properties", { page: rowB, properties: { Priority: "Medium" } });
     await must("notion_undo", { undo_id: r.undo_id });
@@ -457,9 +458,9 @@ async function main(): Promise<void> {
     expect((await prop(rowA, "Priority")) === "High", "row A lost High after undo");
     return `row B (was Medium) now: ${JSON.stringify(await prop(rowB, "Priority"))}`;
   });
-  await step("notion_update_options: rename is refused clearly, nothing changes", async () => {
-    const r = await tool("notion_update_options", { database: main.db, property: "Priority", rename: [{ from: "high", to: "Urgent" }] });
-    expect(r.isError && /can't rename/.test(r.text), r.text);
+  await step("notion_schema add_options: an existing option (any case) changes nothing", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add_options", property: "Priority", options: ["high"] });
+    expect(r.added.length === 0 && !r.undo_id, JSON.stringify(r));
     expect((await prop(rowA, "Priority")) === "High", "row A changed");
   });
   await step("notion_insert_blocks: after_block undo leaves later siblings alone", async () => {
@@ -471,8 +472,8 @@ async function main(): Promise<void> {
     const after = (await call(() => n.blocks.children.list({ block_id: rowA }))).results.length;
     expect(after === before, `page had ${before} top-level blocks, now ${after}`);
   });
-  await step("notion_rename_property: rename then undo", async () => {
-    const r = await must("notion_rename_property", { database: main.db, from: "points", to: "Score" });
+  await step("notion_schema rename: rename then undo", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "rename", property: "points", to: "Score" });
     expect((await prop(rowA, "Score")) === 1200, "renamed property missing");
     await must("notion_undo", { undo_id: r.undo_id });
     expect((await prop(rowA, "Points")) === 1200, "rename not undone");
@@ -761,6 +762,182 @@ async function main(): Promise<void> {
   await step("notion_list_templates: a database without templates says so", async () => {
     const r = await tool("notion_list_templates", { database: main.db });
     expect(!r.isError && /no templates|templates/.test(r.text), r.text);
+  });
+
+  // ---------- phase 3: databases ----------
+  let clients = { db: "", ds: "" };
+  let tracker = { db: "", ds: "" };
+  await step("notion_create_database: Clients, then a tracker with every property kind", async () => {
+    const c = await must("notion_create_database", {
+      parent: pageId, title: `${stamp} Clients`, icon: "🏢",
+      properties: [{ name: "Client", type: "title" }, { name: "Tier", type: "select", options: ["Gold", "Silver"] }],
+    });
+    clients = { db: c.database_id, ds: c.data_source_id };
+    createdDatabases.push(c.database_id);
+    const r = await must("notion_create_database", {
+      parent: pageId, title: `${stamp} Tracker`,
+      properties: [
+        { name: "Task", type: "title" },
+        { name: "Status", type: "status", options: ["Backlog", "In Progress", "At Risk", "Done"] },
+        { name: "Owner", type: "people" },
+        { name: "Due", type: "date" },
+        { name: "Completed Date", type: "date" },
+        { name: "Priority", type: "select", options: [{ name: "High", color: "red" }, { name: "Medium", color: "yellow" }, { name: "Low", color: "gray" }] },
+        { name: "Client", type: "relation", relation: { database: clients.db, two_way: true, related_name: "Projects" } },
+        { name: "Client tier", type: "rollup", rollup: { relation: "Client", property: "Tier", function: "show_original" } },
+        { name: "Estimate", type: "number", number_format: "dollar", description: "Budget" },
+        { name: "Double", type: "formula", formula: 'prop("Estimate") * 2' },
+        { name: "Parent", type: "relation", relation: { database: "self" } },
+        { name: "ID", type: "unique_id", prefix: "PRJ" },
+        { name: "Files", type: "files" },
+        { name: "Where", type: "place" },
+      ],
+    });
+    tracker = { db: r.database_id, ds: r.data_source_id };
+    createdDatabases.push(r.database_id);
+    const names = r.properties.map((p: Json) => p.name);
+    for (const want of ["Status", "Client", "Client tier", "Parent", "ID", "Where", "Double"]) expect(names.includes(want), `missing ${want}: ${names}`);
+    const status = r.properties.find((p: Json) => p.name === "Status");
+    const complete = status.groups.find((g: Json) => g.name === "Complete").options;
+    expect(complete.includes("Done"), `Done not in Complete: ${JSON.stringify(status.groups)}`);
+    const cs = await must("notion_get_schema", { database: clients.db });
+    expect(cs.properties.some((p: Json) => p.name === "Projects"), `two-way relation missing on Clients: ${JSON.stringify(cs.properties.map((p: Json) => [p.name, p.type]))}`);
+    return r.notes?.join(" ") ?? "";
+  });
+  await step("notion_bulk_create: invalid rows are all reported, nothing written", async () => {
+    const r = await must("notion_bulk_create", {
+      database: tracker.db, dry_run: false,
+      rows: [{ Task: "ok", Status: "Done" }, { Task: "bad", Status: "Nope" }, { Task: "bad2", Estimate: "lots", Client: "No Such Client" }],
+    });
+    expect(r.invalid === 2 && r.errors.length === 2 && !r.created, JSON.stringify(r));
+    expect(r.errors.some((e: Json) => e.error.includes('no row titled "No Such Client"')), JSON.stringify(r.errors));
+    const q = await must("notion_query", { database: tracker.db });
+    expect(q.count === 0, `${q.count} rows written`);
+  });
+  let bulkUndo = "";
+  await step("notion_bulk_create: 3 clients from CSV, 15 tasks from JSON with relations by title", async () => {
+    const c = await must("notion_bulk_create", { database: clients.db, csv: 'Client,Tier\nAcme,Gold\n"Globex, Inc",Silver\nInitech,\n', dry_run: false });
+    expect(c.created === 3, JSON.stringify(c));
+    const owners = person ? [person.id] : [];
+    const statuses = ["Backlog", "In Progress", "At Risk", "Done", "Done"];
+    const rows = Array.from({ length: 15 }, (_, i) => ({
+      Task: `Task ${i + 1}`,
+      Status: statuses[i % 5],
+      Priority: ["High", "Medium", "Low"][i % 3],
+      Due: `2026-${String(9 + (i % 3)).padStart(2, "0")}-${String(10 + i).padStart(2, "0")}`,
+      Estimate: (i + 1) * 100,
+      Client: ["Acme", "Globex, Inc", "Initech"][i % 3],
+      ...(owners.length ? { Owner: owners } : {}),
+    }));
+    const dry = await must("notion_bulk_create", { database: tracker.db, rows });
+    expect(dry.dry_run && dry.rows === 15, JSON.stringify(dry));
+    const r = await must("notion_bulk_create", { database: tracker.db, rows, dry_run: false });
+    expect(r.created === 15, JSON.stringify(r));
+    bulkUndo = r.undo_id;
+    const q = await must("notion_query", { database: tracker.db, where: { Client: "Acme" }, properties: ["Task", "Client tier", "ID"] });
+    expect(q.count === 5, `Acme has ${q.count} tasks`);
+    expect(JSON.stringify(q.rows[0]["Client tier"]).includes("Gold"), `rollup read: ${JSON.stringify(q.rows[0])}`);
+    expect(/^PRJ-\d+$/.test(q.rows[0].ID), `unique id: ${q.rows[0].ID}`);
+  });
+  await step("notion_query: operators, in, or, relative dates", async () => {
+    const a = await must("notion_query", { database: tracker.db, where: { Estimate: { ">": 500, "<=": 1000 } } });
+    expect(a.count === 5, `estimate range: ${a.count}`);
+    const b = await must("notion_query", { database: tracker.db, where: { Status: { in: ["Done", "At Risk"] } } });
+    expect(b.count === 9, `status in: ${b.count}`);
+    const c = await must("notion_query", { database: tracker.db, where: { or: [{ Priority: "High" }, { Task: { contains: "15" } }] } });
+    expect(c.count === 6, `or: ${c.count}`);
+    const d = await must("notion_query", { database: tracker.db, where: { Due: { before: "2026-10-01" }, Status: { "!=": "Done" } } });
+    expect(d.count >= 1, `before: ${d.count}`);
+    const e = await must("notion_query", { database: tracker.db, where: { "$created": { after: "-1d" } } });
+    expect(e.count === 15, `created recently: ${e.count}`);
+  });
+  await step("notion_aggregate: counts by status, sums by client, month buckets", async () => {
+    const a = await must("notion_aggregate", { database: tracker.db, group_by: "Status" });
+    expect(a.totals.count === 15, JSON.stringify(a.totals));
+    const done = a.groups.find((g: Json) => g.key === "Done");
+    expect(done?.count === 6, JSON.stringify(a.groups));
+    const b = await must("notion_aggregate", { database: tracker.db, group_by: "Client", metrics: ["count", "sum:Estimate", "avg:Estimate"] });
+    const acme = b.groups.find((g: Json) => g.key === "Acme");
+    expect(acme?.count === 5 && acme.sum_Estimate === 100 + 400 + 700 + 1000 + 1300, JSON.stringify(b.groups));
+    const c = await must("notion_aggregate", { database: tracker.db, group_by: { property: "Due", by: "month" }, where: { Status: { "!=": "Done" } } });
+    expect(c.groups.length === 3 && c.totals.count === 9, JSON.stringify(c));
+    return `status: ${a.groups.map((g: Json) => `${g.key}=${g.count}`).join(", ")}`;
+  });
+  await step("notion_bulk_update: per-row values, dry run, apply, undo", async () => {
+    const q = await must("notion_query", { database: tracker.db, where: { Priority: "High" }, properties: ["Task"] });
+    const rows = q.rows.map((r: Json, i: number) => ({ page: r.id, set: { Estimate: 9000 + i, Where: { lat: 40.7, lon: -74, name: "NYC" } } }));
+    const dry = await must("notion_bulk_update", { rows });
+    expect(dry.dry_run && dry.matched === rows.length && dry.rows[0].will_set, JSON.stringify(dry).slice(0, 300));
+    const r = await must("notion_bulk_update", { rows, dry_run: false });
+    expect(r.updated === rows.length, JSON.stringify(r));
+    const check = await must("notion_query", { database: tracker.db, where: { Estimate: { ">=": 9000 } } });
+    expect(check.count === rows.length, `${check.count} updated`);
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = await must("notion_query", { database: tracker.db, where: { Estimate: { ">=": 9000 } } });
+    expect(after.count === 0, `${after.count} not reverted`);
+  });
+  await step("files and place properties: write, read, undo", async () => {
+    const q = await must("notion_query", { database: tracker.db, where: { Task: "Task 1" } });
+    const id = q.rows[0].id;
+    const txt = path.join(os.tmpdir(), `${stamp}.txt`);
+    writeFileSync(txt, "hello");
+    const r = await must("notion_update_properties", { page: id, properties: { Files: [txt, { name: "spec", url: "https://example.com/spec.pdf" }], Where: { lat: 51.5, lon: -0.12, name: "London" } } });
+    const files = await prop(id, "Files");
+    expect(JSON.stringify(files) === JSON.stringify([`${stamp}.txt`, "spec"]), JSON.stringify(files));
+    expect((await prop(id, "Where") as Json)?.name === "London", "place missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect(JSON.stringify(await prop(id, "Files")) === "[]" && (await prop(id, "Where")) === null, "files/place not reverted");
+  });
+  await step("notion_schema: status option with group, number format, description", async () => {
+    const a = await must("notion_schema", { database: tracker.db, action: "add_options", property: "Status", options: [{ name: "Blocked", group: "In progress" }, "Shipped"] });
+    const s = await must("notion_get_schema", { database: tracker.db });
+    const groups = s.properties.find((p: Json) => p.name === "Status").groups;
+    expect(groups.find((g: Json) => g.name === "In progress").options.includes("Blocked"), JSON.stringify(groups));
+    expect(groups.find((g: Json) => g.name === "Complete").options.includes("Shipped"), JSON.stringify(groups));
+    const b = await must("notion_schema", { database: tracker.db, action: "set_number_format", property: "Estimate", number_format: "euro" });
+    const c = await must("notion_schema", { database: tracker.db, action: "set_description", property: "Priority", description: "How urgent" });
+    for (const u of [c, b, a]) await must("notion_undo", { undo_id: u.undo_id });
+    const s2 = await must("notion_get_schema", { database: tracker.db });
+    const st = s2.properties.find((p: Json) => p.name === "Status").options;
+    expect(!st.includes("Blocked") && st.includes("Done"), `status after undo: ${st}`);
+    expect(s2.properties.find((p: Json) => p.name === "Estimate").format === "dollar", "format not restored");
+    const pr = await must("notion_get_schema", { database: tracker.db });
+    expect(pr.properties.find((p: Json) => p.name === "Priority").options.length === 3, "priority options changed by description edit");
+  });
+  await step("notion_schema delete: dry run counts values; undo re-creates the property and its values", async () => {
+    const dry = await must("notion_schema", { database: tracker.db, action: "delete", property: "Priority" });
+    expect(dry.dry_run && dry.rows_with_values === "15", JSON.stringify(dry));
+    const r = await must("notion_schema", { database: tracker.db, action: "delete", property: "Priority", dry_run: false });
+    expect(r.values_saved_for_undo === 15, JSON.stringify(r));
+    const s = await must("notion_get_schema", { database: tracker.db });
+    expect(!s.properties.some((p: Json) => p.name === "Priority"), "not deleted");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const agg = await must("notion_aggregate", { database: tracker.db, group_by: "Priority" });
+    expect(JSON.stringify(agg.groups.map((g: Json) => [g.key, g.count]).sort()) === JSON.stringify([["High", 5], ["Low", 5], ["Medium", 5]]), JSON.stringify(agg.groups));
+  });
+  if (process.env.SMOKE_LARGE) {
+    await step("large: 300 rows created, bulk-updated with dry run, and undone as one batch", async () => {
+      const rows = Array.from({ length: 300 }, (_, i) => ({ Task: `Bulk ${i + 1}`, Status: "Backlog", Estimate: i }));
+      const created = await must("notion_bulk_create", { database: tracker.db, rows, dry_run: false });
+      expect(created.created === 300, JSON.stringify(created));
+      const dry = await must("notion_bulk_update", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, set: { Status: "In Progress" }, limit: 500 });
+      expect(dry.matched === 300, `dry run matched ${dry.matched}`);
+      const t0 = Date.now();
+      const r = await must("notion_bulk_update", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, set: { Status: "In Progress" }, limit: 500, dry_run: false });
+      expect(r.updated === 300, JSON.stringify(r));
+      const t1 = Date.now();
+      await must("notion_undo", { undo_id: r.undo_id });
+      const t2 = Date.now();
+      const agg = await must("notion_aggregate", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, group_by: "Status" });
+      expect(agg.groups.length === 1 && agg.groups[0].key === "Backlog" && agg.groups[0].count === 300, JSON.stringify(agg.groups));
+      await must("notion_undo", { undo_id: created.undo_id });
+      return `update ${Math.round((t1 - t0) / 1000)}s, undo ${Math.round((t2 - t1) / 1000)}s`;
+    });
+  }
+  await step("notion_bulk_create: undo trashes every created row", async () => {
+    await must("notion_undo", { undo_id: bulkUndo });
+    const q = await must("notion_query", { database: tracker.db });
+    expect(q.count === 0, `${q.count} rows left`);
   });
 
   // ---------- page trash + undo ----------

@@ -2,7 +2,7 @@
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { read, notion } from "./notion.js";
-import { coerceValue, resolvePropertyName, restoreValue, simplify } from "./schema.js";
+import { coerceValue, pageDataSourceId, resolvePropertyName, restoreValue, simplify } from "./schema.js";
 import type { UndoOp } from "./journal.js";
 
 /** Validate friendly values against the schema; reports every problem at once. */
@@ -49,5 +49,6 @@ export function snapshot(page: PageObjectResponse, names: string[]): UndoOp {
     const v = restoreValue(page.properties[n]);
     if (v) properties[n] = v;
   }
-  return { kind: "page_properties", page_id: page.id, properties };
+  const dsId = pageDataSourceId(page);
+  return { kind: "page_properties", page_id: page.id, properties, ...(dsId ? { data_source_id: dsId } : {}) };
 }

@@ -1,6 +1,7 @@
 import { collectPaginatedAPI, isFullDataSource, isFullUser } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse, UserObjectResponse } from "@notionhq/client";
 import { read, isNotFound, normalizeId, notion } from "./notion.js";
+import { isUrl, uploadLocalFile } from "./files.js";
 import { forApi, fromInlineMarkdown, pendingUserLookups, plain, toRequest, USER_LOOKUP } from "./richtext.js";
 
 export type PropertyConfig = DataSourceObjectResponse["properties"][string];
@@ -154,9 +155,42 @@ const READ_ONLY = new Set([
   "last_edited_time",
   "last_edited_by",
   "unique_id",
-  "verification",
   "button",
 ]);
+
+const UUID = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+
+/** Relation values may be page ids/URLs or titles of rows in the related database. Titles must match exactly one row. */
+const relationTitleCache = new Map<string, { at: number; id: string }>();
+
+async function resolveRelationValue(propName: string, dataSourceId: string, v: string): Promise<string> {
+  const s = v.trim();
+  if (UUID.test(s) || /notion\.(so|site|com)\//.test(s)) return normalizeId(s);
+  const key = `${dataSourceId}|${s}`;
+  const hit = relationTitleCache.get(key);
+  if (hit && Date.now() - hit.at < TTL_MS) return hit.id;
+  const target = await fetchDataSource(dataSourceId);
+  const titleName = Object.values(target.properties).find((p) => p.type === "title")?.name;
+  if (!titleName) throw new Error(`"${propName}": the related database has no title property, so use page ids.`);
+  const res = await read(() =>
+    notion().dataSources.query({ data_source_id: dataSourceId, filter: { property: titleName, title: { equals: s } }, page_size: 2, result_type: "page" } as never)
+  );
+  if (res.results.length === 1) {
+    relationTitleCache.set(key, { at: Date.now(), id: res.results[0].id });
+    return res.results[0].id;
+  }
+  throw new Error(
+    res.results.length === 0
+      ? `"${propName}": no row titled "${s}" in "${dataSourceTitle(target)}". Create it first or pass a page id.`
+      : `"${propName}": several rows in "${dataSourceTitle(target)}" are titled "${s}"; pass the page id instead.`
+  );
+}
+
+interface FileInput {
+  name?: string;
+  url?: string;
+  path?: string;
+}
 
 function toList(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
@@ -201,6 +235,23 @@ export async function coerceValue(
   if (READ_ONLY.has(t)) throw new Error(`"${propName}" is a ${t} property and is computed by Notion; it can't be set.`);
   const isEmpty = value === null || value === "" || (Array.isArray(value) && value.length === 0);
 
+  if ((t as string) === "place") {
+    if (isEmpty) return { payload: { place: null }, notes };
+    const p = value as { lat?: unknown; lon?: unknown; name?: unknown; address?: unknown };
+    if (typeof p !== "object" || typeof p.lat !== "number" || typeof p.lon !== "number") {
+      throw new Error(`"${propName}" is a place; pass {"lat": 40.7, "lon": -74.0, "name": "…", "address": "…"}.`);
+    }
+    return {
+      payload: { place: { lat: p.lat, lon: p.lon, ...(p.name ? { name: String(p.name) } : {}), ...(p.address ? { address: String(p.address) } : {}) } },
+      notes,
+    };
+  }
+  if ((t as string) === "verification") {
+    const state = typeof value === "object" && value ? (value as { state?: string }).state : String(value ?? "unverified");
+    if (state !== "verified" && state !== "unverified") throw new Error(`"${propName}": use "verified" or "unverified".`);
+    const date = typeof value === "object" && value ? (value as { date?: unknown }).date : undefined;
+    return { payload: { verification: state === "verified" ? { state, ...(date ? { date } : {}) } : { state } }, notes };
+  }
   switch (t) {
     case "title":
     case "rich_text": {
@@ -270,10 +321,32 @@ export async function coerceValue(
     }
     case "relation": {
       if (isEmpty) return { payload: { relation: [] }, notes };
-      const list = toList(value);
+      // "a, b" is two ids only when every part is an id or link; otherwise it's one title that contains a comma.
+      const parts = typeof value === "string" ? toList(value) : [];
+      const list = typeof value === "string" && !parts.every((x) => UUID.test(String(x)) || /notion\.(so|site|com)\//.test(String(x))) ? [value] : toList(value);
       checkReferenceCount(propName, "relations", list.length);
-      const ids = list.map((v) => ({ id: normalizeId(String(v)) }));
+      const ids: { id: string }[] = [];
+      for (const v of list) {
+        const id = await resolveRelationValue(propName, config.relation.data_source_id, String(v));
+        if (!UUID.test(String(v).trim())) notes.push(`"${String(v)}" matched row ${id} in "${propName}"`);
+        ids.push({ id });
+      }
       return { payload: { relation: ids }, notes };
+    }
+    case "files": {
+      if (isEmpty) return { payload: { files: [] }, notes };
+      const list = (Array.isArray(value) ? value : [value]) as (string | FileInput)[];
+      checkReferenceCount(propName, "files", list.length);
+      const files: Record<string, unknown>[] = [];
+      for (const item of list) {
+        const f: FileInput = typeof item === "string" ? (isUrl(item) ? { url: item } : { path: item }) : item;
+        const src = f.url ?? f.path;
+        if (!src) throw new Error(`"${propName}": each file needs a URL or local path (got ${JSON.stringify(item)}).`);
+        const name = (f.name ?? decodeURIComponent(src.split("?")[0].split(/[\\/]/).pop() || "file")).slice(0, 100);
+        if (isUrl(src)) files.push({ name, external: { url: src } });
+        else files.push({ name, file_upload: { id: await uploadLocalFile(src, name) } });
+      }
+      return { payload: { files }, notes };
     }
     default:
       throw new Error(`Setting "${t}" properties isn't supported yet ("${propName}").`);
@@ -305,11 +378,22 @@ export function simplify(prop: PageProperty): unknown {
     }
     case "rollup": {
       const r = v as Record<string, unknown> & { type: string };
-      if (r.type === "array") return `(rollup: ${(r.array as unknown[]).length} items)`;
+      if (r.type === "array") {
+        const items = (r.array as PageProperty[]).map((item) => simplify(item));
+        const flat = items.flat().filter((x) => x !== null && x !== "");
+        return flat.length > 25 ? [...flat.slice(0, 25), `…and ${flat.length - 25} more`] : flat;
+      }
+      if (r.type === "date") return r.date ? ((r.date as { end?: string | null }).end ? r.date : (r.date as { start: string }).start) : null;
       return r[r.type] ?? null;
     }
     case "files":
       return (v as { name: string }[]).map((f) => f.name);
+    case "place": {
+      const pl = v as { lat: number; lon: number; name?: string | null; address?: string | null } | null;
+      return pl ? { ...(pl.name ? { name: pl.name } : {}), ...(pl.address ? { address: pl.address } : {}), lat: pl.lat, lon: pl.lon } : null;
+    }
+    case "verification":
+      return v ? (v as { state: string }).state : null;
     case "created_by":
     case "last_edited_by":
       return (v as { name?: string; id: string }).name ?? (v as { id: string }).id;
@@ -352,6 +436,17 @@ export function restoreValue(prop: PageProperty): Record<string, unknown> | null
     case "people":
     case "relation":
       return { [p.type]: (v as { id: string }[]).map((x) => ({ id: x.id })) };
+    case "files":
+      // Notion-hosted files can be sent back by their (signed) URL (verified live).
+      return {
+        files: (v as { name: string; type: string; external?: { url: string }; file?: { url: string } }[]).map((f) =>
+          f.type === "external" ? { name: f.name, external: { url: f.external?.url } } : { name: f.name, file: { url: f.file?.url } }
+        ),
+      };
+    case "place": {
+      const pl = v as { lat: number; lon: number; name?: string | null; address?: string | null } | null;
+      return { place: pl ? { lat: pl.lat, lon: pl.lon, ...(pl.name ? { name: pl.name } : {}), ...(pl.address ? { address: pl.address } : {}) } : null };
+    }
     default:
       return null;
   }
@@ -394,64 +489,175 @@ export async function withFullProperties(page: PageObjectResponse, names: string
   return { ...page, properties };
 }
 
-/** Build a Notion filter from simple {Property: value} equality pairs. */
+/** YYYY-MM-DD in the configured zone (NOTION_PLUS_TIMEZONE, else the system zone). */
+function localDate(d: Date): string {
+  const tz = process.env.NOTION_PLUS_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+
+/** "today", "tomorrow", "yesterday", "+7d", "-2w", "+1m" → YYYY-MM-DD; anything else is returned as-is. */
+export function resolveRelativeDate(v: string, now = new Date()): string {
+  const s = v.trim().toLowerCase();
+  const day = 86_400_000;
+  if (s === "today" || s === "now") return localDate(now);
+  if (s === "tomorrow") return localDate(new Date(now.getTime() + day));
+  if (s === "yesterday") return localDate(new Date(now.getTime() - day));
+  const m = s.match(/^([+-])(\d+)\s*(d|day|days|w|week|weeks|m|month|months|y|year|years)$/);
+  if (!m) return v;
+  const n = Number(m[2]) * (m[1] === "-" ? -1 : 1);
+  const unit = m[3][0];
+  if (unit === "d") return localDate(new Date(now.getTime() + n * day));
+  if (unit === "w") return localDate(new Date(now.getTime() + n * 7 * day));
+  const d = new Date(now);
+  if (unit === "m") d.setMonth(d.getMonth() + n);
+  else d.setFullYear(d.getFullYear() + n);
+  return localDate(d);
+}
+
+const OP_ALIASES: Record<string, string> = {
+  "=": "equals", "==": "equals", is: "equals", eq: "equals",
+  "!=": "does_not_equal", not: "does_not_equal", ne: "does_not_equal", is_not: "does_not_equal",
+  ">": "greater_than", gt: "greater_than", ">=": "greater_than_or_equal_to", gte: "greater_than_or_equal_to",
+  "<": "less_than", lt: "less_than", "<=": "less_than_or_equal_to", lte: "less_than_or_equal_to",
+  not_contains: "does_not_contain",
+};
+
+const DATE_OPS: Record<string, string> = {
+  equals: "equals", greater_than: "after", less_than: "before", greater_than_or_equal_to: "on_or_after",
+  less_than_or_equal_to: "on_or_before", before: "before", after: "after", on_or_before: "on_or_before", on_or_after: "on_or_after",
+};
+const DATE_RANGES = ["past_week", "past_month", "past_year", "next_week", "next_month", "next_year", "this_week"];
+
+function isOpObject(v: unknown): v is Record<string, unknown> {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+  const keys = Object.keys(v);
+  return keys.length > 0 && keys.every((k) => k in OP_ALIASES || /^[a-z_]+$/.test(k)) && !("lat" in v) && !("start" in v);
+}
+
+/** One clause for `name` of type `t`: operator (already normalized) and value. */
+async function clause(ds: DataSourceObjectResponse, name: string, op: string, value: unknown): Promise<Record<string, unknown>> {
+  const config = ds.properties[name];
+  const t = config.type as string;
+  const wrap = (key: string, cond: Record<string, unknown>) =>
+    key === "created_time" || key === "last_edited_time" ? { timestamp: key, [key]: cond } : { property: name, [key]: cond };
+  if (op === "is_empty" || op === "is_not_empty") {
+    const empty = op === "is_empty" ? value !== false : value === false;
+    return wrap(t, { [empty ? "is_empty" : "is_not_empty"]: true });
+  }
+  const bad = (ops: string) => new Error(`"${name}" (${t}) supports: ${ops}. Got "${op}".`);
+  switch (t) {
+    case "title":
+    case "rich_text":
+    case "url":
+    case "email":
+    case "phone_number": {
+      const ok = ["equals", "does_not_equal", "contains", "does_not_contain", "starts_with", "ends_with"];
+      if (!ok.includes(op)) throw bad(ok.join(", "));
+      return wrap(t, { [op]: String(value) });
+    }
+    case "number":
+    case "unique_id": {
+      const ok = ["equals", "does_not_equal", "greater_than", "less_than", "greater_than_or_equal_to", "less_than_or_equal_to"];
+      if (!ok.includes(op)) throw bad(`=, !=, >, >=, <, <=`);
+      const num = typeof value === "number" ? value : Number(String(value).replace(/^[A-Za-z]+-/, "").replace(/[,$%\s]/g, ""));
+      if (!Number.isFinite(num)) throw new Error(`"${name}": "${String(value)}" isn't a number.`);
+      return wrap(t, { [op]: num });
+    }
+    case "checkbox": {
+      if (op !== "equals" && op !== "does_not_equal") throw bad("=, !=");
+      const c = await coerceValue(name, config, value, false);
+      return wrap(t, { [op]: c.payload.checkbox });
+    }
+    case "select":
+    case "status": {
+      if (op !== "equals" && op !== "does_not_equal") throw bad("=, !=, in, is_empty");
+      const c = await coerceValue(name, config, value, false);
+      return wrap(t, { [op]: (c.payload[t] as { name: string }).name });
+    }
+    case "multi_select": {
+      if (op !== "contains" && op !== "does_not_contain" && op !== "equals") throw bad("contains, does_not_contain, is_empty");
+      const c = await coerceValue(name, config, value, false);
+      const names = (c.payload.multi_select as { name: string }[]).map((o) => o.name);
+      const key = op === "does_not_contain" ? "does_not_contain" : "contains";
+      return names.length === 1 ? wrap(t, { [key]: names[0] }) : { and: names.map((n) => wrap(t, { [key]: n })) };
+    }
+    case "people":
+    case "relation": {
+      if (op !== "contains" && op !== "does_not_contain" && op !== "equals") throw bad("contains, does_not_contain, is_empty");
+      const c = await coerceValue(name, config, value, false);
+      const ids = (c.payload[t] as { id: string }[]).map((o) => o.id);
+      const key = op === "does_not_contain" ? "does_not_contain" : "contains";
+      return ids.length === 1 ? wrap(t, { [key]: ids[0] }) : { and: ids.map((id) => wrap(t, { [key]: id })) };
+    }
+    case "date":
+    case "created_time":
+    case "last_edited_time": {
+      if (DATE_RANGES.includes(op)) return wrap(t, { [op]: {} });
+      const mapped = DATE_OPS[op];
+      if (!mapped) throw bad(`=, before/<, after/>, on_or_before/<=, on_or_after/>=, ${DATE_RANGES.join(", ")}, is_empty`);
+      const d = resolveRelativeDate(String(value));
+      if (Number.isNaN(Date.parse(d))) throw new Error(`"${name}": "${String(value)}" isn't a date. Use YYYY-MM-DD, "today", or "+7d".`);
+      return wrap(t, { [mapped]: d });
+    }
+    default:
+      throw new Error(`"where" doesn't support ${t} properties ("${name}"); use a raw Notion \`filter\` instead.`);
+  }
+}
+
+/**
+ * Build a Notion filter from a friendly `where`:
+ * - {"Status": "Done"} equality (names and options matched forgivingly), null for empty
+ * - {"Due": {"before": "today"}}, {"Points": {">": 5, "<=": 10}}, {"Tags": {"contains": "Q4"}}, {"Owner": {"is_empty": true}}
+ * - {"Status": {"in": ["Done", "Blocked"]}}, {"Due": "past_week"} style ranges via {"Due": {"past_week": true}}
+ * - {"or": [{…}, {…}]}, {"and": [...]}, and "$created" / "$last_edited" for timestamps
+ * Relative dates: "today", "tomorrow", "yesterday", "+7d", "-2w", "+1m".
+ */
 export async function buildWhereFilter(
   ds: DataSourceObjectResponse,
   where: Record<string, unknown>
 ): Promise<Record<string, unknown> | undefined> {
   const clauses: Record<string, unknown>[] = [];
   for (const [rawName, value] of Object.entries(where)) {
-    const { name } = resolvePropertyName(ds, rawName);
-    const config = ds.properties[name];
-    const t = config.type;
-    const empty = value === null || value === "";
-    if (empty) {
-      clauses.push({ property: name, [t]: { is_empty: true } });
+    if (rawName === "or" || rawName === "and") {
+      if (!Array.isArray(value) || value.length === 0) throw new Error(`"${rawName}" takes a non-empty list of conditions.`);
+      const parts: Record<string, unknown>[] = [];
+      for (const w of value) {
+        const f = await buildWhereFilter(ds, w as Record<string, unknown>);
+        if (f) parts.push(f);
+      }
+      clauses.push(parts.length === 1 ? parts[0] : { [rawName]: parts });
       continue;
     }
-    switch (t) {
-      case "title":
-      case "rich_text":
-      case "url":
-      case "email":
-      case "phone_number":
-        clauses.push({ property: name, [t]: { equals: String(value) } });
-        break;
-      case "number":
-        clauses.push({ property: name, number: { equals: Number(value) } });
-        break;
-      case "checkbox": {
-        const c = await coerceValue(name, config, value, false);
-        clauses.push({ property: name, checkbox: { equals: c.payload.checkbox } });
-        break;
-      }
-      case "select":
-      case "status": {
-        const c = await coerceValue(name, config, value, false);
-        clauses.push({ property: name, [t]: { equals: (c.payload[t] as { name: string }).name } });
-        break;
-      }
-      case "multi_select": {
-        const c = await coerceValue(name, config, value, false);
-        for (const o of c.payload.multi_select as { name: string }[]) {
-          clauses.push({ property: name, multi_select: { contains: o.name } });
+    const name =
+      rawName === "$created" || rawName === "$last_edited"
+        ? rawName
+        : resolvePropertyName(ds, rawName).name;
+    const tsType = name === "$created" ? "created_time" : name === "$last_edited" ? "last_edited_time" : null;
+    const target = tsType
+      ? { ...ds, properties: { ...ds.properties, [name]: { id: name, name, type: tsType, [tsType]: {} } } } as unknown as DataSourceObjectResponse
+      : ds;
+    const conds: Record<string, unknown>[] = [];
+    if (value === null || value === "") {
+      conds.push(await clause(target, name, "is_empty", true));
+    } else if (isOpObject(value)) {
+      for (const [rawOp, v] of Object.entries(value)) {
+        const op = OP_ALIASES[rawOp] ?? rawOp;
+        if (op === "in" || op === "not_in") {
+          if (!Array.isArray(v) || v.length === 0) throw new Error(`"${name}": "${op}" takes a non-empty list.`);
+          const parts = await Promise.all(v.map((x) => clause(target, name, op === "in" ? "equals" : "does_not_equal", x)));
+          conds.push(parts.length === 1 ? parts[0] : { [op === "in" ? "or" : "and"]: parts });
+        } else if (DATE_RANGES.includes(op) && v === true) {
+          conds.push(await clause(target, name, op, true));
+        } else {
+          conds.push(await clause(target, name, op, v));
         }
-        break;
       }
-      case "date":
-        clauses.push({ property: name, date: { equals: String(value) } });
-        break;
-      case "people": {
-        const c = await coerceValue(name, config, value, false);
-        for (const u of c.payload.people as { id: string }[]) clauses.push({ property: name, people: { contains: u.id } });
-        break;
-      }
-      case "relation":
-        for (const v of toList(value)) clauses.push({ property: name, relation: { contains: normalizeId(String(v)) } });
-        break;
-      default:
-        throw new Error(`"where" doesn't support ${t} properties ("${name}"); use a raw Notion filter instead.`);
+    } else {
+      const t = target.properties[name].type as string;
+      const op = t === "multi_select" || t === "people" || t === "relation" ? "contains" : "equals";
+      conds.push(await clause(target, name, op, value));
     }
+    clauses.push(...conds);
   }
   if (clauses.length === 0) return undefined;
   return clauses.length === 1 ? clauses[0] : { and: clauses };

@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.4.0
+
+### Added
+- `notion_create_database`: full schema in one call, including status options with groups, number formats, formulas, one- and two-way relations (also to the same database), rollups, unique IDs, files, and places.
+- `notion_schema`: add, rename, and delete properties (delete previews affected rows and saves up to 2000 rows' values for undo), add select/multi-select/status options with status groups, change number formats and descriptions.
+- `notion_aggregate`: count, count_values, count_empty, distinct, sum, avg, min, max, median, checked, percent_checked, grouped by any property or date bucket.
+- `notion_bulk_create`: up to 1000 rows from JSON or CSV, every row validated first, dry run by default.
+- `notion_bulk_update` `rows` mode: different values per row.
+- `where` operators everywhere: comparisons, `in`, `contains`, `starts_with`, `is_empty`, date ranges, nested `or`/`and`, relative dates, and `$created` / `$last_edited`.
+- Property writes: files (URLs or local files), place, verification; relations by related row title.
+- Rollup arrays read as their values; places read as name and coordinates.
+
+### Changed
+- `notion_add_property`, `notion_update_options`, and `notion_rename_property` are replaced by `notion_schema`.
+- Undo checks rows of a database for later edits with one query instead of one read per row.
+- Schema undo no longer runs the edit check (a data source's edit time moves with every schema change).
+- Bulk create, bulk update, and undo keep three requests in flight (still within Notion's rate limit): 300 rows update in about 110 seconds instead of 375.
+- Undoing a created page no longer checks for later edits; the trashed page keeps them and can be restored from Notion's trash.
+- Relation values with commas are read as one title unless every part is a page id or link.
+
 ## 0.3.0
 
 ### Added

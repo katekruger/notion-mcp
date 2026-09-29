@@ -59,7 +59,7 @@ test("undoTarget: restores and comment deletes can't clobber newer edits; trashi
   assert.equal(undoTarget({ kind: "comment_delete", comment_id: "c" }), null);
   assert.equal(undoTarget({ kind: "block_trash", block_id: "b", in_trash: false }), null);
   assert.deepEqual(undoTarget({ kind: "block_trash", block_id: "b", in_trash: true }), { kind: "block", id: "b" });
-  assert.deepEqual(undoTarget({ kind: "schema", data_source_id: "d", properties: {} }), { kind: "data_source", id: "d" });
+  assert.equal(undoTarget({ kind: "schema", data_source_id: "d", properties: {} }), null);
 });
 
 test("appendSpecs reports which top-level blocks landed when a later request fails", async () => {
@@ -103,4 +103,19 @@ test("fitToLimit leaves small results alone and cuts long strings with a hint", 
   assert.equal(fitToLimit({ a: 1 }), JSON.stringify({ a: 1 }, null, 2));
   const cut = fitToLimit("y".repeat(CHARACTER_LIMIT + 10));
   assert.match(cut, /Truncated/);
+});
+
+test("mapLimited keeps order and never runs more than the limit at once", async () => {
+  const { mapLimited } = await import("../src/services/notion.js");
+  let active = 0;
+  let peak = 0;
+  const out = await mapLimited([5, 1, 4, 2, 3], async (x) => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((r) => setTimeout(r, x * 5));
+    active--;
+    return x * 10;
+  }, 3);
+  assert.deepEqual(out, [50, 10, 40, 20, 30]);
+  assert.equal(peak, 3);
 });

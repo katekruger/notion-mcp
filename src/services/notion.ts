@@ -77,6 +77,26 @@ export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Pro
   }
 }
 
+/** Requests in flight at once for bulk work. Starts are still spaced by the rate limiter above. */
+export const BULK_CONCURRENCY = 3;
+
+/**
+ * Run `fn` over items with a few requests in flight, so bulk jobs are bound by Notion's rate limit rather than
+ * by each request's latency. Results keep the input order.
+ */
+export async function mapLimited<T, R>(items: T[], fn: (item: T, index: number) => Promise<R>, limit = BULK_CONCURRENCY): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 /** Shorthand for reads, which are always safe to retry. */
 export function read<T>(fn: () => Promise<T>): Promise<T> {
   return call(fn, { idempotent: true });

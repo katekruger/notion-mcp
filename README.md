@@ -67,7 +67,8 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 - `notion_get_blocks`: read one section of a large page.
 - `notion_find_blocks`: locate blocks by text or regex.
 - `notion_get_schema`: property types, options, status groups, relations.
-- `notion_query`: rows via simple `where` pairs or raw Notion filters.
+- `notion_query`: rows via `where` (equality, operators, `in`, `or`/`and`, relative dates) or raw Notion filters.
+- `notion_aggregate`: counts, sums, averages, and more, grouped by any property or date bucket, without pulling rows into context.
 
 **Write content**
 - `notion_patch_block`: edit one block's text, checkbox, code language or caption, color, toggle heading, callout icon, or a table row's cells.
@@ -85,13 +86,13 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 **Write data**
 - `notion_update_properties`: set row fields with validation.
 - `notion_create_page`: new row or sub-page with content, an icon and cover, or from a database template.
-- `notion_bulk_update`: change every matching row (dry run by default).
+- `notion_bulk_update`: set values on every matching row, or different values per row (dry run by default, up to 500 rows).
+- `notion_bulk_create`: add up to 1000 rows from JSON or CSV (dry run by default; every row validated first).
 - `notion_trash_page`: trash a page.
 
-**Schema**
-- `notion_add_property`: add a column.
-- `notion_update_options`: add select or multi-select options. (Renaming options isn't possible through the API; see limits.)
-- `notion_rename_property`: rename a column.
+**Databases**
+- `notion_create_database`: a database with its full schema in one call: options (status options with groups), number formats, formulas, one- or two-way relations (including to itself), rollups, unique IDs, files, places.
+- `notion_schema`: add, rename, or delete a property (delete previews first and undo restores the values), add select/multi-select/status options, change number formats and descriptions.
 
 **Safety**
 - `notion_history`: recent changes and their undo ids.
@@ -127,7 +128,29 @@ Inline: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `<u>underline</u>`, 
 
 These are the same tags Notion's markdown export uses, so `notion_get_page` with `format: "markdown"` returns markdown you can edit and insert back; the live test suite checks that a full page survives the round trip line for line. Local files can be uploaded from the working directory and the temp folder; set `NOTION_PLUS_UPLOAD_DIRS` (separated by `:`, or `;` on Windows) to allow other folders.
 
-The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing `notion_update_options` deletes the added options, which also clears them from any rows that used them since.
+The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
+
+### Queries and aggregation
+
+`where` in `notion_query`, `notion_aggregate`, `notion_bulk_update`, and automation rules accepts:
+
+```json
+{
+  "Status": {"in": ["Done", "At Risk"]},
+  "Due": {"before": "today"},
+  "Estimate": {">": 500, "<=": 1000},
+  "Tags": "Q4",
+  "Owner": null,
+  "or": [{"Priority": "High"}, {"Task": {"contains": "urgent"}}],
+  "$last_edited": {"after": "-7d"}
+}
+```
+
+Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not_contains`, `starts_with`, `ends_with`, `in`, `not_in`, `is_empty`, `before`, `after`, `on_or_before`, `on_or_after`, and date ranges such as `past_week` or `next_month`. Dates accept `today`, `tomorrow`, `yesterday`, and offsets like `+7d`, `-2w`, `+1m` (in `NOTION_PLUS_TIMEZONE`, default the system zone). Property names and option values are matched forgivingly and checked against the schema.
+
+`notion_aggregate` takes `group_by` (a property, or `{"property": "Due", "by": "month"}`) and `metrics` such as `["count", "sum:Estimate", "avg:Estimate"]`. Rows with several values (multi-select, people, relations) count once in each of their groups, and relation groups show the related rows' titles. It scans up to 10,000 rows by default (`max_rows`, up to 50,000).
+
+Relation values in writes can be page ids, links, or the related row's exact title.
 
 ## Known Notion API limits
 
@@ -137,10 +160,13 @@ The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; s
 - Button blocks can't be created or read through the API. Breadcrumbs, bookmarks, and links to pages don't appear in Notion's markdown export; this server fills them in. Code captions aren't in the markdown export either.
 - A heading 4 can't be updated without resending its text; `notion_patch_block` handles that.
 - Notion's built-in database automations can't be created or edited through the API. Button blocks, AI blocks, and some embeds are read-only (the API returns them as `unsupported`).
-- Status options can now be added through the API; `notion_update_options` doesn't do it yet (planned). Views, including chart views, are also supported by the API and planned here.
+- Status options can be added, each in a group (To-do, In progress, Complete). Options sent without a group all land in To-do, so this server guesses the group from the option name ("Done" → Complete) and says so. Views, including chart views, are supported by the API and planned here.
 - Last-edited times are rounded to the minute, so the freshness check catches edits made in an earlier minute.
-- Select option names and colors can't be changed through the API. Renames are accepted and silently ignored; color changes are rejected. Rename options in Notion, or add a new option, move rows with `notion_bulk_update`, and delete the old option in Notion.
-- Leaving an option out of a schema update deletes it and clears it from every row.
+- Select and status option names and colors can't be changed through the API. Renames are accepted and silently ignored; color changes are rejected. Rename options in Notion, or add a new option, move rows with `notion_bulk_update`, and delete the old option in Notion.
+- Leaving an option out of a schema update deletes it and clears it from every row, so this server always sends the full list.
+- Verification properties can only be created in wikis; in a regular database Notion skips them without an error (`notion_create_database` reports it).
+- There's no aggregation endpoint; `notion_aggregate` reads the matching rows and summarizes them on your machine (about 100 rows per request). Rows with more than 25 relations or people are counted by their first 25.
+- Deleting a property deletes its values. `notion_schema` saves up to 2000 rows' values first so undo can put them back; a re-created unique ID renumbers rows, and a re-created two-way relation re-creates its other side.
 - One write can carry at most 100 relations or people, and at most 100 rich text segments per block or property (each segment up to 2000 characters). This server splits long text into segments and returns a clear error past those limits instead of truncating.
 - `blocks.children.append` accepts 2 levels of nesting per request; deeper content is added in follow-up requests automatically.
 - Page reads include at most 25 items of a title, rich text, relation, or people value. Undo snapshots and before/after previews re-read the full value, so nothing is lost; `notion_get_page` and bulk dry-run previews may still show only the first 25.
@@ -252,7 +278,7 @@ Built in phases, each ending with the build, unit tests, and the live suite pass
 
 1. Foundations: tests, lint, CI, timeouts, partial-failure reporting, safer undo. (done, 0.2.0)
 2. Content: every creatable block type, rich text colors and mentions, markdown round trip, move/copy/duplicate, icons, covers, templates, comments. (done, 0.3.0)
-3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create.
+3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create. (done, 0.4.0)
 4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages.
 5. Automations: schedules, run state, more actions, full management from Claude.
 6. Distribution: MCP Bundle, tool evaluations, acceptance tests.

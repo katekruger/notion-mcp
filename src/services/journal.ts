@@ -2,18 +2,19 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { call, isNotFound, notion, read } from "./notion.js";
+import { call, isNotFound, mapLimited, notion, read } from "./notion.js";
 import { invalidateSchema } from "./schema.js";
 
 export type UndoOp =
-  | { kind: "page_properties"; page_id: string; properties: Record<string, unknown> }
+  | { kind: "page_properties"; page_id: string; properties: Record<string, unknown>; data_source_id?: string }
   | { kind: "block_update"; block_id: string; payload: Record<string, unknown> }
   | { kind: "block_trash"; block_id: string; in_trash: boolean; parent_id?: string }
   | { kind: "page_trash"; page_id: string; in_trash: boolean }
   | { kind: "schema"; data_source_id: string; properties: Record<string, unknown> }
   | { kind: "comment_delete"; comment_id: string }
   | { kind: "page_update"; page_id: string; payload: Record<string, unknown> }
-  | { kind: "page_move"; page_id: string; parent: Record<string, unknown> };
+  | { kind: "page_move"; page_id: string; parent: Record<string, unknown> }
+  | { kind: "database_trash"; database_id: string; in_trash: boolean };
 
 /** Undo ops that trash newly inserted blocks. The parent lets undo check freshness with one listing, not one read per block. */
 export function insertedBlocks(ids: string[], parentId: string): UndoOp[] {
@@ -100,9 +101,16 @@ async function apply(op: UndoOp): Promise<void> {
     case "page_move":
       await call(() => n.pages.move({ page_id: op.page_id, parent: op.parent } as never));
       break;
+    case "database_trash":
+      await call(() => n.databases.update({ database_id: op.database_id, in_trash: op.in_trash } as never));
+      break;
     case "schema":
       await call(() => n.dataSources.update({ data_source_id: op.data_source_id, properties: op.properties } as never));
       invalidateSchema(op.data_source_id);
+      for (const v of Object.values(op.properties)) {
+        const rel = (v as { relation?: { data_source_id?: string } } | null)?.relation?.data_source_id;
+        if (rel) invalidateSchema(rel);
+      }
       break;
   }
 }
@@ -118,13 +126,17 @@ export function undoTarget(op: UndoOp): { kind: "page" | "block" | "data_source"
       // Trashing a block we inserted would also throw away edits made inside it since.
       return op.in_trash ? { kind: "block", id: op.block_id } : null;
     case "page_trash":
-      return op.in_trash ? { kind: "page", id: op.page_id } : null;
+      // Trashing a page this server created keeps its later edits (it can be restored from Notion's trash), so no check.
+      return null;
     case "schema":
-      return { kind: "data_source", id: op.data_source_id };
+      // A data source's edit time moves with every schema change and some row edits (verified live), so it can't
+      // tell whether this property was changed since; schema undo only touches the property it names.
+      return null;
     case "page_update":
     case "page_move":
       return { kind: "page", id: op.page_id };
     case "comment_delete":
+    case "database_trash":
       return null;
   }
 }
@@ -188,9 +200,39 @@ async function lastEditedTimes(entry: JournalEntry): Promise<Map<string, string 
       if (!isNotFound(e)) throw e;
     }
   }
+  // Rows in a database: one query for rows edited since the entry finds every conflict at once.
+  const sources = new Set(entry.undo.flatMap((op) => (op.kind === "page_properties" && op.data_source_id ? [op.data_source_id] : [])));
+  const checkedRows = new Set<string>();
+  for (const dsId of sources) {
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await read(() =>
+          n.dataSources.query({
+            data_source_id: dsId,
+            page_size: 100,
+            filter: { timestamp: "last_edited_time", last_edited_time: { after: new Date(minuteOf(entry.at)).toISOString() } },
+            ...(cursor ? { start_cursor: cursor } : {}),
+          } as never)
+        );
+        for (const r of res.results) {
+          const edited = (r as { last_edited_time?: unknown }).last_edited_time;
+          if (typeof edited === "string") out.set(r.id, edited);
+        }
+        cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
+      } while (cursor);
+      for (const op of entry.undo) if (op.kind === "page_properties" && op.data_source_id === dsId) checkedRows.add(op.page_id);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
   for (const op of entry.undo) {
     const t = undoTarget(op);
     if (!t || out.has(t.id)) continue;
+    if (checkedRows.has(t.id)) {
+      out.set(t.id, null); // Not edited since the entry (the query above returns every row that was).
+      continue;
+    }
     // A listed parent that no longer shows the block means it's already gone; nothing to compare.
     if (op.kind === "block_trash" && op.parent_id && parents.has(op.parent_id)) {
       out.set(t.id, null);
@@ -240,13 +282,22 @@ export async function undo(
 
   let applied = 0;
   const failed: string[] = [];
-  for (const op of [...target.undo].reverse()) {
-    try {
-      await apply(op);
-      applied++;
-    } catch (e) {
-      failed.push(`${op.kind}: ${(e as Error).message}`);
-    }
+  // Reverse order matters across kinds (a re-created property before its values), not within a run of
+  // independent row/block ops, so those runs go a few at a time.
+  const ops = [...target.undo].reverse();
+  const independent = new Set(["page_properties", "page_trash", "block_trash", "comment_delete", "block_update"]);
+  for (let i = 0; i < ops.length; ) {
+    let j = i + 1;
+    if (independent.has(ops[i].kind)) while (j < ops.length && ops[j].kind === ops[i].kind) j++;
+    await mapLimited(ops.slice(i, j), async (op) => {
+      try {
+        await apply(op);
+        applied++;
+      } catch (e) {
+        failed.push(`${op.kind}: ${(e as Error).message}`);
+      }
+    });
+    i = j;
   }
   target.undone = failed.length === 0;
   await save(entries);

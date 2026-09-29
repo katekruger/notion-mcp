@@ -192,10 +192,11 @@ export function registerReadTools(server: McpServer): void {
     {
       title: "Query Database",
       description:
-        "Query database rows. Use `where` for simple equality ({\"Status\": \"Done\", \"Owner\": \"kate@x.com\"}); property names and " +
-        "option values are matched forgivingly and validated. Use `filter` for anything more complex (raw Notion filter JSON, " +
-        "e.g. {\"property\":\"Due\",\"date\":{\"before\":\"2026-10-01\"}}). If both are given they are combined with AND. " +
-        "Returns rows with simple property values and page ids.",
+        "Query database rows. `where` takes equality ({\"Status\": \"Done\"}), operators ({\"Due\": {\"before\": \"today\"}}, " +
+        "{\"Estimate\": {\">\": 500}}, {\"Task\": {\"contains\": \"x\"}}, {\"Owner\": null}), lists ({\"Status\": {\"in\": [\"Done\", \"Blocked\"]}}), " +
+        "{\"or\": [...]}, relative dates (\"today\", \"+7d\", \"-2w\"), and \"$created\"/\"$last_edited\"; names and options are matched " +
+        "forgivingly and validated. `filter` takes raw Notion filter JSON; both are combined with AND. Returns rows with simple " +
+        "values and page ids. For counts or totals use notion_aggregate instead of reading every row.",
       inputSchema: {
         database: z.string().describe("Database URL/id or data source id."),
         data_source_name: z.string().optional(),

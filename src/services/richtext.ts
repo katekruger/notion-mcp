@@ -1,4 +1,5 @@
 import type { RichTextItemResponse } from "@notionhq/client";
+import { normalizeId } from "./notion.js";
 
 export interface Annotations {
   bold?: boolean;
@@ -106,31 +107,134 @@ export function segmentText(s: RichTextReq): string {
   return s.plain_text ?? "";
 }
 
+export const COLORS = ["default", "gray", "brown", "orange", "yellow", "green", "blue", "purple", "pink", "red"] as const;
+export const BLOCK_COLORS: readonly string[] = [...COLORS, ...COLORS.filter((c) => c !== "default").map((c) => `${c}_background`)];
+
+/** Accepts API colors ("red_background") and Notion markdown's short form ("red_bg"). Throws on anything else. */
+export function normalizeColor(color: string): string {
+  const c = color.trim().toLowerCase().replace(/_bg$/, "_background");
+  if (!BLOCK_COLORS.includes(c)) throw new Error(`Unknown color "${color}". Use one of: ${BLOCK_COLORS.join(", ")}.`);
+  return c;
+}
+
+/** Prefix marking a user mention that still needs an email/name lookup (see resolveUserMentions). */
+export const USER_LOOKUP = "lookup:";
+
+function attrs(tag: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of tag.matchAll(/([a-z_-]+)="([^"]*)"/gi)) out[m[1].toLowerCase()] = m[2];
+  return out;
+}
+
+function mentionFromTag(kind: string, a: Record<string, string>, inner: string): Record<string, unknown> {
+  const ref = a.url ?? a.id ?? inner;
+  switch (kind) {
+    case "page":
+    case "database":
+      if (!ref) throw new Error(`<mention-${kind}> needs url="…" (a Notion link or id).`);
+      return { [kind]: { id: normalizeId(ref) } };
+    case "user": {
+      const v = (a.id ?? a.email ?? a.url ?? inner).replace(/^user:\/\//, "").trim();
+      if (!v) throw new Error('<mention-user> needs id="…", email="…", or the person\'s name inside it.');
+      return { user: { id: /^[0-9a-f-]{32,36}$/i.test(v) ? normalizeId(v) : USER_LOOKUP + v } };
+    }
+    case "date": {
+      const start = a.start ?? inner;
+      if (!start || Number.isNaN(Date.parse(start))) throw new Error(`<mention-date> needs start="YYYY-MM-DD" (got "${start}").`);
+      return { date: { start, ...(a.end ? { end: a.end } : {}) } };
+    }
+    default:
+      throw new Error(`Unknown mention type "${kind}". Use mention-page, mention-database, mention-user, or mention-date.`);
+  }
+}
+
+// Earliest-match inline grammar. Wrapping forms recurse so formatting nests (e.g. a bold link inside a colored span).
+const INLINE = new RegExp(
+  [
+    String.raw`(?<span><span\b([^>]*)>([\s\S]*?)</span>)`,
+    String.raw`(?<mentionSelf><mention-(page|database|user|date)\b([^>]*?)/>)`,
+    String.raw`(?<mention><mention-(page|database|user|date)\b([^>]*)>([\s\S]*?)</mention-\8>)`,
+    String.raw`(?<eqNotion>\$` + "`" + String.raw`([^` + "`" + String.raw`]+)` + "`" + String.raw`\$)`,
+    String.raw`(?<eq>(?<![\w$\\])\$(?![\s\d])([^$\n]+?)(?<!\s)\$(?![\w$]))`,
+    String.raw`(?<bold>\*\*([\s\S]+?)\*\*)`,
+    String.raw`(?<strike>~~([\s\S]+?)~~)`,
+    String.raw`(?<under><u>([\s\S]+?)</u>)`,
+    String.raw`(?<code>` + "`" + String.raw`([^` + "`" + String.raw`]+)` + "`" + ")",
+    String.raw`(?<link>\[([^\]]+)\]\(((?:https?://|mailto:|/)[^)\s]*)\))`,
+    String.raw`(?<italic>(?<![\w*])\*(?![\s*])([^*]+?)(?<!\s)\*(?![\w*]))`,
+    String.raw`(?<italic2>(?<![\w_])_(?![\s_])([^_]+?)(?<!\s)_(?![\w_]))`,
+  ].join("|"),
+  "g"
+);
+
+function withAnn(base: Annotations | undefined, add: Annotations): Annotations {
+  return { ...(base ?? {}), ...add };
+}
+
+function parseInline(input: string, ann: Annotations | undefined, url: string | undefined, out: RichTextReq[]): void {
+  const pushText = (content: string, a: Annotations | undefined, link: string | undefined): void => {
+    if (!content) return;
+    const clean = cleanAnnotations(a);
+    out.push({ type: "text", text: { content, link: link ? { url: link } : null }, ...(clean ? { annotations: clean } : {}) });
+  };
+  const re = new RegExp(INLINE.source, "g");
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input)) !== null) {
+    pushText(input.slice(last, m.index), ann, url);
+    last = m.index + m[0].length;
+    const g = m.groups ?? {};
+    const clean = cleanAnnotations(ann);
+    if (g.span !== undefined) {
+      const a = attrs(m[2]);
+      const add: Annotations = {};
+      if (a.color) add.color = normalizeColor(a.color);
+      if (a.underline === "true") add.underline = true;
+      if (a.bold === "true") add.bold = true;
+      if (a.italic === "true") add.italic = true;
+      parseInline(m[3], withAnn(ann, add), url, out);
+    } else if (g.mentionSelf !== undefined) {
+      out.push({ type: "mention", mention: mentionFromTag(m[5], attrs(m[6]), ""), ...(clean ? { annotations: clean } : {}) });
+    } else if (g.mention !== undefined) {
+      const inner = m[10];
+      out.push({ type: "mention", mention: mentionFromTag(m[8], attrs(m[9]), inner), plain_text: inner, ...(clean ? { annotations: clean } : {}) });
+    } else if (g.eqNotion !== undefined) {
+      out.push({ type: "equation", equation: { expression: m[12] }, ...(clean ? { annotations: clean } : {}) });
+    } else if (g.eq !== undefined) {
+      out.push({ type: "equation", equation: { expression: m[14] }, ...(clean ? { annotations: clean } : {}) });
+    } else if (g.bold !== undefined) parseInline(m[16], withAnn(ann, { bold: true }), url, out);
+    else if (g.strike !== undefined) parseInline(m[18], withAnn(ann, { strikethrough: true }), url, out);
+    else if (g.under !== undefined) parseInline(m[20], withAnn(ann, { underline: true }), url, out);
+    else if (g.code !== undefined) pushText(m[22], withAnn(ann, { code: true }), url);
+    else if (g.link !== undefined) parseInline(m[24], ann, m[25], out);
+    else if (g.italic !== undefined) parseInline(m[27], withAnn(ann, { italic: true }), url, out);
+    else if (g.italic2 !== undefined) parseInline(m[29], withAnn(ann, { italic: true }), url, out);
+  }
+  pushText(input.slice(last), ann, url);
+}
+
 /**
- * Parse a small, predictable subset of inline markdown:
- * **bold**, *italic* or _italic_, `code`, ~~strike~~, [text](url).
- * Anything else is literal text.
+ * Parse inline markdown into rich text. Formatting nests.
+ * Markdown: **bold**, *italic* or _italic_, `code`, ~~strike~~, <u>underline</u>, [text](url), $x^2$ (inline equation).
+ * Notion's markdown tags (as returned by page markdown reads): <span color="red">…</span> (also red_bg / red_background,
+ * underline="true"), $`x`$, <mention-page url="…"/>, <mention-database url="…"/>, <mention-user id|email="…"/>,
+ * <mention-date start="2026-10-01" end="…"/>. A "$" followed by a digit or space is literal, so prices stay text.
  */
 export function fromInlineMarkdown(input: string): RichTextReq[] {
   const out: RichTextReq[] = [];
-  const pattern = /(\*\*([^*]+)\*\*)|(~~([^~]+)~~)|(`([^`]+)`)|(\[([^\]]+)\]\((https?:\/\/[^)\s]+)\))|(\*([^*\s][^*]*)\*)|(_([^_\s][^_]*)_)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  const pushText = (content: string, annotations?: Annotations, url?: string): void => {
-    if (!content) return;
-    out.push({ type: "text", text: { content, link: url ? { url } : null }, ...(annotations ? { annotations } : {}) });
-  };
-  while ((m = pattern.exec(input)) !== null) {
-    pushText(input.slice(last, m.index));
-    if (m[2] !== undefined) pushText(m[2], { bold: true });
-    else if (m[4] !== undefined) pushText(m[4], { strikethrough: true });
-    else if (m[6] !== undefined) pushText(m[6], { code: true });
-    else if (m[8] !== undefined) pushText(m[8], undefined, m[9]);
-    else if (m[11] !== undefined) pushText(m[11], { italic: true });
-    else if (m[13] !== undefined) pushText(m[13], { italic: true });
-    last = m.index + m[0].length;
+  parseInline(input, undefined, undefined, out);
+  return out;
+}
+
+/** Collect user mentions that still need a lookup, so callers can resolve them before sending. */
+export function pendingUserLookups(value: unknown, out: { user: { id: string } }[] = []): { user: { id: string } }[] {
+  if (Array.isArray(value)) value.forEach((v) => pendingUserLookups(v, out));
+  else if (value && typeof value === "object") {
+    const o = value as Record<string, unknown>;
+    const u = o.user as { id?: unknown } | undefined;
+    if (u && typeof u.id === "string" && u.id.startsWith(USER_LOOKUP)) out.push(o as { user: { id: string } });
+    for (const v of Object.values(o)) pendingUserLookups(v, out);
   }
-  pushText(input.slice(last));
   return out;
 }
 

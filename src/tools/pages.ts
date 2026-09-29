@@ -3,7 +3,11 @@ import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { call, read, isNotFound, normalizeId, notion } from "../services/notion.js";
-import { appendSpecs, markdownToSpecs, type BlockSpec } from "../services/blocks.js";
+import { appendSpecs, markdownToSpecs, normalizeSpecs } from "../services/blocks.js";
+import { fileRef, isUrl } from "../services/files.js";
+import { blockSpecSchema } from "../services/specSchema.js";
+
+export { blockSpecSchema };
 import { textToTitle } from "../services/richtext.js";
 import {
   buildWhereFilter,
@@ -17,17 +21,25 @@ import { record, type UndoOp } from "../services/journal.js";
 import { beforeAfter, getFullPage, preparePayload, snapshot } from "../services/writes.js";
 import { DESTRUCTIVE, ok, safe, WRITE } from "./util.js";
 
-export const blockSpecSchema: z.ZodType<BlockSpec> = z.lazy(() =>
-  z.object({
-    type: z.string().describe("paragraph, heading_1-3, bulleted_list_item, numbered_list_item, to_do, toggle, quote, callout, code, divider"),
-    text: z.string().optional().describe("Inline markdown allowed: **bold**, *italic*, `code`, ~~strike~~, [link](https://…)"),
-    checked: z.boolean().optional(),
-    language: z.string().optional(),
-    emoji: z.string().optional(),
-    color: z.string().optional(),
-    children: z.array(blockSpecSchema).optional(),
-  })
-);
+/** Page icon from an emoji, image URL, or local image path. */
+export async function iconRef(source: string): Promise<Record<string, unknown>> {
+  return isUrl(source) || /[\\/.]/.test(source) ? fileRef(source) : { type: "emoji", emoji: source };
+}
+
+/** "default", a template name, or a template id → the pages.create `template` value. */
+export async function resolveTemplate(dataSourceId: string, input: string): Promise<Record<string, unknown>> {
+  if (input.toLowerCase() === "default") return { type: "default" };
+  const res = await read(() => notion().dataSources.listTemplates({ data_source_id: dataSourceId }));
+  const byId = /^[0-9a-f-]{32,36}$/i.test(input) ? res.templates.find((t) => t.id.replace(/-/g, "") === input.replace(/-/g, "")) : undefined;
+  const byName = res.templates.filter((t) => t.name.toLowerCase() === input.toLowerCase());
+  const match = byId ?? (byName.length === 1 ? byName[0] : undefined);
+  if (!match) {
+    throw new Error(
+      `No template "${input}". Templates: ${res.templates.map((t) => `"${t.name}"${t.is_default ? " (default)" : ""}`).join(", ") || "(none)"}.`
+    );
+  }
+  return { type: "template_id", template_id: match.id };
+}
 
 export function checkFresh(actual: string, expected: string | undefined, what: string): void {
   if (expected && new Date(actual).getTime() > new Date(expected).getTime()) {
@@ -83,8 +95,9 @@ export function registerPageTools(server: McpServer): void {
       title: "Create Page",
       description:
         "Create a page. If `parent` is a database, `properties` are validated against its schema (same rules as notion_update_properties) " +
-        "and `title` fills the title property. If `parent` is a page, a sub-page is created. Content can be given as `markdown` " +
-        "(headings, lists, to-dos, quotes, code fences, dividers, inline formatting) or as structured `blocks`.",
+        "and `title` fills the title property; `template` applies one of the database's templates (see notion_list_templates). " +
+        "If `parent` is a page, a sub-page is created. Content can be `markdown` or structured `blocks` (same formats as " +
+        "notion_insert_blocks). `icon` is an emoji, image URL, or local image path; `cover` is an image URL or local path.",
       inputSchema: {
         parent: z.string().describe("Parent database or page URL/id."),
         data_source_name: z.string().optional(),
@@ -93,12 +106,15 @@ export function registerPageTools(server: McpServer): void {
         allow_new_options: z.boolean().default(false),
         markdown: z.string().optional(),
         blocks: z.array(blockSpecSchema).optional(),
-        icon_emoji: z.string().optional(),
+        icon: z.string().optional().describe("Emoji, image URL, or local image path."),
+        icon_emoji: z.string().optional().describe("Older name for icon."),
+        cover: z.string().optional().describe("Image URL or local image path."),
+        template: z.string().optional().describe('Database parents: "default", or a template name or id from notion_list_templates.'),
       },
       annotations: { ...WRITE, idempotentHint: false },
     },
-    safe(async ({ parent, data_source_name, title, properties, allow_new_options, markdown, blocks, icon_emoji }) => {
-      const specs = [...(markdown ? markdownToSpecs(markdown) : []), ...(blocks ?? [])];
+    safe(async ({ parent, data_source_name, title, properties, allow_new_options, markdown, blocks, icon, icon_emoji, cover, template }) => {
+      const specs = normalizeSpecs([...(markdown ? markdownToSpecs(markdown) : []), ...(blocks ?? [])]);
       let ds: DataSourceObjectResponse | null = null;
       try {
         ds = await resolveDataSource(parent, data_source_name);
@@ -121,7 +137,14 @@ export function registerPageTools(server: McpServer): void {
         }
         body = { parent: { type: "page_id", page_id: normalizeId(parent) }, properties: { title: { title: textToTitle(title ?? "Untitled") } } };
       }
-      if (icon_emoji) body.icon = { type: "emoji", emoji: icon_emoji };
+      if (template) {
+        if (!ds) throw new Error("Templates belong to databases; `parent` is a page.");
+        if (specs.length) throw new Error("A template fills the page's content, so it can't be combined with markdown or blocks. Create it, then add content with notion_insert_blocks.");
+        body.template = await resolveTemplate(ds.id, template);
+      }
+      const iconSource = icon ?? icon_emoji;
+      if (iconSource) body.icon = await iconRef(iconSource);
+      if (cover) body.cover = await fileRef(cover);
 
       // Content is appended after creation so deep nesting and >100 blocks go through one code path.
       const created = await call(() => notion().pages.create(body as never));
@@ -140,6 +163,7 @@ export function registerPageTools(server: McpServer): void {
         url: "url" in created ? created.url : undefined,
         parent: ds ? `database "${dataSourceTitle(ds)}"` : "page",
         blocks_added: specs.length,
+        ...(template ? { template_note: "Notion applies templates in the background; content may take a few seconds to appear." } : {}),
         notes,
         undo_id: journalId,
       });

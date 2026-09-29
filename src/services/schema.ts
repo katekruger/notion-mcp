@@ -1,7 +1,7 @@
 import { collectPaginatedAPI, isFullDataSource, isFullUser } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse, UserObjectResponse } from "@notionhq/client";
 import { read, isNotFound, normalizeId, notion } from "./notion.js";
-import { forApi, fromInlineMarkdown, plain, toRequest } from "./richtext.js";
+import { forApi, fromInlineMarkdown, pendingUserLookups, plain, toRequest, USER_LOOKUP } from "./richtext.js";
 
 export type PropertyConfig = DataSourceObjectResponse["properties"][string];
 export type PageProperty = PageObjectResponse["properties"][string];
@@ -132,6 +132,11 @@ async function resolveUser(v: string): Promise<string> {
   return match.id;
 }
 
+/** Replace user mentions written by email or name (see fromInlineMarkdown) with user ids, in place. */
+export async function resolveUserMentions(payload: unknown): Promise<void> {
+  for (const m of pendingUserLookups(payload)) m.user = { id: await resolveUser(m.user.id.slice(USER_LOOKUP.length)) };
+}
+
 /** Notion rejects relation and people arrays longer than this in one write. */
 export const MAX_REFERENCES = 100;
 
@@ -200,7 +205,9 @@ export async function coerceValue(
     case "title":
     case "rich_text": {
       const text = isEmpty ? "" : String(value);
-      return { payload: { [t]: text ? forApi(fromInlineMarkdown(text)) : [] }, notes };
+      const rich = text ? forApi(fromInlineMarkdown(text)) : [];
+      await resolveUserMentions(rich);
+      return { payload: { [t]: rich }, notes };
     }
     case "number": {
       if (isEmpty) return { payload: { number: null }, notes };

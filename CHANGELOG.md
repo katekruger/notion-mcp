@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.3.0
+
+### Added
+- Every block type the API can create: heading 4, toggle headings, tables (header row/column), columns, tabs, callouts with emoji or image icons, equations, table of contents, breadcrumbs, bookmarks, embeds, images/files/PDF/video/audio (web URL or local file, uploaded via the File Upload API), synced blocks (new or reference), links to pages, and code captions.
+- Rich text: colors and backgrounds, underline, inline equations, and page/database/user/date mentions, with formatting that nests.
+- Markdown in Notion's own format (callouts, `<columns>`, `<details>`, `<table>`, `<tabs>`, colored spans, mentions) plus GitHub alerts (`> [!NOTE]`) and pipe tables, with nesting to any depth.
+- `notion_get_page` `format: "markdown"`: the page as markdown that can be written back; blocks Notion's export leaves out (bookmarks, breadcrumbs, links to pages) are filled in.
+- `notion_copy_blocks` (copy or move, with dry run), `notion_duplicate_page`, `notion_update_page` (title, icon, cover, lock, move), `notion_list_templates`, `notion_comments` (list, add, reply).
+- `notion_create_page`: `template`, `icon` (emoji, URL, or local image), and `cover`.
+- `notion_patch_block`: toggle headings, callout icons, code captions, and table row cells.
+- `notion_replace_text` also covers table cells, captions, and the page title (`include_title`).
+
+### Changed
+- A request can now carry a block plus two levels below it (verified live), so nested content takes fewer requests.
+- Undo checks inserted blocks for later edits with one listing of their parent instead of one read per block.
+- The live suite also trashes the pages it creates.
+
 ## 0.2.0
 
 ### Added

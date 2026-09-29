@@ -8,10 +8,17 @@ import { invalidateSchema } from "./schema.js";
 export type UndoOp =
   | { kind: "page_properties"; page_id: string; properties: Record<string, unknown> }
   | { kind: "block_update"; block_id: string; payload: Record<string, unknown> }
-  | { kind: "block_trash"; block_id: string; in_trash: boolean }
+  | { kind: "block_trash"; block_id: string; in_trash: boolean; parent_id?: string }
   | { kind: "page_trash"; page_id: string; in_trash: boolean }
   | { kind: "schema"; data_source_id: string; properties: Record<string, unknown> }
-  | { kind: "comment_delete"; comment_id: string };
+  | { kind: "comment_delete"; comment_id: string }
+  | { kind: "page_update"; page_id: string; payload: Record<string, unknown> }
+  | { kind: "page_move"; page_id: string; parent: Record<string, unknown> };
+
+/** Undo ops that trash newly inserted blocks. The parent lets undo check freshness with one listing, not one read per block. */
+export function insertedBlocks(ids: string[], parentId: string): UndoOp[] {
+  return ids.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true, parent_id: parentId }));
+}
 
 export interface JournalEntry {
   id: string;
@@ -87,6 +94,12 @@ async function apply(op: UndoOp): Promise<void> {
     case "comment_delete":
       await call(() => n.comments.delete({ comment_id: op.comment_id }));
       break;
+    case "page_update":
+      await call(() => n.pages.update({ page_id: op.page_id, ...op.payload } as never));
+      break;
+    case "page_move":
+      await call(() => n.pages.move({ page_id: op.page_id, parent: op.parent } as never));
+      break;
     case "schema":
       await call(() => n.dataSources.update({ data_source_id: op.data_source_id, properties: op.properties } as never));
       invalidateSchema(op.data_source_id);
@@ -108,6 +121,9 @@ export function undoTarget(op: UndoOp): { kind: "page" | "block" | "data_source"
       return op.in_trash ? { kind: "page", id: op.page_id } : null;
     case "schema":
       return { kind: "data_source", id: op.data_source_id };
+    case "page_update":
+    case "page_move":
+      return { kind: "page", id: op.page_id };
     case "comment_delete":
       return null;
   }
@@ -155,9 +171,31 @@ export function findConflicts(
 async function lastEditedTimes(entry: JournalEntry): Promise<Map<string, string | null>> {
   const out = new Map<string, string | null>();
   const n = notion();
+  // Inserted blocks: one children listing per parent covers them all.
+  const parents = new Set(entry.undo.flatMap((op) => (op.kind === "block_trash" && op.in_trash && op.parent_id ? [op.parent_id] : [])));
+  for (const parentId of parents) {
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await read(() => n.blocks.children.list({ block_id: parentId, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) }));
+        for (const b of res.results) {
+          const edited = (b as { last_edited_time?: unknown }).last_edited_time;
+          if (typeof edited === "string") out.set(b.id, edited);
+        }
+        cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
+      } while (cursor);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
   for (const op of entry.undo) {
     const t = undoTarget(op);
     if (!t || out.has(t.id)) continue;
+    // A listed parent that no longer shows the block means it's already gone; nothing to compare.
+    if (op.kind === "block_trash" && op.parent_id && parents.has(op.parent_id)) {
+      out.set(t.id, null);
+      continue;
+    }
     try {
       const obj: object =
         t.kind === "page"

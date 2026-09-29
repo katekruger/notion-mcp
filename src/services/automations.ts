@@ -7,10 +7,11 @@ import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { z } from "zod";
 import { call, read, notion } from "./notion.js";
-import { appendSpecs, markdownToSpecs, PartialWriteError, type BlockSpec } from "./blocks.js";
+import { appendSpecs, markdownToSpecs, PartialWriteError } from "./blocks.js";
+import { blockSpecSchema } from "./specSchema.js";
 import { forApi, fromInlineMarkdown, plain } from "./richtext.js";
 import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyName, simplify, withFullProperties } from "./schema.js";
-import { record, type UndoOp } from "./journal.js";
+import { insertedBlocks, record, type UndoOp } from "./journal.js";
 import { preparePayload, snapshot } from "./writes.js";
 
 // ---------- rules file ----------
@@ -25,21 +26,9 @@ const relativeSchema = z
     message: "Set exactly one of older_than_days or newer_than_days.",
   });
 
-const blockSpec: z.ZodType<BlockSpec> = z.lazy(() =>
-  z.object({
-    type: z.string(),
-    text: z.string().optional(),
-    checked: z.boolean().optional(),
-    language: z.string().optional(),
-    emoji: z.string().optional(),
-    color: z.string().optional(),
-    children: z.array(blockSpec).optional(),
-  })
-);
-
 const actionSchema = z.union([
   z.object({ set: z.record(z.string(), z.unknown()) }).strict(),
-  z.object({ append: z.union([z.string(), z.array(blockSpec)]) }).strict(),
+  z.object({ append: z.union([z.string(), z.array(blockSpecSchema)]) }).strict(),
   z.object({ comment: z.string().min(1) }).strict(),
   z.object({ trash: z.literal(true) }).strict(),
 ]);
@@ -360,10 +349,10 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
           try {
             ids = await appendSpecs(page.id, specs);
           } catch (e) {
-            if (e instanceof PartialWriteError) undo.push(...e.createdIds.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true }) as UndoOp));
+            if (e instanceof PartialWriteError) undo.push(...insertedBlocks(e.createdIds, page.id));
             throw e;
           }
-          undo.push(...ids.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true }) as UndoOp));
+          undo.push(...insertedBlocks(ids, page.id));
         } else if ("comment" in a) {
           const text = render(a.comment, ctx);
           const c = await call(() => notion().comments.create({ parent: { page_id: page.id }, rich_text: forApi(fromInlineMarkdown(text)) } as never));

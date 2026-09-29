@@ -6,7 +6,7 @@
 // Everything is created inside a fresh pair of databases under NOTION_TEST_PAGE and
 // trashed at the end, even when steps fail. The undo journal goes to a temp folder,
 // never to ~/.notion-plus. Set SMOKE_KEEP=1 to leave the databases for inspection.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -25,6 +25,7 @@ const { registerPageTools } = await import("../src/tools/pages.js");
 const { registerBlockTools } = await import("../src/tools/blocks.js");
 const { registerSafetyTools, registerSchemaTools } = await import("../src/tools/schema.js");
 const { registerAutomationTools } = await import("../src/tools/automations.js");
+const { registerContentTools } = await import("../src/tools/content.js");
 const { runAll } = await import("../src/services/automations.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -36,7 +37,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerSchemaTools, registerSafetyTools, registerAutomationTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerSafetyTools, registerAutomationTools]) {
   register(registry as never);
 }
 
@@ -92,6 +93,13 @@ const pageId = normalizeId(testPage);
 const stamp = `smoke-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 const n = notion();
 const createdDatabases: string[] = [];
+const createdPages: string[] = [];
+
+async function blockText(id: string): Promise<string> {
+  const b = (await call(() => n.blocks.retrieve({ block_id: id }))) as unknown as Json;
+  if (b.type === "table_row") return b.table_row.cells.map((c: Json[]) => c.map((s) => s.plain_text).join("")).join(" | ");
+  return (b[b.type].rich_text ?? []).map((s: Json) => s.plain_text).join("");
+}
 
 function rt(content: string) {
   return [{ type: "text", text: { content } }];
@@ -412,7 +420,7 @@ async function main(): Promise<void> {
     expect(dry.dry_run && dry.total_replacements === 2, `dry run found ${dry.total_replacements}`);
     expect((await tool("notion_find_blocks", { page: rowA, query: "Q4" })).json.count === 0, "dry run wrote");
     const applied = await must("notion_replace_text", { page: rowA, find: "Q3", replace: "Q4", dry_run: false });
-    expect(applied.blocks_changed === 2, JSON.stringify(applied));
+    expect(applied.changed === 2, JSON.stringify(applied));
     const intro = await blockAt(rowA, "Q4 bold");
     const b = (await call(() => n.blocks.retrieve({ block_id: intro }))) as unknown as Json;
     const boldSeg = b.paragraph.rich_text.find((s: Json) => s.plain_text.includes("Q4"));
@@ -550,6 +558,211 @@ async function main(): Promise<void> {
     expect(r.isError && /rich text segments/.test(r.text), r.text.slice(0, 200));
   });
 
+  // ---------- phase 2: content ----------
+  const RICH_MD = [
+    "# Q3 plan",
+    "#### Small heading",
+    '## Details {toggle="true"}',
+    "\tHidden until opened",
+    'Plain, **bold Q3**, <span color="red">red</span>, <span color="blue_bg">highlight</span>, $x^2$, ' +
+      `<mention-page url="${pageId}"/>, <mention-date start="2026-10-01"/>, [link](https://example.com)`,
+    "> [!NOTE] Heads up",
+    "> Second line of the note",
+    '<callout icon="🔥" color="red_bg">',
+    "\tHot take",
+    "\t- nested bullet",
+    "</callout>",
+    "<details>",
+    "<summary>More</summary>",
+    "\t- level 1",
+    "\t\t- level 2",
+    "\t\t\t- level 3",
+    "\t\t\t\t- level 4",
+    "\t\t\t\t\t- level 5",
+    "</details>",
+    "<columns>",
+    "\t<column>",
+    "\t\tLeft column",
+    "\t\t- with a list",
+    "\t\t\t- nested deeper",
+    "\t</column>",
+    "\t<column>",
+    "\t\tRight column",
+    "\t</column>",
+    "</columns>",
+    "| Quarter | Revenue |",
+    "|---|---|",
+    "| Q3 | 100 |",
+    "| Q4 | 120 |",
+    "<tabs>",
+    "\t<tab>",
+    "\t\tOverview",
+    "\t\tOverview content",
+    "\t</tab>",
+    "\t<tab>",
+    "\t\tDetails",
+    "\t\tDetails content",
+    "\t</tab>",
+    "</tabs>",
+    "```mermaid",
+    "graph TD; A-->B",
+    "```",
+    "$$",
+    "E=mc^2",
+    "$$",
+    "<table_of_contents/>",
+    "<breadcrumb/>",
+    '<bookmark url="https://example.com"/>',
+    '<embed src="https://www.youtube.com/watch?v=dQw4w9WgXcQ"></embed>',
+    "![](https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png)",
+    `<link-to-page url="${pageId}"/>`,
+    "<synced_block>",
+    "\tSynced original",
+    "</synced_block>",
+    "- [x] done item",
+    "---",
+  ].join("\n");
+  let richPage = "";
+  await step("notion_create_page: every block type from markdown", async () => {
+    const r = await must("notion_create_page", { parent: pageId, title: `${stamp} Q3 content`, markdown: RICH_MD, icon: "📊" });
+    richPage = r.page_id;
+    createdPages.push(richPage);
+    const outline = (await tool("notion_get_blocks", { block: richPage, max_depth: 6, max_blocks: 500 })).text;
+    const types = ["heading_1", "heading_4", "heading_2", "callout", "toggle", "column_list", "table", "tab", "code", "equation", "table_of_contents",
+      "breadcrumb", "bookmark", "embed", "image", "link_to_page", "synced_block", "to_do", "divider"];
+    const missing = types.filter((t) => !outline.includes(`(${t})`));
+    expect(missing.length === 0, `missing block types: ${missing.join(", ")}`);
+    expect(outline.includes("level 5"), "5-level nesting lost");
+    expect(outline.includes("nested deeper"), "nested content inside a column lost");
+    return `${outline.split("\n").length} blocks`;
+  });
+  await step("notion_get_page format=markdown: formatting survives a round trip", async () => {
+    const md1 = (await tool("notion_get_page", { page: richPage, format: "markdown" })).text.split("MARKDOWN:\n")[1] ?? "";
+    for (const needle of ['color="red"', "<callout", "<columns>", "<details>", "<tabs>", "```mermaid", "<breadcrumb/>", "<bookmark url=", "<link-to-page", "mention-page", "level 5"]) {
+      expect(md1.includes(needle), `markdown read lacks ${needle}`);
+    }
+    const r = await must("notion_create_page", { parent: pageId, title: `${stamp} round trip`, markdown: md1 });
+    createdPages.push(r.page_id);
+    const md2 = (await tool("notion_get_page", { page: r.page_id, format: "markdown" })).text.split("MARKDOWN:\n")[1] ?? "";
+    // The synced original becomes a reference to it in the copy; everything else should match line for line.
+    const norm = (s: string) => s.split("\n").filter((l) => !/synced_block/.test(l)).join("\n");
+    const a = norm(md1).split("\n");
+    const b = norm(md2).split("\n");
+    const diff = a.map((l, i) => (l === b[i] ? null : `${i}: ${l} ≠ ${b[i]}`)).filter(Boolean);
+    expect(diff.length === 0 && a.length === b.length, `${diff.length} lines differ (${a.length} vs ${b.length}): ${diff.slice(0, 3).join(" | ")}`);
+    return `${a.length} lines identical`;
+  });
+  await step("notion_insert_blocks: local image is uploaded", async () => {
+    const png = path.join(os.tmpdir(), `${stamp}.png`);
+    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+    const r = await must("notion_insert_blocks", { parent: richPage, blocks: [{ type: "image", url: png, caption: "uploaded" }] });
+    const b = (await call(() => n.blocks.retrieve({ block_id: r.block_ids[0] }))) as unknown as Json;
+    expect(b.image.type === "file", `image type ${b.image.type}`);
+    const outside = await tool("notion_insert_blocks", { parent: richPage, blocks: [{ type: "image", url: "/etc/hostname" }] });
+    expect(outside.isError && /outside the folders/.test(outside.text), outside.text);
+  });
+  await step("notion_patch_block: toggle heading, callout icon, table cells; undo", async () => {
+    const heading = await blockAt(richPage, "Small heading");
+    const r1 = await must("notion_patch_block", { block_id: heading, toggleable: true, color: "green_bg" });
+    const h = (await call(() => n.blocks.retrieve({ block_id: heading }))) as unknown as Json;
+    expect(h.heading_4.is_toggleable === true && h.heading_4.color === "green_background", JSON.stringify(h.heading_4));
+    const callout = await blockAt(richPage, "Hot take");
+    const r2 = await must("notion_patch_block", { block_id: callout, icon: "✅" });
+    const row = await blockAt(richPage, "Q4 | 120");
+    const r3 = await must("notion_patch_block", { block_id: row, cells: ["Q4", "**130**"] });
+    expect(r3.after === "Q4 | 130", r3.after);
+    for (const r of [r3, r2, r1]) await must("notion_undo", { undo_id: r.undo_id });
+    const c = (await call(() => n.blocks.retrieve({ block_id: callout }))) as unknown as Json;
+    expect(c.callout.icon.emoji === "🔥", "callout icon not restored");
+    expect((await blockText(row)) === "Q4 | 120", "table row not restored");
+  });
+  await step("notion_replace_text: Q3→Q4 in title, text, and table cells keeps formatting; undo", async () => {
+    const dry = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4" });
+    expect(dry.dry_run && dry.total_replacements >= 4, JSON.stringify(dry).slice(0, 300));
+    expect(dry.changes.some((c: Json) => c.page_title), "title not in preview");
+    expect(dry.changes.some((c: Json) => c.type === "table_row"), "table cell not in preview");
+    const r = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4", dry_run: false });
+    expect(r.total_replacements === dry.total_replacements, `${r.total_replacements} vs ${dry.total_replacements}`);
+    const para = await blockAt(richPage, "bold Q4");
+    const b = (await call(() => n.blocks.retrieve({ block_id: para }))) as unknown as Json;
+    expect(b.paragraph.rich_text.some((s: Json) => s.plain_text.includes("Q4") && s.annotations.bold), "bold lost");
+    expect(b.paragraph.rich_text.some((s: Json) => s.type === "mention"), "mention lost");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const again = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4" });
+    expect(again.total_replacements === dry.total_replacements, "undo did not restore every Q3");
+  });
+  let target = "";
+  await step("notion_copy_blocks: copy callout and columns to another page; undo", async () => {
+    target = (await must("notion_create_page", { parent: pageId, title: `${stamp} target`, markdown: "Existing first\n\nExisting last" })).page_id;
+    createdPages.push(target);
+    const callout = await blockAt(richPage, "Hot take");
+    const cols = (await tool("notion_get_blocks", { block: richPage, max_depth: 0 })).text.match(/\(column_list\).*⟨([^⟩]+)⟩/)?.[1];
+    expect(cols, "no column_list found");
+    const first = await blockAt(target, "Existing first");
+    const r = await must("notion_copy_blocks", { block_ids: [callout, cols], to: target, position: "after_block", after_block_id: first });
+    expect(r.created_block_ids.length === 2, JSON.stringify(r));
+    const outline = (await tool("notion_get_blocks", { block: target, max_depth: 4 })).text;
+    const order = ["Existing first", "Hot take", "Left column", "nested deeper", "Existing last"].map((t) => outline.indexOf(t));
+    expect(order.every((x, i) => x >= 0 && (i === 0 || x > order[i - 1])), `order wrong: ${order}`);
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect(!(await tool("notion_get_blocks", { block: target, max_depth: 0 })).text.includes("Hot take"), "copy not undone");
+  });
+  await step("notion_copy_blocks: move defaults to a dry run; move then undo restores the original", async () => {
+    const toggle = await blockAt(richPage, "More");
+    const dry = await must("notion_copy_blocks", { block_ids: [toggle], to: target, move: true });
+    expect(dry.dry_run === true && dry.total_blocks >= 6, JSON.stringify(dry));
+    const r = await must("notion_copy_blocks", { block_ids: [toggle], to: target, move: true, dry_run: false });
+    expect((await tool("notion_find_blocks", { page: richPage, query: "^More$", regex: true })).json.count === 0, "original still there");
+    expect((await tool("notion_find_blocks", { page: target, query: "level 5", max_depth: 6 })).json.count === 1, "moved content missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect((await tool("notion_find_blocks", { page: richPage, query: "level 5", max_depth: 6 })).json.count === 1, "original not restored");
+    expect((await tool("notion_find_blocks", { page: target, query: "level 5", max_depth: 6 })).json.count === 0, "moved copy not removed");
+  });
+  await step("notion_copy_blocks: moving an original synced block is refused", async () => {
+    const synced = (await tool("notion_get_blocks", { block: richPage, max_depth: 0 })).text.match(/\(synced_block\).*⟨([^⟩]+)⟩/)?.[1];
+    const r = await tool("notion_copy_blocks", { block_ids: [synced], to: target, move: true, dry_run: false });
+    expect(r.isError && /synced/.test(r.text), r.text);
+  });
+  await step("notion_duplicate_page: content, icon, and sub-pages; undo", async () => {
+    await must("notion_create_page", { parent: richPage, title: "Child page", markdown: "child content" });
+    const dry = await must("notion_duplicate_page", { page: richPage, dry_run: true });
+    expect(dry.subpages.includes("Child page"), JSON.stringify(dry));
+    const r = await must("notion_duplicate_page", { page: richPage, to: pageId });
+    createdPages.push(r.page_id);
+    expect(r.subpages === 1, JSON.stringify(r));
+    const copy = await tool("notion_get_page", { page: r.page_id, max_depth: 6, max_blocks: 500 });
+    expect(copy.text.includes("(copy)") && copy.text.includes('"icon": "📊"'), copy.text.slice(0, 300));
+    expect(copy.text.includes("level 5") && copy.text.includes("(child_page) Child page"), "content or sub-page missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
+    expect(p.in_trash === true, "duplicate not trashed");
+  });
+  await step("notion_update_page: title, icon, cover, lock, move; undo", async () => {
+    const r = await must("notion_update_page", {
+      page: target, title: `${stamp} renamed`, icon: "🎯", cover: "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+      locked: true, move_to: richPage,
+    });
+    const p = (await call(() => n.pages.retrieve({ page_id: target }))) as unknown as Json;
+    expect(p.icon.emoji === "🎯" && p.cover && p.is_locked === true && p.parent.page_id === richPage, JSON.stringify({ icon: p.icon, parent: p.parent }));
+    await must("notion_undo", { undo_id: r.undo_id });
+    const q = (await call(() => n.pages.retrieve({ page_id: target }))) as unknown as Json;
+    expect(q.parent.page_id === pageId && q.icon === null && q.cover === null && !q.is_locked, JSON.stringify({ icon: q.icon, parent: q.parent, locked: q.is_locked }));
+  });
+  await step("notion_comments: add, list, reply; undo deletes", async () => {
+    const a = await must("notion_comments", { action: "add", target: richPage, text: "**Review** this" });
+    const b = await must("notion_comments", { action: "reply", discussion_id: a.discussion_id, text: "Done" });
+    const list = await must("notion_comments", { action: "list", target: richPage });
+    expect(list.count >= 2 && list.comments.some((c: Json) => c.text === "Review this"), JSON.stringify(list).slice(0, 300));
+    await must("notion_undo", { undo_id: b.undo_id });
+    await must("notion_undo", { undo_id: a.undo_id });
+    const after = await must("notion_comments", { action: "list", target: richPage });
+    expect(after.count === list.count - 2, `${after.count} comments left`);
+  });
+  await step("notion_list_templates: a database without templates says so", async () => {
+    const r = await tool("notion_list_templates", { database: main.db });
+    expect(!r.isError && /no templates|templates/.test(r.text), r.text);
+  });
+
   // ---------- page trash + undo ----------
   await step("notion_trash_page: trash then undo", async () => {
     const r = await must("notion_trash_page", { page: rowC });
@@ -580,6 +793,13 @@ try {
   if (process.env.SMOKE_KEEP) {
     console.log(`\nSMOKE_KEEP set; leaving databases: ${createdDatabases.join(", ")}`);
   } else {
+    for (const id of createdPages.reverse()) {
+      try {
+        await call(() => notion().pages.update({ page_id: id, in_trash: true } as never));
+      } catch {
+        // Already trashed (for example by an undo step).
+      }
+    }
     for (const id of createdDatabases.reverse()) {
       try {
         await call(() => notion().databases.update({ database_id: id, in_trash: true } as never));

@@ -63,21 +63,28 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 
 **Read**
 - `notion_search`: find pages and databases by title.
-- `notion_get_page`: properties plus a content outline with every block id.
+- `notion_get_page`: properties plus a content outline with every block id, or (`format: "markdown"`) the whole page as Notion-flavored markdown that can be written back.
 - `notion_get_blocks`: read one section of a large page.
 - `notion_find_blocks`: locate blocks by text or regex.
 - `notion_get_schema`: property types, options, status groups, relations.
 - `notion_query`: rows via simple `where` pairs or raw Notion filters.
 
 **Write content**
-- `notion_patch_block`: edit one block's text, checkbox, code language, or color.
+- `notion_patch_block`: edit one block's text, checkbox, code language or caption, color, toggle heading, callout icon, or a table row's cells.
 - `notion_insert_blocks`: add markdown or structured blocks at the start, end, or after a specific block.
-- `notion_replace_text`: find and replace across a page, keeping formatting (dry run by default).
+- `notion_replace_text`: find and replace across a page's text, table cells, captions, and title, keeping formatting (dry run by default).
 - `notion_delete_blocks`: trash specific blocks.
+- `notion_copy_blocks`: copy blocks with everything inside them to another spot, or move them (`move: true`, dry run by default).
+- `notion_comments`: list, add, and reply to comments.
+
+**Pages**
+- `notion_update_page`: title, icon, cover, lock, or move a page under another page or into a database.
+- `notion_duplicate_page`: copy a page with its content, icon, cover, properties, and sub-pages.
+- `notion_list_templates`: a database's templates, for `notion_create_page`'s `template`.
 
 **Write data**
 - `notion_update_properties`: set row fields with validation.
-- `notion_create_page`: new row or sub-page with content.
+- `notion_create_page`: new row or sub-page with content, an icon and cover, or from a database template.
 - `notion_bulk_update`: change every matching row (dry run by default).
 - `notion_trash_page`: trash a page.
 
@@ -95,12 +102,40 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 - `notion_automation_add`: check a rule against the live schema, save it, and preview what it would do.
 - `notion_automation_dry_run`: show what each rule would change right now. Never writes.
 
+### Content formats
+
+`notion_insert_blocks` and `notion_create_page` take `markdown` or structured `blocks`, and both can express every block type the API can create:
+
+| Content | Markdown | Structured block |
+|---|---|---|
+| Headings 1–4, toggle headings | `#`…`####`, `## Title {toggle="true"}` with indented children | `heading_1`…`heading_4`, `toggleable` |
+| Lists, to-dos, nesting | `-`, `1.`, `- [ ]`, indent to nest (any depth) | `children` |
+| Callouts | `> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` / `[!WARNING]` / `[!CAUTION]`, or `<callout icon="🔥" color="red_bg">` | `callout` with `icon` (emoji, URL, or local image) and `color` |
+| Toggles | `<details><summary>Title</summary> … </details>` | `toggle` |
+| Tables | pipe tables, or `<table header-row="true"><tr><td>…` | `table` with `rows`, `header_row`, `header_column` |
+| Columns | `<columns><column> … </column></columns>` | `column_list` with `columns` |
+| Tabs | `<tabs><tab>Title … </tab></tabs>` | `tab` with `tabs: [{title, children}]` |
+| Code, Mermaid diagrams | ```` ```python ````, ```` ```mermaid ```` | `code` with `language`, `caption` |
+| Equations | `$$ … $$` (block), `$x^2$` (inline) | `equation` with `expression` |
+| Images, files, PDF, video, audio | `![caption](url)`, `<file src="…"/>` | `image` etc. with `url` (web URL or local path; local files are uploaded) |
+| Bookmarks, embeds | `<bookmark url="…"/>`, `<embed src="…"/>` | `bookmark`, `embed` |
+| Synced blocks | `<synced_block> … </synced_block>` (new), `<synced_block url="…">` (reference) | `synced_block` with `children` or `synced_from` |
+| Links to pages, TOC, breadcrumb | `<link-to-page url="…"/>`, `<table_of_contents/>`, `<breadcrumb/>` | `link_to_page`, `table_of_contents`, `breadcrumb` |
+| Dividers | `---` | `divider` |
+
+Inline: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `<u>underline</u>`, `[link](url)`, `$x^2$`, `<span color="red">…</span>` (any color, or `blue_bg` for backgrounds), and mentions: `<mention-page url="…"/>`, `<mention-user email="…"/>`, `<mention-date start="2026-10-01"/>`. A block's color goes at the end of its line: `Text {color="blue"}`.
+
+These are the same tags Notion's markdown export uses, so `notion_get_page` with `format: "markdown"` returns markdown you can edit and insert back; the live test suite checks that a full page survives the round trip line for line. Local files can be uploaded from the working directory and the temp folder; set `NOTION_PLUS_UPLOAD_DIRS` (separated by `:`, or `;` on Windows) to allow other folders.
+
 The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing `notion_update_options` deletes the added options, which also clears them from any rows that used them since.
 
 ## Known Notion API limits
 
 - A block's type can't be changed in place; insert a new block and delete the old one.
-- Blocks can't be moved; insert a copy where you want it and delete the original. (Pages can be moved; a tool for both is planned.)
+- Blocks can't be moved, so `notion_copy_blocks` with `move: true` copies and then trashes the original: moved blocks get new ids and lose their comments. It refuses moves that would lose content the API can't recreate (databases, read-only blocks) or break synced-block references. Pages are moved natively.
+- There's no API for duplicating a page; `notion_duplicate_page` rebuilds it. Databases inside the page aren't copied (they're listed as skipped), and sub-pages land at the end of the copy.
+- Button blocks can't be created or read through the API. Breadcrumbs, bookmarks, and links to pages don't appear in Notion's markdown export; this server fills them in. Code captions aren't in the markdown export either.
+- A heading 4 can't be updated without resending its text; `notion_patch_block` handles that.
 - Notion's built-in database automations can't be created or edited through the API. Button blocks, AI blocks, and some embeds are read-only (the API returns them as `unsupported`).
 - Status options can now be added through the API; `notion_update_options` doesn't do it yet (planned). Views, including chart views, are also supported by the API and planned here.
 - Last-edited times are rounded to the minute, so the freshness check catches edits made in an earlier minute.
@@ -216,7 +251,7 @@ Versions follow semver; see [CHANGELOG.md](CHANGELOG.md).
 Built in phases, each ending with the build, unit tests, and the live suite passing:
 
 1. Foundations: tests, lint, CI, timeouts, partial-failure reporting, safer undo. (done, 0.2.0)
-2. Content: every creatable block type, rich text colors and mentions, markdown round trip, move/copy/duplicate, icons, covers, templates, comments.
+2. Content: every creatable block type, rich text colors and mentions, markdown round trip, move/copy/duplicate, icons, covers, templates, comments. (done, 0.3.0)
 3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create.
 4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages.
 5. Automations: schedules, run state, more actions, full management from Claude.

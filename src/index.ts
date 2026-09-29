@@ -5,6 +5,7 @@ import { registerReadTools } from "./tools/read.js";
 import { registerPageTools } from "./tools/pages.js";
 import { registerBlockTools } from "./tools/blocks.js";
 import { registerSafetyTools, registerSchemaTools } from "./tools/schema.js";
+import { registerAutomationTools } from "./tools/automations.js";
 
 const server = new McpServer(
   { name: "notion-plus-mcp-server", version: "0.1.0" },
@@ -22,6 +23,7 @@ registerPageTools(server);
 registerBlockTools(server);
 registerSchemaTools(server);
 registerSafetyTools(server);
+registerAutomationTools(server);
 
 async function main(): Promise<void> {
   if (!process.env.NOTION_TOKEN) {

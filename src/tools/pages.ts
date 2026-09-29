@@ -7,17 +7,14 @@ import { appendSpecs, markdownToSpecs, type BlockSpec } from "../services/blocks
 import { textToTitle } from "../services/richtext.js";
 import {
   buildWhereFilter,
-  coerceValue,
   dataSourceTitle,
   invalidateSchema,
   pageDataSourceId,
   resolveDataSource,
-  resolvePropertyName,
-  restoreValue,
-  simplify,
   withFullProperties,
 } from "../services/schema.js";
 import { record, type UndoOp } from "../services/journal.js";
+import { beforeAfter, getFullPage, preparePayload, snapshot } from "../services/writes.js";
 import { DESTRUCTIVE, ok, safe, WRITE } from "./util.js";
 
 export const blockSpecSchema: z.ZodType<BlockSpec> = z.lazy(() =>
@@ -38,49 +35,6 @@ export function checkFresh(actual: string, expected: string | undefined, what: s
       `${what} was edited at ${actual}, after the version you read (${expected}). Re-read it and try again so you don't overwrite that change.`
     );
   }
-}
-
-async function preparePayload(
-  ds: DataSourceObjectResponse,
-  values: Record<string, unknown>,
-  allowNew: boolean
-): Promise<{ payload: Record<string, Record<string, unknown>>; notes: string[] }> {
-  const payload: Record<string, Record<string, unknown>> = {};
-  const notes: string[] = [];
-  const errors: string[] = [];
-  for (const [raw, value] of Object.entries(values)) {
-    try {
-      const r = resolvePropertyName(ds, raw);
-      if (r.note) notes.push(r.note);
-      const c = await coerceValue(r.name, ds.properties[r.name], value, allowNew);
-      payload[r.name] = c.payload;
-      notes.push(...c.notes);
-    } catch (e) {
-      errors.push((e as Error).message);
-    }
-  }
-  // Report every problem at once so the model can fix them in a single retry.
-  if (errors.length) throw new Error(`Nothing was written. Fix these first:\n- ${errors.join("\n- ")}`);
-  return { payload, notes };
-}
-
-async function getFullPage(id: string): Promise<PageObjectResponse> {
-  const p = await call(() => notion().pages.retrieve({ page_id: id }));
-  if (!isFullPage(p)) throw new Error(`Could not read page ${id}.`);
-  return p;
-}
-
-function beforeAfter(page: PageObjectResponse, names: string[]): Record<string, unknown> {
-  return Object.fromEntries(names.map((n) => [n, simplify(page.properties[n])]));
-}
-
-function snapshot(page: PageObjectResponse, names: string[]): UndoOp {
-  const properties: Record<string, unknown> = {};
-  for (const n of names) {
-    const v = restoreValue(page.properties[n]);
-    if (v) properties[n] = v;
-  }
-  return { kind: "page_properties", page_id: page.id, properties };
 }
 
 export function registerPageTools(server: McpServer): void {

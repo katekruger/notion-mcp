@@ -87,6 +87,11 @@ Tip: turn off the built-in Notion connector while using this one so Claude doesn
 - `notion_history`: recent changes and their undo ids.
 - `notion_undo`: revert a change.
 
+**Automations** (see below)
+- `notion_automation_list`: show the rules.
+- `notion_automation_add`: check a rule against the live schema, save it, and preview what it would do.
+- `notion_automation_dry_run`: show what each rule would change right now. Never writes.
+
 The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time, so it will also overwrite later edits to the same fields. Undoing `notion_update_options` deletes the added options, which also clears them from any rows that used them since.
 
 ## Known Notion API limits
@@ -105,6 +110,69 @@ The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; s
 - Notion merges adjacent text segments with identical formatting when you read them back, and normalizes link URLs (for example adding a trailing `/`).
 - Undoing a large insert trashes blocks one request at a time (about 3 per second).
 
+## Automations
+
+Rules in `automations/rules.json` run on a schedule. Each rule is a database query; every row it matches gets the rule's actions. There are no webhooks: a GitHub Actions workflow checks hourly.
+
+```json
+{
+  "version": 1,
+  "timezone": "America/New_York",
+  "rules": [
+    {
+      "id": "stamp-completed",
+      "database": "https://www.notion.so/…",
+      "when": { "where": { "Status": "Done", "Completed Date": null } },
+      "actions": [{ "set": { "Completed Date": "{{today}}" } }]
+    },
+    {
+      "id": "archive-stale",
+      "database": "https://www.notion.so/…",
+      "when": { "where": { "Status": "Done" }, "relative": [{ "property": "$last_edited", "older_than_days": 30 }] },
+      "actions": [{ "trash": true }],
+      "limit": 20
+    },
+    {
+      "id": "welcome-high-priority",
+      "database": "https://www.notion.so/…",
+      "when": { "where": { "Priority": "High" } },
+      "actions": [{ "comment": "Flagged high priority: {{page.Name}}" }, { "append": "- [ ] Triage by {{today}}" }],
+      "marker": "Automated"
+    }
+  ]
+}
+```
+
+**Conditions (`when`)**: `where` and `filter` work exactly like `notion_query`. `relative` takes `{property, older_than_days}` or `{property, newer_than_days}` for a date, created time, or last edited time property, or `"$created"` / `"$last_edited"`.
+
+**Actions**: `{"set": {...}}` (validated like `notion_update_properties`), `{"append": "markdown"}` or blocks, `{"comment": "text"}`, `{"trash": true}`. Strings can use `{{today}}` (in the file's `timezone`), `{{now}}`, `{{page.<Property>}}`, `{{page.url}}`, and `{{page.id}}`.
+
+**Each rule acts once per row.** Because rules are re-checked every hour, a rule must stop matching a row after acting on it, or it would act again on every run. The runner refuses a rule unless it changes a property its condition checks to a different value, trashes the row, or names a `marker`: a checkbox property the runner requires to be unchecked and then checks.
+
+**Other options**: `enabled` (default true), `limit` (rows per run, default 50; the rest wait for the next run), `allow_new_options`, `data_source_name`.
+
+### Running
+
+```bash
+npm run automations -- --dry-run            # preview every enabled rule
+npm run automations -- --rule stamp-completed
+npm run automations                         # apply
+```
+
+One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it. Comments can't be deleted through the API; undo leaves them.
+
+From Claude, add rules with `notion_automation_add` (it saves to the local rules file); commit `automations/rules.json` so the scheduled workflow picks them up.
+
+### GitHub Actions
+
+`.github/workflows/automations.yml` runs hourly and has a manual **Run workflow** button with `dry_run` (on by default for manual runs) and `rule` inputs.
+
+1. Create an internal integration for automations and share only the databases your rules touch with it. Enable insert comments if rules comment. A separate token limits what the scheduled job can reach.
+2. In the repo, go to Settings → Secrets and variables → Actions and add `NOTION_TOKEN`.
+3. Each run writes its summary to the job page and uploads the undo journal as an artifact (`notion-plus-journal-<run id>`, kept 90 days). To undo a scheduled run: download the artifact, unzip it to a folder, and run the MCP server or `npm run inspect` with `NOTION_PLUS_HOME` set to that folder, then call `notion_undo` with the id from the job summary.
+
+GitHub may start scheduled runs a few minutes late, and turns off schedules in repos with no activity for 60 days.
+
 ## Development
 
 ```bash
@@ -117,5 +185,4 @@ npm run smoke       # live test against a real workspace
 
 ## Roadmap
 
-- **Automations:** rules and schedules that run as GitHub Actions cron jobs, for example "stamp Completed Date when Status is Done" or "archive rows untouched for 30 days."
 - Page templates, comments, and move/copy helpers.

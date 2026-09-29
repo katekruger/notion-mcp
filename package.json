@@ -14,7 +14,8 @@
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
     "test": "tsx --test test/*.test.ts",
     "smoke": "tsx scripts/smoke.ts",
-    "typecheck": "tsc -p tsconfig.check.json"
+    "typecheck": "tsc -p tsconfig.check.json",
+    "automations": "node dist/automations-cli.js"
   },
   "engines": {
     "node": ">=18"

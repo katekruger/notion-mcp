@@ -17,12 +17,15 @@ try {
   // No .env is fine; the variables may come from the environment.
 }
 process.env.NOTION_PLUS_HOME = mkdtempSync(path.join(os.tmpdir(), "notion-plus-smoke-"));
+process.env.NOTION_PLUS_RULES = path.join(process.env.NOTION_PLUS_HOME, "rules.json"); // never touch the repo's rules
 
 const { call, normalizeId, notion } = await import("../src/services/notion.js");
 const { registerReadTools } = await import("../src/tools/read.js");
 const { registerPageTools } = await import("../src/tools/pages.js");
 const { registerBlockTools } = await import("../src/tools/blocks.js");
 const { registerSafetyTools, registerSchemaTools } = await import("../src/tools/schema.js");
+const { registerAutomationTools } = await import("../src/tools/automations.js");
+const { runAll } = await import("../src/services/automations.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 type Handler = (args: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>;
@@ -33,7 +36,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerSchemaTools, registerSafetyTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerSchemaTools, registerSafetyTools, registerAutomationTools]) {
   register(registry as never);
 }
 
@@ -136,6 +139,7 @@ async function main(): Promise<void> {
     Due: { date: {} },
     Points: { number: { format: "number" } },
     Done: { checkbox: {} },
+    Automated: { checkbox: {} },
     Owner: { people: {} },
     Related: { relation: { data_source_id: related.ds, type: "single_property", single_property: {} } },
   };
@@ -449,6 +453,73 @@ async function main(): Promise<void> {
     await must("notion_undo", { undo_id: r.undo_id });
     expect((await prop(rowA, "Points")) === 1200, "rename not undone");
   });
+
+  // ---------- automations ----------
+  if (hasStatus) {
+    let trashRow = "";
+    const today = new Date().toISOString().slice(0, 10);
+    const rules = [
+      {
+        id: "stamp-done",
+        database: main.db,
+        when: { where: { Status: "Done", Due: null } },
+        actions: [{ set: { Due: "{{today}}" } }, { append: "Closed on {{today}}" }, { comment: "Closed by automation: {{page.Name}}" }],
+      },
+      { id: "flag-high", database: main.db, when: { where: { Priority: "High" } }, actions: [{ comment: "High priority row" }], marker: "Automated" },
+      { id: "trash-marked", database: main.db, when: { where: { Name: "Trash me" } }, actions: [{ trash: true }] },
+    ];
+    await step("notion_automation_add: rules checked against the schema, with preview", async () => {
+      trashRow = (await must("notion_create_page", { parent: main.db, title: "Trash me" })).page_id;
+      await must("notion_update_properties", { page: rowB, properties: { Status: "Done", Due: null } });
+      for (const rule of rules) {
+        const r = await must("notion_automation_add", { rule });
+        expect(r.saved === rule.id, JSON.stringify(r));
+      }
+      const listed = await must("notion_automation_list", {});
+      expect(listed.rules.length === 3, `listed ${listed.rules.length} rules`);
+    });
+    await step("notion_automation_add: a rule that would repeat forever is refused", async () => {
+      const r = await tool("notion_automation_add", { rule: { id: "loop", database: main.db, when: { where: { Status: "Done" } }, actions: [{ comment: "again" }] } });
+      expect(r.isError && /every run/.test(r.text), r.text);
+    });
+    await step("notion_automation_add: relative date conditions query cleanly", async () => {
+      const r = await must("notion_automation_add", {
+        rule: { id: "recent", enabled: false, database: main.db, when: { relative: [{ property: "$created", newer_than_days: 1 }] }, actions: [{ comment: "x" }], marker: "Automated" },
+      });
+      expect(/would act on [1-9]/.test(r.preview), r.preview);
+    });
+    await step("notion_automation_dry_run: previews and writes nothing", async () => {
+      const r = await tool("notion_automation_dry_run", {});
+      expect(!r.isError && /stamp-done.*would act on 1/.test(r.text) && /flag-high.*would act on 1/.test(r.text) && /trash-marked.*would act on 1/.test(r.text), r.text);
+      expect((await prop(rowB, "Due")) === null, "dry run wrote Due");
+    });
+    let undoIds: string[] = [];
+    await step("automations run: set, append, comment, marker, trash", async () => {
+      const results = await runAll({ dryRun: false });
+      for (const res of results) expect(!res.error && res.acted === 1, `${res.rule}: ${res.error ?? `acted ${res.acted}`} ${JSON.stringify(res.rows)}`);
+      undoIds = results.map((r) => r.undo_id).filter((x): x is string => Boolean(x));
+      expect((await prop(rowB, "Due")) === today, `Due is ${JSON.stringify(await prop(rowB, "Due"))}`);
+      expect((await tool("notion_find_blocks", { page: rowB, query: `Closed on ${today}` })).json.count === 1, "append missing");
+      const comments = (await call(() => n.comments.list({ block_id: rowB }))).results as Json[];
+      expect(comments.some((c) => c.rich_text.map((t: Json) => t.plain_text).join("").includes("Closed by automation: Row B")), "comment missing");
+      expect((await prop(rowA, "Automated")) === true, "marker not set");
+      const t = (await call(() => n.pages.retrieve({ page_id: trashRow }))) as unknown as Json;
+      expect(t.in_trash === true, "row not trashed");
+    });
+    await step("automations run again: nothing matches (rules are one-time per row)", async () => {
+      const results = await runAll({ dryRun: false });
+      expect(results.every((r) => r.acted === 0 && !r.error), JSON.stringify(results.map((r) => [r.rule, r.acted, r.error])));
+    });
+    await step("automations undo: every rule's run reverts", async () => {
+      for (const id of undoIds) await must("notion_undo", { undo_id: id });
+      expect((await prop(rowB, "Due")) === null, "Due not reverted");
+      expect((await tool("notion_find_blocks", { page: rowB, query: "Closed on" })).json.count === 0, "appended block not removed");
+      expect((await prop(rowA, "Automated")) === false, "marker not reverted");
+      const t = (await call(() => n.pages.retrieve({ page_id: trashRow }))) as unknown as Json;
+      expect(t.in_trash === false, "trashed row not restored");
+      return "comments stay (the API can't delete them); the journal says so";
+    });
+  }
 
   // ---------- content limits ----------
   await step("limits: 5000-char paragraph is written in full", async () => {

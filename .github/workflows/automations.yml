@@ -1,0 +1,50 @@
+name: Notion automations
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly; GitHub may start scheduled runs a few minutes late
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only; write nothing to Notion"
+        type: boolean
+        default: true
+      rule:
+        description: "Run only this rule id (blank for all enabled rules)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notion-automations
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run rules
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PLUS_HOME: ${{ runner.temp }}/notion-plus
+          AUTOMATIONS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          RULE: ${{ inputs.rule }}
+        run: npm run automations -- ${RULE:+--rule "$RULE"}
+      - name: Save undo journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notion-plus-journal-${{ github.run_id }}
+          path: ${{ runner.temp }}/notion-plus/journal.json
+          if-no-files-found: ignore
+          retention-days: 90

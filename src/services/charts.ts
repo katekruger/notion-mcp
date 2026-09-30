@@ -1,6 +1,7 @@
 // Chart images: data → Vega-Lite → SVG → PNG, styled to one validated palette so every chart reads as one system.
-// Colors are the reference categorical palette (light mode; Notion pages show images as-is in either theme),
-// assigned in fixed slot order and folded into "Other" past eight series.
+// Colors are the reference categorical palette, assigned in fixed slot order and folded into "Other" past eight
+// series. Notion shows images as-is in either theme (a page can't swap images by theme), so `theme` picks the
+// surface: light, Notion's dark background, or transparent with mid-gray text that reads on both.
 // Rendering libraries load on first use: resvg ships a native binary per platform, so a bundle built for another
 // platform still starts and serves every other tool, and only chart images report the problem.
 import type * as vl from "vega-lite";
@@ -12,10 +13,22 @@ export type ChartType = (typeof CHART_TYPES)[number];
 
 /** Validated categorical order (see the dataviz reference palette); order is the CVD-safety mechanism. */
 export const PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
-const SURFACE = "#ffffff";
-const TEXT = "#0b0b0b";
-const TEXT_2 = "#52514e";
-const GRID = "#e8e7e3";
+export const CHART_THEMES = ["light", "dark", "transparent"] as const;
+export type ChartTheme = (typeof CHART_THEMES)[number];
+interface Theme {
+  /** null leaves the image transparent. */
+  surface: string | null;
+  text: string;
+  text2: string;
+  grid: string;
+}
+const THEMES: Record<ChartTheme, Theme> = {
+  light: { surface: "#ffffff", text: "#0b0b0b", text2: "#52514e", grid: "#e8e7e3" },
+  // Notion's dark page background, so the image sits flush on dark pages.
+  dark: { surface: "#191919", text: "#f0efed", text2: "#a5a4a0", grid: "#373735" },
+  // Mid-gray clears 4:1 contrast on both white and Notion's dark background.
+  transparent: { surface: null, text: "#7f7e7a", text2: "#7f7e7a", grid: "rgba(127,126,122,0.3)" },
+};
 const FONT = "Inter, -apple-system, Segoe UI, Helvetica, Arial, DejaVu Sans, sans-serif";
 /** Scatter/bubble colors must stay distinguishable across every pair; only the first three slots are. */
 const MAX_SCATTER_SERIES = 3;
@@ -39,6 +52,8 @@ export interface ChartSpec {
   height?: number;
   /** Sort categories by value (descending) instead of input order. Ignored for time series. */
   sort_by_value?: boolean;
+  /** Image surface; default light. */
+  theme?: ChartTheme;
 }
 
 function d3Format(f: string | undefined): string {
@@ -99,6 +114,9 @@ export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.Top
   const multi = series.length > 1;
   const temporal = isTemporal(rows) && ["line", "area", "stacked_area", "column", "stacked_column", "grouped_column"].includes(spec.type);
   const fmt = d3Format(spec.value_format);
+  const th = THEMES[spec.theme ?? "light"];
+  // Separators between bars and slices are drawn in the surface color; with no surface there are none.
+  const sep = th.surface ? { stroke: th.surface, strokeWidth: 2 } : { strokeWidth: 0 };
   const width = spec.width ?? 640;
   const height = spec.height ?? 360;
   const color = multi
@@ -111,7 +129,7 @@ export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.Top
     $schema: "https://vega.github.io/schema/vega-lite/v6.json",
     width,
     height,
-    background: SURFACE,
+    background: th.surface ?? "transparent",
     padding: 16,
     // `si` keeps stacks in legend order (first series at the baseline) instead of alphabetical.
     data: { values: rows.map((r) => ({ ...r, x: typeof r.x === "number" ? r.x : String(r.x), si: r.series === undefined ? 0 : series.indexOf(r.series) })) },
@@ -119,18 +137,18 @@ export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.Top
     config: {
       font: FONT,
       view: { stroke: null },
-      title: { anchor: "start", fontSize: 16, fontWeight: 600, color: TEXT, subtitleColor: TEXT_2, subtitleFontSize: 12, offset: 12 },
+      title: { anchor: "start", fontSize: 16, fontWeight: 600, color: th.text, subtitleColor: th.text2, subtitleFontSize: 12, offset: 12 },
       axis: {
-        labelColor: TEXT_2, titleColor: TEXT_2, labelFontSize: 11, titleFontSize: 11, titleFontWeight: 500,
-        gridColor: GRID, domainColor: GRID, tickColor: GRID, labelPadding: 6,
+        labelColor: th.text2, titleColor: th.text2, labelFontSize: 11, titleFontSize: 11, titleFontWeight: 500,
+        gridColor: th.grid, domainColor: th.grid, tickColor: th.grid, labelPadding: 6,
       },
       axisX: { grid: false },
-      legend: { labelColor: TEXT_2, labelFontSize: 11, symbolType: "circle", symbolSize: 80 },
-      bar: { cornerRadiusEnd: 4, discreteBandSize: 24, stroke: SURFACE, strokeWidth: 2 },
+      legend: { labelColor: th.text2, labelFontSize: 11, symbolType: "circle", symbolSize: 80 },
+      bar: { cornerRadiusEnd: 4, discreteBandSize: 24, ...sep },
       line: { strokeWidth: 2, strokeCap: "round", strokeJoin: "round" },
-      point: { size: 80, filled: true, stroke: SURFACE, strokeWidth: 2 },
-      arc: { stroke: SURFACE, strokeWidth: 2 },
-      text: { color: TEXT_2, fontSize: 11 },
+      point: { size: 80, filled: true, ...sep },
+      arc: { ...sep },
+      text: { color: th.text2, fontSize: 11 },
     },
   };
 
@@ -202,8 +220,8 @@ export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.Top
           { mark: { type: "arc", ...(spec.type === "donut" ? { innerRadius: Math.min(width, height) * 0.22 } : {}), outerRadius: Math.min(width, height) * 0.4 } },
           {
             // Labels wear the text color; the slice beside them carries identity.
-            mark: { type: "text", radius: Math.min(width, height) * 0.46, fontSize: 11, color: TEXT_2 },
-            encoding: { text: { field: "y", type: "quantitative", format: fmt }, color: { value: TEXT_2 } },
+            mark: { type: "text", radius: Math.min(width, height) * 0.46, fontSize: 11, color: th.text2 },
+            encoding: { text: { field: "y", type: "quantitative", format: fmt }, color: { value: th.text2 } },
           },
         ],
       };
@@ -244,8 +262,9 @@ export async function renderPng(spec: vl.TopLevelSpec): Promise<Uint8Array> {
   const view = new vega.View(vega.parse(compiled), { renderer: "none" });
   const svg = await view.toSVG();
   view.finalize();
+  const bg = (spec as { background?: string }).background;
   const resvg = new Resvg(svg, {
-    background: SURFACE,
+    ...(bg && bg !== "transparent" ? { background: bg } : {}),
     fitTo: { mode: "zoom", value: 2 },
     font: { loadSystemFonts: true, defaultFontFamily: "DejaVu Sans" },
   });

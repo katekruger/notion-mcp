@@ -740,6 +740,34 @@ async function main(): Promise<void> {
     const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
     expect(p.in_trash === true, "duplicate not trashed");
   });
+  await step("notion_duplicate_page: a database on the page is copied in place with rows and internal relations", async () => {
+    const holder = (await call(() => n.pages.create({ parent: { page_id: pageId }, properties: { title: { title: [{ text: { content: `${stamp} db holder` } }] } } } as never))).id;
+    createdPages.push(holder);
+    await call(() => n.blocks.children.append({ block_id: holder, children: [{ paragraph: { rich_text: [{ text: { content: "above" } }] } }] } as never));
+    const db = (await call(() => n.databases.create({
+      parent: { type: "page_id", page_id: holder }, is_inline: true, title: [{ text: { content: "Inner" } }],
+      initial_data_source: { properties: { Task: { title: {} }, Pts: { number: { format: "dollar" } } } },
+    } as never))) as unknown as Json;
+    const ds = db.data_sources[0].id;
+    await call(() => n.dataSources.update({ data_source_id: ds, properties: { Parent: { relation: { data_source_id: ds, type: "dual_property", dual_property: { synced_property_name: "Children" } } } } } as never));
+    const a = await call(() => n.pages.create({ parent: { data_source_id: ds }, properties: { Task: { title: [{ text: { content: "A" } }] }, Pts: { number: 3 } } } as never));
+    await call(() => n.pages.create({ parent: { data_source_id: ds }, properties: { Task: { title: [{ text: { content: "B" } }] }, Parent: { relation: [{ id: a.id }] } } } as never));
+    await call(() => n.blocks.children.append({ block_id: holder, children: [{ paragraph: { rich_text: [{ text: { content: "below" } }] } }] } as never));
+    const dry = await must("notion_duplicate_page", { page: holder, dry_run: true });
+    expect(dry.databases?.[0]?.data_sources?.[0]?.rows === 2, JSON.stringify(dry));
+    const r = await must("notion_duplicate_page", { page: holder });
+    createdPages.push(r.page_id);
+    expect(r.databases.length === 1 && r.databases[0].rows === 2, JSON.stringify(r));
+    const kids = (await call(() => n.blocks.children.list({ block_id: r.page_id }))) as unknown as Json;
+    expect(kids.results.map((b: Json) => b.type).join(",") === "paragraph,child_database,paragraph", "database not in place");
+    const copyDb = (await call(() => n.databases.retrieve({ database_id: r.databases[0].database_id }))) as unknown as Json;
+    const copyDs = copyDb.data_sources[0].id;
+    const rows = (await call(() => n.dataSources.query({ data_source_id: copyDs } as never))) as unknown as Json;
+    const b = rows.results.find((x: Json) => x.properties.Task.title[0]?.plain_text === "B");
+    const copiedA = rows.results.find((x: Json) => x.properties.Task.title[0]?.plain_text === "A");
+    expect(b?.properties.Parent.relation[0]?.id === copiedA?.id, "relation not re-pointed at the copied row");
+    await must("notion_undo", { undo_id: r.undo_id });
+  });
   await step("notion_update_page: title, icon, cover, lock, move; undo", async () => {
     const r = await must("notion_update_page", {
       page: target, title: `${stamp} renamed`, icon: "🎯", cover: "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
@@ -755,7 +783,7 @@ async function main(): Promise<void> {
     const a = await must("notion_comments", { action: "add", target: richPage, text: "**Review** this" });
     const b = await must("notion_comments", { action: "reply", discussion_id: a.discussion_id, text: "Done" });
     const list = await must("notion_comments", { action: "list", target: richPage });
-    expect(list.count >= 2 && list.comments.some((c: Json) => c.text === "Review this"), JSON.stringify(list).slice(0, 300));
+    expect(list.count >= 2 && list.comments.some((c: Json) => c.text === "**Review** this"), JSON.stringify(list).slice(0, 300));
     await must("notion_undo", { undo_id: b.undo_id });
     await must("notion_undo", { undo_id: a.undo_id });
     const after = await must("notion_comments", { action: "list", target: richPage });

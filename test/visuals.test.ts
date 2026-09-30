@@ -145,3 +145,15 @@ test("mermaid: gantt builder escapes names and marks status; checker catches com
   assert.throws(() => checkMermaid("gantt\n  title x"), /no tasks/);
   assert.throws(() => normalizeSpecs([{ type: "code", language: "mermaid", text: "nonsense" }]), /start with a type/);
 });
+
+test("chart themes: dark uses Notion's dark surface, transparent drops the background and separators", () => {
+  const rows = [{ x: "a", y: 1 }, { x: "b", y: 2 }];
+  const dark = vegaLiteSpec({ type: "bar", title: "T", theme: "dark" }, rows).spec as unknown as { background: string; config: { title: { color: string }; bar: { stroke?: string } } };
+  assert.equal(dark.background, "#191919");
+  assert.equal(dark.config.bar.stroke, "#191919");
+  assert.notEqual(dark.config.title.color, "#0b0b0b");
+  const clear = vegaLiteSpec({ type: "pie", theme: "transparent" }, rows).spec as unknown as { background: string; config: { arc: { stroke?: string; strokeWidth: number } } };
+  assert.equal(clear.background, "transparent");
+  assert.deepEqual(clear.config.arc, { strokeWidth: 0 });
+  assert.equal((vegaLiteSpec({ type: "bar" }, rows).spec as unknown as { background: string }).background, "#ffffff");
+});

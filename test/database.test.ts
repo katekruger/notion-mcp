@@ -170,3 +170,23 @@ test("configToRequest re-creates select, status (with groups), and rollups for u
   assert.deepEqual(configToRequest(src, props.Roll), { type: "rollup", rollup: { relation_property_name: "Rel", rollup_property_name: "Name", function: "count" } });
   assert.equal(configToRequest(src, props.Name), null);
 });
+
+test("splitSchema: internal relations and their rollups wait, outside two-way relations become one-way", async () => {
+  const { splitSchema } = await import("../src/services/dbcopy.js");
+  const src = {
+    ...ds,
+    properties: {
+      Name: ds.properties.Name,
+      Points: ds.properties.Points,
+      Parent: { id: "pa", name: "Parent", type: "relation", relation: { data_source_id: "ds", type: "dual_property", dual_property: { synced_property_name: "Children" } } },
+      Children: { id: "ch", name: "Children", type: "relation", relation: { data_source_id: "ds", type: "dual_property", dual_property: { synced_property_name: "Parent" } } },
+      Kids: { id: "k", name: "Kids", type: "rollup", rollup: { relation_property_name: "Children", rollup_property_name: "Name", function: "count" } },
+      Client: { id: "cl", name: "Client", type: "relation", relation: { data_source_id: "other", type: "dual_property", dual_property: { synced_property_name: "Tasks" } } },
+    },
+  } as unknown as DataSourceObjectResponse;
+  const r = splitSchema(src, new Set(["ds"]));
+  assert.deepEqual(Object.keys(r.first).sort(), ["Client", "Name", "Points"]);
+  assert.deepEqual(r.first.Client, { type: "relation", relation: { data_source_id: "other", type: "single_property", single_property: {} } });
+  assert.deepEqual(Object.keys(r.later).sort(), ["Kids", "Parent"]);
+  assert.match(r.notes.join(" "), /Client.*one-way/);
+});

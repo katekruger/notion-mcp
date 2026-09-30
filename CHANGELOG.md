@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.8.0
+
+### Added
+- `notion_duplicate_page` copies databases on the page: every data source's schema, and (unless `databases: "schema"` or `"none"`) up to 500 rows per data source with their values and content. Relations and rollups inside the copy are re-pointed at the copied data source and rows.
+- Chart `theme`: `light`, `dark` (Notion's dark background), or `transparent`, for `notion_create_chart`, stored recipes, and report charts.
+
+### Changed
+- Duplicated sub-pages and databases keep their position in the page instead of moving to the end.
+- Release workflow: Intel Mac bundles build on `macos-15-intel` (`macos-13` is retired), and one platform failing no longer blocks the others from publishing.
+
+### Fixed
+- README: the comparison table and limits section understated schema support and still listed views as planned.
+
 ## 0.7.0
 
 ### Added

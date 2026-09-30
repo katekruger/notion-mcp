@@ -1,12 +1,12 @@
-// Live smoke test: runs every tool handler against a real Notion workspace.
+// Live integration suite: runs every tool handler against a real Notion workspace.
 //
-//   NOTION_TOKEN=ntn_... NOTION_TEST_PAGE=<page url or id> npm run smoke
+//   NOTION_TOKEN=ntn_... NOTION_TEST_PAGE=<page url or id> npm run test:live
 //   (or put both in .env)
 //
 // Everything is created inside a fresh pair of databases under NOTION_TEST_PAGE and
 // trashed at the end, even when steps fail. The undo journal goes to a temp folder,
 // never to ~/.notion-plus. Set SMOKE_KEEP=1 to leave the databases for inspection.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -25,6 +25,9 @@ const { registerPageTools } = await import("../src/tools/pages.js");
 const { registerBlockTools } = await import("../src/tools/blocks.js");
 const { registerSafetyTools, registerSchemaTools } = await import("../src/tools/schema.js");
 const { registerAutomationTools } = await import("../src/tools/automations.js");
+const { registerContentTools } = await import("../src/tools/content.js");
+const { registerDatabaseTools } = await import("../src/tools/database.js");
+const { registerVisualTools } = await import("../src/tools/visuals.js");
 const { runAll } = await import("../src/services/automations.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -36,7 +39,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerSchemaTools, registerSafetyTools, registerAutomationTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools]) {
   register(registry as never);
 }
 
@@ -64,11 +67,12 @@ async function must(name: string, args: Record<string, unknown>): Promise<Json> 
 
 const results: { step: string; ok: boolean; detail: string }[] = [];
 const touched = new Set<string>();
-async function step(name: string, fn: () => Promise<string | void>): Promise<void> {
+async function step(name: string, fn: () => Promise<unknown>): Promise<void> {
   touched.add(name.split(":")[0]);
   const started = Date.now();
   try {
-    const detail = (await fn()) ?? "";
+    const out = await fn();
+    const detail = typeof out === "string" ? out : "";
     results.push({ step: name, ok: true, detail });
     console.log(`  ok    ${name} (${Date.now() - started} ms)${detail ? ` - ${detail}` : ""}`);
   } catch (e) {
@@ -91,6 +95,13 @@ const pageId = normalizeId(testPage);
 const stamp = `smoke-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 const n = notion();
 const createdDatabases: string[] = [];
+const createdPages: string[] = [];
+
+async function blockText(id: string): Promise<string> {
+  const b = (await call(() => n.blocks.retrieve({ block_id: id }))) as unknown as Json;
+  if (b.type === "table_row") return b.table_row.cells.map((c: Json[]) => c.map((s) => s.plain_text).join("")).join(" | ");
+  return (b[b.type].rich_text ?? []).map((s: Json) => s.plain_text).join("");
+}
 
 function rt(content: string) {
   return [{ type: "text", text: { content } }];
@@ -305,6 +316,21 @@ async function main(): Promise<void> {
     expect(r.isError && /edited at/.test(r.text), r.text);
   });
 
+  await step("notion_undo: refuses to overwrite a later edit, then force overwrites it", async () => {
+    const r = await must("notion_update_properties", { page: rowA, properties: { Points: 7 } });
+    // Notion reports edit times to the minute, so the outside edit must land in a later minute to be visible.
+    const wait = 61_000 - (Date.now() % 60_000);
+    await new Promise((res) => setTimeout(res, wait));
+    await call(() => n.pages.update({ page_id: rowA, properties: { Points: { number: 8 } } } as never));
+    const refused = await tool("notion_undo", { undo_id: r.undo_id });
+    expect(refused.isError && /Nothing was undone/.test(refused.text), refused.text);
+    expect((await prop(rowA, "Points")) === 8, "refused undo still wrote");
+    const forced = await must("notion_undo", { undo_id: r.undo_id, force: true });
+    expect(forced.overwrote_later_edits?.length === 1, JSON.stringify(forced));
+    expect((await prop(rowA, "Points")) === 1200, "forced undo did not restore Points");
+    return `waited ${Math.round(wait / 1000)}s for the next minute`;
+  });
+
   if (hasStatus) {
     await step("notion_bulk_update: dry_run, apply, undo", async () => {
       const dry = await must("notion_bulk_update", { database: main.db, where: { Status: "Not started" }, set: { Status: "In progress" } });
@@ -396,7 +422,7 @@ async function main(): Promise<void> {
     expect(dry.dry_run && dry.total_replacements === 2, `dry run found ${dry.total_replacements}`);
     expect((await tool("notion_find_blocks", { page: rowA, query: "Q4" })).json.count === 0, "dry run wrote");
     const applied = await must("notion_replace_text", { page: rowA, find: "Q3", replace: "Q4", dry_run: false });
-    expect(applied.blocks_changed === 2, JSON.stringify(applied));
+    expect(applied.changed === 2, JSON.stringify(applied));
     const intro = await blockAt(rowA, "Q4 bold");
     const b = (await call(() => n.blocks.retrieve({ block_id: intro }))) as unknown as Json;
     const boldSeg = b.paragraph.rich_text.find((s: Json) => s.plain_text.includes("Q4"));
@@ -416,14 +442,14 @@ async function main(): Promise<void> {
   });
 
   // ---------- schema writes + undo ----------
-  await step("notion_add_property: add then undo", async () => {
-    const r = await must("notion_add_property", { database: main.db, name: "Extra", type: "number" });
+  await step("notion_schema add: add then undo", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add", definition: { name: "Extra", type: "number" } });
     await must("notion_undo", { undo_id: r.undo_id });
     const s = await must("notion_get_schema", { database: main.db });
     expect(!s.properties.some((p: Json) => p.name === "Extra"), "Extra still present");
   });
-  await step("notion_update_options: add keeps rows; undo removes only the added option", async () => {
-    const r = await must("notion_update_options", { database: main.db, property: "Priority", add: ["Medium"] });
+  await step("notion_schema add_options: add keeps rows; undo removes only the added option", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add_options", property: "Priority", options: ["Medium"] });
     expect((await prop(rowA, "Priority")) === "High", "row A lost its option after adding one");
     await must("notion_update_properties", { page: rowB, properties: { Priority: "Medium" } });
     await must("notion_undo", { undo_id: r.undo_id });
@@ -433,9 +459,9 @@ async function main(): Promise<void> {
     expect((await prop(rowA, "Priority")) === "High", "row A lost High after undo");
     return `row B (was Medium) now: ${JSON.stringify(await prop(rowB, "Priority"))}`;
   });
-  await step("notion_update_options: rename is refused clearly, nothing changes", async () => {
-    const r = await tool("notion_update_options", { database: main.db, property: "Priority", rename: [{ from: "high", to: "Urgent" }] });
-    expect(r.isError && /can't rename/.test(r.text), r.text);
+  await step("notion_schema add_options: an existing option (any case) changes nothing", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "add_options", property: "Priority", options: ["high"] });
+    expect(r.added.length === 0 && !r.undo_id, JSON.stringify(r));
     expect((await prop(rowA, "Priority")) === "High", "row A changed");
   });
   await step("notion_insert_blocks: after_block undo leaves later siblings alone", async () => {
@@ -447,8 +473,8 @@ async function main(): Promise<void> {
     const after = (await call(() => n.blocks.children.list({ block_id: rowA }))).results.length;
     expect(after === before, `page had ${before} top-level blocks, now ${after}`);
   });
-  await step("notion_rename_property: rename then undo", async () => {
-    const r = await must("notion_rename_property", { database: main.db, from: "points", to: "Score" });
+  await step("notion_schema rename: rename then undo", async () => {
+    const r = await must("notion_schema", { database: main.db, action: "rename", property: "points", to: "Score" });
     expect((await prop(rowA, "Score")) === 1200, "renamed property missing");
     await must("notion_undo", { undo_id: r.undo_id });
     expect((await prop(rowA, "Points")) === 1200, "rename not undone");
@@ -468,28 +494,29 @@ async function main(): Promise<void> {
       { id: "flag-high", database: main.db, when: { where: { Priority: "High" } }, actions: [{ comment: "High priority row" }], marker: "Automated" },
       { id: "trash-marked", database: main.db, when: { where: { Name: "Trash me" } }, actions: [{ trash: true }] },
     ];
-    await step("notion_automation_add: rules checked against the schema, with preview", async () => {
+    await step("notion_automation add: rules checked against the schema, with preview", async () => {
       trashRow = (await must("notion_create_page", { parent: main.db, title: "Trash me" })).page_id;
       await must("notion_update_properties", { page: rowB, properties: { Status: "Done", Due: null } });
       for (const rule of rules) {
-        const r = await must("notion_automation_add", { rule });
+        const r = await must("notion_automation", { action: "add", rule });
         expect(r.saved === rule.id, JSON.stringify(r));
       }
-      const listed = await must("notion_automation_list", {});
+      const listed = await must("notion_automation", { action: "list" });
       expect(listed.rules.length === 3, `listed ${listed.rules.length} rules`);
     });
-    await step("notion_automation_add: a rule that would repeat forever is refused", async () => {
-      const r = await tool("notion_automation_add", { rule: { id: "loop", database: main.db, when: { where: { Status: "Done" } }, actions: [{ comment: "again" }] } });
+    await step("notion_automation add: a rule that would repeat forever is refused", async () => {
+      const r = await tool("notion_automation", { action: "add", rule: { id: "loop", database: main.db, when: { where: { Status: "Done" } }, actions: [{ comment: "again" }] } });
       expect(r.isError && /every run/.test(r.text), r.text);
     });
-    await step("notion_automation_add: relative date conditions query cleanly", async () => {
-      const r = await must("notion_automation_add", {
+    await step("notion_automation add: relative date conditions query cleanly", async () => {
+      const r = await must("notion_automation", {
+        action: "add",
         rule: { id: "recent", enabled: false, database: main.db, when: { relative: [{ property: "$created", newer_than_days: 1 }] }, actions: [{ comment: "x" }], marker: "Automated" },
       });
       expect(/would act on [1-9]/.test(r.preview), r.preview);
     });
-    await step("notion_automation_dry_run: previews and writes nothing", async () => {
-      const r = await tool("notion_automation_dry_run", {});
+    await step("notion_automation dry_run: previews and writes nothing", async () => {
+      const r = await tool("notion_automation", { action: "dry_run" });
       expect(!r.isError && /stamp-done.*would act on 1/.test(r.text) && /flag-high.*would act on 1/.test(r.text) && /trash-marked.*would act on 1/.test(r.text), r.text);
       expect((await prop(rowB, "Due")) === null, "dry run wrote Due");
     });
@@ -517,7 +544,8 @@ async function main(): Promise<void> {
       expect((await prop(rowA, "Automated")) === false, "marker not reverted");
       const t = (await call(() => n.pages.retrieve({ page_id: trashRow }))) as unknown as Json;
       expect(t.in_trash === false, "trashed row not restored");
-      return "comments stay (the API can't delete them); the journal says so";
+      const comments = (await call(() => n.comments.list({ block_id: rowB }))).results as Json[];
+      expect(!comments.some((c) => c.rich_text.map((x: Json) => x.plain_text).join("").includes("Closed by automation")), "automation comment not deleted");
     });
   }
 
@@ -531,6 +559,583 @@ async function main(): Promise<void> {
   await step("limits: >100 segments rejected before writing", async () => {
     const r = await tool("notion_insert_blocks", { parent: rowB, blocks: [{ type: "paragraph", text: "z".repeat(200_001) }] });
     expect(r.isError && /rich text segments/.test(r.text), r.text.slice(0, 200));
+  });
+
+  // ---------- phase 2: content ----------
+  const RICH_MD = [
+    "# Q3 plan",
+    "#### Small heading",
+    '## Details {toggle="true"}',
+    "\tHidden until opened",
+    'Plain, **bold Q3**, <span color="red">red</span>, <span color="blue_bg">highlight</span>, $x^2$, ' +
+      `<mention-page url="${pageId}"/>, <mention-date start="2026-10-01"/>, [link](https://example.com)`,
+    "> [!NOTE] Heads up",
+    "> Second line of the note",
+    '<callout icon="🔥" color="red_bg">',
+    "\tHot take",
+    "\t- nested bullet",
+    "</callout>",
+    "<details>",
+    "<summary>More</summary>",
+    "\t- level 1",
+    "\t\t- level 2",
+    "\t\t\t- level 3",
+    "\t\t\t\t- level 4",
+    "\t\t\t\t\t- level 5",
+    "</details>",
+    "<columns>",
+    "\t<column>",
+    "\t\tLeft column",
+    "\t\t- with a list",
+    "\t\t\t- nested deeper",
+    "\t</column>",
+    "\t<column>",
+    "\t\tRight column",
+    "\t</column>",
+    "</columns>",
+    "| Quarter | Revenue |",
+    "|---|---|",
+    "| Q3 | 100 |",
+    "| Q4 | 120 |",
+    "<tabs>",
+    "\t<tab>",
+    "\t\tOverview",
+    "\t\tOverview content",
+    "\t</tab>",
+    "\t<tab>",
+    "\t\tDetails",
+    "\t\tDetails content",
+    "\t</tab>",
+    "</tabs>",
+    "```mermaid",
+    "graph TD; A-->B",
+    "```",
+    "$$",
+    "E=mc^2",
+    "$$",
+    "<table_of_contents/>",
+    "<breadcrumb/>",
+    '<bookmark url="https://example.com"/>',
+    '<embed src="https://www.youtube.com/watch?v=dQw4w9WgXcQ"></embed>',
+    "![](https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png)",
+    `<link-to-page url="${pageId}"/>`,
+    "<synced_block>",
+    "\tSynced original",
+    "</synced_block>",
+    "- [x] done item",
+    "---",
+  ].join("\n");
+  let richPage = "";
+  await step("notion_create_page: every block type from markdown", async () => {
+    const r = await must("notion_create_page", { parent: pageId, title: `${stamp} Q3 content`, markdown: RICH_MD, icon: "📊" });
+    richPage = r.page_id;
+    createdPages.push(richPage);
+    const outline = (await tool("notion_get_blocks", { block: richPage, max_depth: 6, max_blocks: 500 })).text;
+    const types = ["heading_1", "heading_4", "heading_2", "callout", "toggle", "column_list", "table", "tab", "code", "equation", "table_of_contents",
+      "breadcrumb", "bookmark", "embed", "image", "link_to_page", "synced_block", "to_do", "divider"];
+    const missing = types.filter((t) => !outline.includes(`(${t})`));
+    expect(missing.length === 0, `missing block types: ${missing.join(", ")}`);
+    expect(outline.includes("level 5"), "5-level nesting lost");
+    expect(outline.includes("nested deeper"), "nested content inside a column lost");
+    return `${outline.split("\n").length} blocks`;
+  });
+  await step("notion_get_page format=markdown: formatting survives a round trip", async () => {
+    const md1 = (await tool("notion_get_page", { page: richPage, format: "markdown" })).text.split("MARKDOWN:\n")[1] ?? "";
+    for (const needle of ['color="red"', "<callout", "<columns>", "<details>", "<tabs>", "```mermaid", "<breadcrumb/>", "<bookmark url=", "<link-to-page", "mention-page", "level 5"]) {
+      expect(md1.includes(needle), `markdown read lacks ${needle}`);
+    }
+    const r = await must("notion_create_page", { parent: pageId, title: `${stamp} round trip`, markdown: md1 });
+    createdPages.push(r.page_id);
+    const md2 = (await tool("notion_get_page", { page: r.page_id, format: "markdown" })).text.split("MARKDOWN:\n")[1] ?? "";
+    // The synced original becomes a reference to it in the copy; everything else should match line for line.
+    const norm = (s: string) => s.split("\n").filter((l) => !/synced_block/.test(l)).join("\n");
+    const a = norm(md1).split("\n");
+    const b = norm(md2).split("\n");
+    const diff = a.map((l, i) => (l === b[i] ? null : `${i}: ${l} ≠ ${b[i]}`)).filter(Boolean);
+    expect(diff.length === 0 && a.length === b.length, `${diff.length} lines differ (${a.length} vs ${b.length}): ${diff.slice(0, 3).join(" | ")}`);
+    return `${a.length} lines identical`;
+  });
+  await step("notion_insert_blocks: local image is uploaded", async () => {
+    const png = path.join(os.tmpdir(), `${stamp}.png`);
+    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+    const r = await must("notion_insert_blocks", { parent: richPage, blocks: [{ type: "image", url: png, caption: "uploaded" }] });
+    const b = (await call(() => n.blocks.retrieve({ block_id: r.block_ids[0] }))) as unknown as Json;
+    expect(b.image.type === "file", `image type ${b.image.type}`);
+    const outside = await tool("notion_insert_blocks", { parent: richPage, blocks: [{ type: "image", url: "/etc/hostname" }] });
+    expect(outside.isError && /outside the folders/.test(outside.text), outside.text);
+  });
+  await step("notion_patch_block: toggle heading, callout icon, table cells; undo", async () => {
+    const heading = await blockAt(richPage, "Small heading");
+    const r1 = await must("notion_patch_block", { block_id: heading, toggleable: true, color: "green_bg" });
+    const h = (await call(() => n.blocks.retrieve({ block_id: heading }))) as unknown as Json;
+    expect(h.heading_4.is_toggleable === true && h.heading_4.color === "green_background", JSON.stringify(h.heading_4));
+    const callout = await blockAt(richPage, "Hot take");
+    const r2 = await must("notion_patch_block", { block_id: callout, icon: "✅" });
+    const row = await blockAt(richPage, "Q4 | 120");
+    const r3 = await must("notion_patch_block", { block_id: row, cells: ["Q4", "**130**"] });
+    expect(r3.after === "Q4 | 130", r3.after);
+    for (const r of [r3, r2, r1]) await must("notion_undo", { undo_id: r.undo_id });
+    const c = (await call(() => n.blocks.retrieve({ block_id: callout }))) as unknown as Json;
+    expect(c.callout.icon.emoji === "🔥", "callout icon not restored");
+    expect((await blockText(row)) === "Q4 | 120", "table row not restored");
+  });
+  await step("notion_replace_text: Q3→Q4 in title, text, and table cells keeps formatting; undo", async () => {
+    const dry = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4" });
+    expect(dry.dry_run && dry.total_replacements >= 4, JSON.stringify(dry).slice(0, 300));
+    expect(dry.changes.some((c: Json) => c.page_title), "title not in preview");
+    expect(dry.changes.some((c: Json) => c.type === "table_row"), "table cell not in preview");
+    const r = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4", dry_run: false });
+    expect(r.total_replacements === dry.total_replacements, `${r.total_replacements} vs ${dry.total_replacements}`);
+    const para = await blockAt(richPage, "bold Q4");
+    const b = (await call(() => n.blocks.retrieve({ block_id: para }))) as unknown as Json;
+    expect(b.paragraph.rich_text.some((s: Json) => s.plain_text.includes("Q4") && s.annotations.bold), "bold lost");
+    expect(b.paragraph.rich_text.some((s: Json) => s.type === "mention"), "mention lost");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const again = await must("notion_replace_text", { page: richPage, find: "Q3", replace: "Q4" });
+    expect(again.total_replacements === dry.total_replacements, "undo did not restore every Q3");
+  });
+  let target = "";
+  await step("notion_copy_blocks: copy callout and columns to another page; undo", async () => {
+    target = (await must("notion_create_page", { parent: pageId, title: `${stamp} target`, markdown: "Existing first\n\nExisting last" })).page_id;
+    createdPages.push(target);
+    const callout = await blockAt(richPage, "Hot take");
+    const cols = (await tool("notion_get_blocks", { block: richPage, max_depth: 0 })).text.match(/\(column_list\).*⟨([^⟩]+)⟩/)?.[1];
+    expect(cols, "no column_list found");
+    const first = await blockAt(target, "Existing first");
+    const r = await must("notion_copy_blocks", { block_ids: [callout, cols], to: target, position: "after_block", after_block_id: first });
+    expect(r.created_block_ids.length === 2, JSON.stringify(r));
+    const outline = (await tool("notion_get_blocks", { block: target, max_depth: 4 })).text;
+    const order = ["Existing first", "Hot take", "Left column", "nested deeper", "Existing last"].map((t) => outline.indexOf(t));
+    expect(order.every((x, i) => x >= 0 && (i === 0 || x > order[i - 1])), `order wrong: ${order}`);
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect(!(await tool("notion_get_blocks", { block: target, max_depth: 0 })).text.includes("Hot take"), "copy not undone");
+  });
+  await step("notion_copy_blocks: move defaults to a dry run; move then undo restores the original", async () => {
+    const toggle = await blockAt(richPage, "More");
+    const dry = await must("notion_copy_blocks", { block_ids: [toggle], to: target, move: true });
+    expect(dry.dry_run === true && dry.total_blocks >= 6, JSON.stringify(dry));
+    const r = await must("notion_copy_blocks", { block_ids: [toggle], to: target, move: true, dry_run: false });
+    expect((await tool("notion_find_blocks", { page: richPage, query: "^More$", regex: true })).json.count === 0, "original still there");
+    expect((await tool("notion_find_blocks", { page: target, query: "level 5", max_depth: 6 })).json.count === 1, "moved content missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect((await tool("notion_find_blocks", { page: richPage, query: "level 5", max_depth: 6 })).json.count === 1, "original not restored");
+    expect((await tool("notion_find_blocks", { page: target, query: "level 5", max_depth: 6 })).json.count === 0, "moved copy not removed");
+  });
+  await step("notion_copy_blocks: moving an original synced block is refused", async () => {
+    const synced = (await tool("notion_get_blocks", { block: richPage, max_depth: 0 })).text.match(/\(synced_block\).*⟨([^⟩]+)⟩/)?.[1];
+    const r = await tool("notion_copy_blocks", { block_ids: [synced], to: target, move: true, dry_run: false });
+    expect(r.isError && /synced/.test(r.text), r.text);
+  });
+  await step("notion_duplicate_page: content, icon, and sub-pages; undo", async () => {
+    await must("notion_create_page", { parent: richPage, title: "Child page", markdown: "child content" });
+    const dry = await must("notion_duplicate_page", { page: richPage, dry_run: true });
+    expect(dry.subpages.includes("Child page"), JSON.stringify(dry));
+    const r = await must("notion_duplicate_page", { page: richPage, to: pageId });
+    createdPages.push(r.page_id);
+    expect(r.subpages === 1, JSON.stringify(r));
+    const copy = await tool("notion_get_page", { page: r.page_id, max_depth: 6, max_blocks: 500 });
+    expect(copy.text.includes("(copy)") && copy.text.includes('"icon": "📊"'), copy.text.slice(0, 300));
+    expect(copy.text.includes("level 5") && copy.text.includes("(child_page) Child page"), "content or sub-page missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
+    expect(p.in_trash === true, "duplicate not trashed");
+  });
+  await step("notion_update_page: title, icon, cover, lock, move; undo", async () => {
+    const r = await must("notion_update_page", {
+      page: target, title: `${stamp} renamed`, icon: "🎯", cover: "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+      locked: true, move_to: richPage,
+    });
+    const p = (await call(() => n.pages.retrieve({ page_id: target }))) as unknown as Json;
+    expect(p.icon.emoji === "🎯" && p.cover && p.is_locked === true && p.parent.page_id === richPage, JSON.stringify({ icon: p.icon, parent: p.parent }));
+    await must("notion_undo", { undo_id: r.undo_id });
+    const q = (await call(() => n.pages.retrieve({ page_id: target }))) as unknown as Json;
+    expect(q.parent.page_id === pageId && q.icon === null && q.cover === null && !q.is_locked, JSON.stringify({ icon: q.icon, parent: q.parent, locked: q.is_locked }));
+  });
+  await step("notion_comments: add, list, reply; undo deletes", async () => {
+    const a = await must("notion_comments", { action: "add", target: richPage, text: "**Review** this" });
+    const b = await must("notion_comments", { action: "reply", discussion_id: a.discussion_id, text: "Done" });
+    const list = await must("notion_comments", { action: "list", target: richPage });
+    expect(list.count >= 2 && list.comments.some((c: Json) => c.text === "Review this"), JSON.stringify(list).slice(0, 300));
+    await must("notion_undo", { undo_id: b.undo_id });
+    await must("notion_undo", { undo_id: a.undo_id });
+    const after = await must("notion_comments", { action: "list", target: richPage });
+    expect(after.count === list.count - 2, `${after.count} comments left`);
+  });
+  await step("notion_list_templates: a database without templates says so", async () => {
+    const r = await tool("notion_list_templates", { database: main.db });
+    expect(!r.isError && /no templates|templates/.test(r.text), r.text);
+  });
+
+  // ---------- phase 3: databases ----------
+  let clients = { db: "", ds: "" };
+  let tracker = { db: "", ds: "" };
+  await step("notion_create_database: Clients, then a tracker with every property kind", async () => {
+    const c = await must("notion_create_database", {
+      parent: pageId, title: `${stamp} Clients`, icon: "🏢",
+      properties: [{ name: "Client", type: "title" }, { name: "Tier", type: "select", options: ["Gold", "Silver"] }],
+    });
+    clients = { db: c.database_id, ds: c.data_source_id };
+    createdDatabases.push(c.database_id);
+    const r = await must("notion_create_database", {
+      parent: pageId, title: `${stamp} Tracker`,
+      properties: [
+        { name: "Task", type: "title" },
+        { name: "Status", type: "status", options: ["Backlog", "In Progress", "At Risk", "Done"] },
+        { name: "Owner", type: "people" },
+        { name: "Due", type: "date" },
+        { name: "Completed Date", type: "date" },
+        { name: "Priority", type: "select", options: [{ name: "High", color: "red" }, { name: "Medium", color: "yellow" }, { name: "Low", color: "gray" }] },
+        { name: "Client", type: "relation", relation: { database: clients.db, two_way: true, related_name: "Projects" } },
+        { name: "Client tier", type: "rollup", rollup: { relation: "Client", property: "Tier", function: "show_original" } },
+        { name: "Estimate", type: "number", number_format: "dollar", description: "Budget" },
+        { name: "Double", type: "formula", formula: 'prop("Estimate") * 2' },
+        { name: "Parent", type: "relation", relation: { database: "self" } },
+        { name: "ID", type: "unique_id", prefix: "PRJ" },
+        { name: "Files", type: "files" },
+        { name: "Where", type: "place" },
+      ],
+    });
+    tracker = { db: r.database_id, ds: r.data_source_id };
+    createdDatabases.push(r.database_id);
+    const names = r.properties.map((p: Json) => p.name);
+    for (const want of ["Status", "Client", "Client tier", "Parent", "ID", "Where", "Double"]) expect(names.includes(want), `missing ${want}: ${names}`);
+    const status = r.properties.find((p: Json) => p.name === "Status");
+    const complete = status.groups.find((g: Json) => g.name === "Complete").options;
+    expect(complete.includes("Done"), `Done not in Complete: ${JSON.stringify(status.groups)}`);
+    const cs = await must("notion_get_schema", { database: clients.db });
+    expect(cs.properties.some((p: Json) => p.name === "Projects"), `two-way relation missing on Clients: ${JSON.stringify(cs.properties.map((p: Json) => [p.name, p.type]))}`);
+    return r.notes?.join(" ") ?? "";
+  });
+  await step("notion_bulk_create: invalid rows are all reported, nothing written", async () => {
+    const r = await must("notion_bulk_create", {
+      database: tracker.db, dry_run: false,
+      rows: [{ Task: "ok", Status: "Done" }, { Task: "bad", Status: "Nope" }, { Task: "bad2", Estimate: "lots", Client: "No Such Client" }],
+    });
+    expect(r.invalid === 2 && r.errors.length === 2 && !r.created, JSON.stringify(r));
+    expect(r.errors.some((e: Json) => e.error.includes('no row titled "No Such Client"')), JSON.stringify(r.errors));
+    const q = await must("notion_query", { database: tracker.db });
+    expect(q.count === 0, `${q.count} rows written`);
+  });
+  let bulkUndo = "";
+  await step("notion_bulk_create: 3 clients from CSV, 15 tasks from JSON with relations by title", async () => {
+    const c = await must("notion_bulk_create", { database: clients.db, csv: 'Client,Tier\nAcme,Gold\n"Globex, Inc",Silver\nInitech,\n', dry_run: false });
+    expect(c.created === 3, JSON.stringify(c));
+    const owners = person ? [person.id] : [];
+    const statuses = ["Backlog", "In Progress", "At Risk", "Done", "Done"];
+    const rows = Array.from({ length: 15 }, (_, i) => ({
+      Task: `Task ${i + 1}`,
+      Status: statuses[i % 5],
+      Priority: ["High", "Medium", "Low"][i % 3],
+      Due: `2026-${String(9 + (i % 3)).padStart(2, "0")}-${String(10 + i).padStart(2, "0")}`,
+      Estimate: (i + 1) * 100,
+      Client: ["Acme", "Globex, Inc", "Initech"][i % 3],
+      ...(owners.length ? { Owner: owners } : {}),
+    }));
+    const dry = await must("notion_bulk_create", { database: tracker.db, rows });
+    expect(dry.dry_run && dry.rows === 15, JSON.stringify(dry));
+    const r = await must("notion_bulk_create", { database: tracker.db, rows, dry_run: false });
+    expect(r.created === 15, JSON.stringify(r));
+    bulkUndo = r.undo_id;
+    const q = await must("notion_query", { database: tracker.db, where: { Client: "Acme" }, properties: ["Task", "Client tier", "ID"] });
+    expect(q.count === 5, `Acme has ${q.count} tasks`);
+    expect(JSON.stringify(q.rows[0]["Client tier"]).includes("Gold"), `rollup read: ${JSON.stringify(q.rows[0])}`);
+    expect(/^PRJ-\d+$/.test(q.rows[0].ID), `unique id: ${q.rows[0].ID}`);
+  });
+  await step("notion_query: operators, in, or, relative dates", async () => {
+    const a = await must("notion_query", { database: tracker.db, where: { Estimate: { ">": 500, "<=": 1000 } } });
+    expect(a.count === 5, `estimate range: ${a.count}`);
+    const b = await must("notion_query", { database: tracker.db, where: { Status: { in: ["Done", "At Risk"] } } });
+    expect(b.count === 9, `status in: ${b.count}`);
+    const c = await must("notion_query", { database: tracker.db, where: { or: [{ Priority: "High" }, { Task: { contains: "15" } }] } });
+    expect(c.count === 6, `or: ${c.count}`);
+    const d = await must("notion_query", { database: tracker.db, where: { Due: { before: "2026-10-01" }, Status: { "!=": "Done" } } });
+    expect(d.count >= 1, `before: ${d.count}`);
+    const e = await must("notion_query", { database: tracker.db, where: { "$created": { after: "-1d" } } });
+    expect(e.count === 15, `created recently: ${e.count}`);
+  });
+  await step("notion_aggregate: counts by status, sums by client, month buckets", async () => {
+    const a = await must("notion_aggregate", { database: tracker.db, group_by: "Status" });
+    expect(a.totals.count === 15, JSON.stringify(a.totals));
+    const done = a.groups.find((g: Json) => g.key === "Done");
+    expect(done?.count === 6, JSON.stringify(a.groups));
+    const b = await must("notion_aggregate", { database: tracker.db, group_by: "Client", metrics: ["count", "sum:Estimate", "avg:Estimate"] });
+    const acme = b.groups.find((g: Json) => g.key === "Acme");
+    expect(acme?.count === 5 && acme.sum_Estimate === 100 + 400 + 700 + 1000 + 1300, JSON.stringify(b.groups));
+    const c = await must("notion_aggregate", { database: tracker.db, group_by: { property: "Due", by: "month" }, where: { Status: { "!=": "Done" } } });
+    expect(c.groups.length === 3 && c.totals.count === 9, JSON.stringify(c));
+    return `status: ${a.groups.map((g: Json) => `${g.key}=${g.count}`).join(", ")}`;
+  });
+  await step("notion_bulk_update: per-row values, dry run, apply, undo", async () => {
+    const q = await must("notion_query", { database: tracker.db, where: { Priority: "High" }, properties: ["Task"] });
+    const rows = q.rows.map((r: Json, i: number) => ({ page: r.id, set: { Estimate: 9000 + i, Where: { lat: 40.7, lon: -74, name: "NYC" } } }));
+    const dry = await must("notion_bulk_update", { rows });
+    expect(dry.dry_run && dry.matched === rows.length && dry.rows[0].will_set, JSON.stringify(dry).slice(0, 300));
+    const r = await must("notion_bulk_update", { rows, dry_run: false });
+    expect(r.updated === rows.length, JSON.stringify(r));
+    const check = await must("notion_query", { database: tracker.db, where: { Estimate: { ">=": 9000 } } });
+    expect(check.count === rows.length, `${check.count} updated`);
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = await must("notion_query", { database: tracker.db, where: { Estimate: { ">=": 9000 } } });
+    expect(after.count === 0, `${after.count} not reverted`);
+  });
+  await step("files and place properties: write, read, undo", async () => {
+    const q = await must("notion_query", { database: tracker.db, where: { Task: "Task 1" } });
+    const id = q.rows[0].id;
+    const txt = path.join(os.tmpdir(), `${stamp}.txt`);
+    writeFileSync(txt, "hello");
+    const r = await must("notion_update_properties", { page: id, properties: { Files: [txt, { name: "spec", url: "https://example.com/spec.pdf" }], Where: { lat: 51.5, lon: -0.12, name: "London" } } });
+    const files = await prop(id, "Files");
+    expect(JSON.stringify(files) === JSON.stringify([`${stamp}.txt`, "spec"]), JSON.stringify(files));
+    expect((await prop(id, "Where") as Json)?.name === "London", "place missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    expect(JSON.stringify(await prop(id, "Files")) === "[]" && (await prop(id, "Where")) === null, "files/place not reverted");
+  });
+  await step("notion_schema: status option with group, number format, description", async () => {
+    const a = await must("notion_schema", { database: tracker.db, action: "add_options", property: "Status", options: [{ name: "Blocked", group: "In progress" }, "Shipped"] });
+    const s = await must("notion_get_schema", { database: tracker.db });
+    const groups = s.properties.find((p: Json) => p.name === "Status").groups;
+    expect(groups.find((g: Json) => g.name === "In progress").options.includes("Blocked"), JSON.stringify(groups));
+    expect(groups.find((g: Json) => g.name === "Complete").options.includes("Shipped"), JSON.stringify(groups));
+    const b = await must("notion_schema", { database: tracker.db, action: "set_number_format", property: "Estimate", number_format: "euro" });
+    const c = await must("notion_schema", { database: tracker.db, action: "set_description", property: "Priority", description: "How urgent" });
+    for (const u of [c, b, a]) await must("notion_undo", { undo_id: u.undo_id });
+    const s2 = await must("notion_get_schema", { database: tracker.db });
+    const st = s2.properties.find((p: Json) => p.name === "Status").options;
+    expect(!st.includes("Blocked") && st.includes("Done"), `status after undo: ${st}`);
+    expect(s2.properties.find((p: Json) => p.name === "Estimate").format === "dollar", "format not restored");
+    const pr = await must("notion_get_schema", { database: tracker.db });
+    expect(pr.properties.find((p: Json) => p.name === "Priority").options.length === 3, "priority options changed by description edit");
+  });
+  await step("notion_schema delete: dry run counts values; undo re-creates the property and its values", async () => {
+    const dry = await must("notion_schema", { database: tracker.db, action: "delete", property: "Priority" });
+    expect(dry.dry_run && dry.rows_with_values === "15", JSON.stringify(dry));
+    const r = await must("notion_schema", { database: tracker.db, action: "delete", property: "Priority", dry_run: false });
+    expect(r.values_saved_for_undo === 15, JSON.stringify(r));
+    const s = await must("notion_get_schema", { database: tracker.db });
+    expect(!s.properties.some((p: Json) => p.name === "Priority"), "not deleted");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const agg = await must("notion_aggregate", { database: tracker.db, group_by: "Priority" });
+    expect(JSON.stringify(agg.groups.map((g: Json) => [g.key, g.count]).sort()) === JSON.stringify([["High", 5], ["Low", 5], ["Medium", 5]]), JSON.stringify(agg.groups));
+  });
+  if (process.env.SMOKE_LARGE) {
+    await step("large: 300 rows created, bulk-updated with dry run, and undone as one batch", async () => {
+      const rows = Array.from({ length: 300 }, (_, i) => ({ Task: `Bulk ${i + 1}`, Status: "Backlog", Estimate: i }));
+      const created = await must("notion_bulk_create", { database: tracker.db, rows, dry_run: false });
+      expect(created.created === 300, JSON.stringify(created));
+      const dry = await must("notion_bulk_update", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, set: { Status: "In Progress" }, limit: 500 });
+      expect(dry.matched === 300, `dry run matched ${dry.matched}`);
+      const t0 = Date.now();
+      const r = await must("notion_bulk_update", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, set: { Status: "In Progress" }, limit: 500, dry_run: false });
+      expect(r.updated === 300, JSON.stringify(r));
+      const t1 = Date.now();
+      await must("notion_undo", { undo_id: r.undo_id });
+      const t2 = Date.now();
+      const agg = await must("notion_aggregate", { database: tracker.db, where: { Task: { starts_with: "Bulk " } }, group_by: "Status" });
+      expect(agg.groups.length === 1 && agg.groups[0].key === "Backlog" && agg.groups[0].count === 300, JSON.stringify(agg.groups));
+      await must("notion_undo", { undo_id: created.undo_id });
+      return `update ${Math.round((t1 - t0) / 1000)}s, undo ${Math.round((t2 - t1) / 1000)}s`;
+    });
+  }
+  // ---------- phase 4: views and visuals ----------
+  let reportHost = "";
+  await step("notion_views: board, timeline, calendar, and chart tabs; list and get", async () => {
+    const made: string[] = [];
+    for (const view of [
+      { name: "By status", type: "board", group_by: "Status", properties: ["Priority", "Due"] },
+      { name: "Timeline", type: "timeline", date: "Due", zoom: "week" },
+      { name: "Calendar", type: "calendar", date: "Due" },
+      { name: "Open by client", type: "chart", where: { Status: { "!=": "Done" } }, chart: { type: "column", x: "Client", y: "count", stack_by: "Priority", labels: true } },
+      { name: "Budget", type: "chart", chart: { type: "number", y: "sum:Estimate" } },
+    ]) {
+      const r = await must("notion_views", { action: "create", database: tracker.db, view });
+      made.push(r.undo_id);
+    }
+    const list = await must("notion_views", { action: "list", database: tracker.db });
+    for (const want of ["By status", "Timeline", "Calendar", "Open by client", "Budget"]) expect(list.views.some((v: Json) => v.name === want), `missing view ${want}`);
+    const board = list.views.find((v: Json) => v.name === "By status");
+    const got = await must("notion_views", { action: "get", view_id: board.id });
+    expect(got.configuration.group_by.property === "Status", JSON.stringify(got.configuration));
+    for (const u of made.reverse()) await must("notion_undo", { undo_id: u });
+    const after = await must("notion_views", { action: "list", database: tracker.db });
+    expect(after.views.length === list.views.length - 5, `${after.views.length} views after undo`);
+    return `${list.views.length} views, then ${after.views.length}`;
+  });
+  await step("notion_views: update and delete revert with undo", async () => {
+    const r = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Work", type: "table", sorts: [{ property: "Due" }] } });
+    const upd = await must("notion_views", { action: "update", view_id: r.view_id, view: { name: "Work (high)", type: "table", where: { Priority: "High" } } });
+    let v = await must("notion_views", { action: "get", view_id: r.view_id });
+    expect(v.name === "Work (high)" && JSON.stringify(v.filter).includes("Priority"), JSON.stringify(v));
+    await must("notion_undo", { undo_id: upd.undo_id });
+    v = await must("notion_views", { action: "get", view_id: r.view_id });
+    expect(v.name === "Work" && !v.filter, `after undo: ${JSON.stringify(v).slice(0, 200)}`);
+    const del = await must("notion_views", { action: "delete", view_id: r.view_id });
+    await must("notion_undo", { undo_id: del.undo_id });
+    const list = await must("notion_views", { action: "list", database: tracker.db });
+    const back = list.views.filter((x: Json) => x.name === "Work");
+    expect(back.length === 1, "deleted view not re-created");
+    await must("notion_views", { action: "delete", view_id: back[0].id });
+  });
+  await step("notion_views: linked chart on a page at an exact spot, and a dashboard widget", async () => {
+    reportHost = (await must("notion_create_page", { parent: pageId, title: `${stamp} visuals`, markdown: "First\n\nLast" })).page_id;
+    createdPages.push(reportHost);
+    const first = await blockAt(reportHost, "First");
+    const r = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Per client", type: "chart", chart: { type: "donut", x: "Client" } }, on: { page: reportHost, after_block: first } });
+    const outline = (await tool("notion_get_blocks", { block: reportHost, max_depth: 0 })).text.split("\n");
+    expect(outline.length === 3 && outline[1].includes("child_database"), outline.join(" | "));
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = (await tool("notion_get_blocks", { block: reportHost, max_depth: 0 })).text.split("\n");
+    expect(after.length === 2, `linked view not removed: ${after.join(" | ")}`);
+    const dash = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Dashboard", type: "dashboard" } });
+    const w = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Count", type: "chart", chart: { type: "number", y: "count" } }, on: { dashboard: dash.view_id } });
+    expect(w.view_id, JSON.stringify(w));
+    await must("notion_undo", { undo_id: w.undo_id });
+    await must("notion_undo", { undo_id: dash.undo_id });
+  });
+  let chartBlock = "";
+  await step("notion_create_chart: image from a database query and from inline data", async () => {
+    const r = await must("notion_create_chart", {
+      parent: reportHost, chart: { type: "bar", title: "Estimate by priority", value_format: "currency" },
+      source: { database: tracker.db, x: "Priority", y: "sum:Estimate" },
+    });
+    chartBlock = r.block_id;
+    expect(r.points === 3 && r.rows_scanned === 15, JSON.stringify(r));
+    const b = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(b.type === "image" && b.image.type === "file", JSON.stringify(b.image).slice(0, 200));
+    const inline = await must("notion_create_chart", {
+      parent: reportHost, position: "start", chart: { type: "line", title: "Burndown" },
+      data: [{ x: "2026-09-01", y: 15, series: "Open" }, { x: "2026-09-08", y: 11, series: "Open" }, { x: "2026-09-15", y: 6, series: "Open" }],
+    });
+    await must("notion_undo", { undo_id: inline.undo_id });
+    const bad = await tool("notion_create_chart", { parent: reportHost, chart: { type: "pie" }, data: [{ x: "a", y: -1 }] });
+    expect(bad.isError && /negative/.test(bad.text), bad.text);
+  });
+  await step("notion_create_chart: refresh in place from new data, then undo", async () => {
+    const before = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    await must("notion_bulk_update", { database: tracker.db, where: { Priority: "Low" }, set: { Estimate: 99999 }, dry_run: false });
+    const r = await must("notion_create_chart", { refresh_block_id: chartBlock });
+    const mid = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(mid.image.file.url.split("?")[0] !== before.image.file.url.split("?")[0], "image not replaced");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(after.image.file.url.split("?")[0] !== mid.image.file.url.split("?")[0], "image not restored");
+    await must("notion_undo", {});
+  });
+  await step("notion_build_report: summary, KPIs, live and image charts, overdue table, gantt; undo", async () => {
+    const r = await must("notion_build_report", {
+      database: tracker.db, parent: pageId, title: `${stamp} Tracker report`,
+      charts: [
+        { title: "Tasks by status", type: "column", x: "Status" },
+        { title: "Estimate by client and priority", type: "grouped_column", x: "Client", y: "sum:Estimate", series: "Priority" },
+      ],
+      table: { title: "Overdue", where: { Due: { before: "today" }, Status: { "!=": "Done" } }, properties: ["Task", "Status", "Due", "Client"], sort: { property: "Due" }, linked_view: true },
+      gantt: { title: "Upcoming work", start: "Due", section: "Client", where: { Status: { "!=": "Done" } } },
+    });
+    createdPages.push(r.page_id);
+    expect(r.sections.native_charts === 1 && r.sections.image_charts === 1 && r.sections.kpis === 4, JSON.stringify(r.sections));
+    const outline = (await tool("notion_get_blocks", { block: r.page_id, max_depth: 3, max_blocks: 400 })).text;
+    for (const want of ["(callout)", "(column_list)", "(child_database)", "(image)", "(table)", "(code)", "Overdue", "Upcoming work"]) expect(outline.includes(want), `report lacks ${want}`);
+    expect((outline.match(/\(child_database\)/g) ?? []).length === 2, "expected a live chart and a live table");
+    const md = (await tool("notion_get_page", { page: r.page_id, format: "markdown" })).text;
+    expect(md.includes("```mermaid") && md.includes("gantt"), "gantt missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
+    expect(p.in_trash === true, "report not trashed");
+  });
+
+  // ---------- phase 5: automations ----------
+  await step("notion_automation: weekday schedule marks past-due rows At Risk with a comment; runs once; undo", async () => {
+    const rule = {
+      id: "at-risk",
+      schedule: "weekdays 09:00",
+      database: tracker.db,
+      when: { where: { Due: { before: "today" }, Status: { not_in: ["Done", "At Risk"] } } },
+      actions: [{ set: { Status: "At Risk" } }, { comment: "Past due: {{page.Task}} was due {{page.Due}}" }],
+      limit: 100,
+    };
+    const added = await must("notion_automation", { action: "add", rule });
+    expect(added.cron === "0 9 * * 1-5" && added.next_run, JSON.stringify(added));
+    const pastDue = await must("notion_query", { database: tracker.db, where: rule.when.where });
+    expect(pastDue.count > 0, "no past-due rows to test with");
+    const dry = (await tool("notion_automation", { action: "dry_run", rule_id: "at-risk", force: true })).text;
+    expect(dry.includes(`would act on ${pastDue.count}`), dry);
+    const run = await must("notion_automation", { action: "run", rule_id: "at-risk", force: true });
+    expect(!run.failed && run.undo.length === 1, JSON.stringify(run));
+    const nowAtRisk = await must("notion_query", { database: tracker.db, where: { Status: "At Risk" } });
+    expect(nowAtRisk.count >= pastDue.count, `${nowAtRisk.count} At Risk`);
+    const comments = (await call(() => n.comments.list({ block_id: pastDue.rows[0].id }))).results as Json[];
+    expect(comments.some((c) => c.rich_text.map((t: Json) => t.plain_text).join("").startsWith("Past due:")), "comment missing");
+    const again = await must("notion_automation", { action: "run", rule_id: "at-risk", force: true });
+    expect(/acted on 0 of 0/.test(again.summary), `rule re-fired: ${again.summary}`);
+    const notDue = (await tool("notion_automation", { action: "dry_run", rule_id: "at-risk" })).text;
+    expect(/not due|would act on/.test(notDue), notDue);
+    await must("notion_undo", { undo_id: run.undo[0].undo_id });
+    const back = await must("notion_query", { database: tracker.db, where: rule.when.where });
+    expect(back.count === pastDue.count, `after undo ${back.count} past-due rows`);
+    return `${pastDue.count} rows marked, re-run acted on 0, undone`;
+  });
+  await step("notion_automation: row moves to Done → stamp Completed Date and refresh the chart; undo", async () => {
+    const rule = {
+      id: "stamp-completed",
+      database: tracker.db,
+      when: { where: { Status: "Done", "Completed Date": null } },
+      actions: [{ set: { "Completed Date": "{{today}}" } }],
+      then: [{ refresh_chart: chartBlock }],
+    };
+    const added = await must("notion_automation", { action: "add", rule });
+    expect(/recipe/.test(added.note ?? ""), `recipe not embedded: ${JSON.stringify(added)}`);
+    const saved = await must("notion_automation", { action: "get", rule_id: "stamp-completed" });
+    expect(typeof saved.then[0].refresh_chart === "object" && saved.then[0].refresh_chart.source, JSON.stringify(saved.then));
+    const before = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    const run = await must("notion_automation", { action: "run", rule_id: "stamp-completed" });
+    expect(!run.failed && /acted on 6 of 6/.test(run.summary) && /then refresh chart/.test(run.summary), run.summary);
+    const stamped = await must("notion_query", { database: tracker.db, where: { "Completed Date": { is_not_empty: true } } });
+    expect(stamped.count === 6, `${stamped.count} stamped`);
+    const after = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(after.image.file.url.split("?")[0] !== before.image.file.url.split("?")[0], "chart not redrawn");
+    await must("notion_undo", { undo_id: run.undo[0].undo_id });
+    const cleared = await must("notion_query", { database: tracker.db, where: { "Completed Date": { is_not_empty: true } } });
+    expect(cleared.count === 0, `${cleared.count} still stamped`);
+  });
+  await step("notion_automation: schedule-only report replaces its previous page; create_page; manage and history", async () => {
+    const rule = {
+      id: "weekly-report",
+      schedule: "weekly mon 08:00",
+      then: [
+        { build_report: { database: tracker.db, parent: pageId, title: `${stamp} weekly {{today}}`, charts: [{ title: "By status", x: "Status" }] } },
+        { create_page: { parent: pageId, title: `${stamp} notes {{today}}`, markdown: "- [ ] Review the report" } },
+      ],
+    };
+    await must("notion_automation", { action: "add", rule });
+    const first = await must("notion_automation", { action: "run", rule_id: "weekly-report", force: true });
+    expect(!first.failed, first.summary);
+    const second = await must("notion_automation", { action: "run", rule_id: "weekly-report", force: true });
+    expect(!second.failed, second.summary);
+    const reports = (await must("notion_search", { query: `${stamp} weekly`, type: "page" })) as Json;
+    const live = (reports.results ?? []).filter((p: Json) => p.title.startsWith(`${stamp} weekly`));
+    for (const p of live) createdPages.push(p.id);
+    const notes = (await must("notion_search", { query: `${stamp} notes`, type: "page" })) as Json;
+    for (const p of notes.results ?? []) createdPages.push(p.id);
+    const firstReport = first.summary.match(/report (\S+)/)?.[1] ?? "";
+    const firstId = firstReport.match(/[0-9a-f]{32}/)?.[0];
+    if (firstId) {
+      const p = (await call(() => n.pages.retrieve({ page_id: firstId }))) as unknown as Json;
+      expect(p.in_trash === true, "previous report not replaced");
+    }
+    for (const u of [...second.undo, ...first.undo]) await must("notion_undo", { undo_id: u.undo_id, force: true });
+    await must("notion_automation", { action: "disable", rule_id: "weekly-report" });
+    const list = await must("notion_automation", { action: "list" });
+    expect(list.rules.find((r: Json) => r.id === "weekly-report").enabled === false, "disable failed");
+    const del = await must("notion_automation", { action: "delete", rule_id: "weekly-report" });
+    expect(del.removed_rule.id === "weekly-report", JSON.stringify(del));
+    const history = await tool("notion_automation", { action: "history" });
+    expect(!history.isError && Array.isArray(history.json) && history.json.length >= 4, history.text.slice(0, 200));
+    for (const id of ["at-risk", "stamp-completed"]) await must("notion_automation", { action: "delete", rule_id: id });
+  });
+
+  await step("notion_bulk_create: undo trashes every created row", async () => {
+    await must("notion_undo", { undo_id: bulkUndo });
+    const q = await must("notion_query", { database: tracker.db });
+    expect(q.count === 0, `${q.count} rows left`);
   });
 
   // ---------- page trash + undo ----------
@@ -563,6 +1168,13 @@ try {
   if (process.env.SMOKE_KEEP) {
     console.log(`\nSMOKE_KEEP set; leaving databases: ${createdDatabases.join(", ")}`);
   } else {
+    for (const id of createdPages.reverse()) {
+      try {
+        await call(() => notion().pages.update({ page_id: id, in_trash: true } as never));
+      } catch {
+        // Already trashed (for example by an undo step).
+      }
+    }
     for (const id of createdDatabases.reverse()) {
       try {
         await call(() => notion().databases.update({ database_id: id, in_trash: true } as never));

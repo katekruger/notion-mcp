@@ -2,15 +2,31 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { call, notion } from "./notion.js";
+import { call, isNotFound, mapLimited, notion, read } from "./notion.js";
 import { invalidateSchema } from "./schema.js";
+import { uploadLocalFile } from "./files.js";
 
 export type UndoOp =
-  | { kind: "page_properties"; page_id: string; properties: Record<string, unknown> }
+  | { kind: "page_properties"; page_id: string; properties: Record<string, unknown>; data_source_id?: string }
   | { kind: "block_update"; block_id: string; payload: Record<string, unknown> }
-  | { kind: "block_trash"; block_id: string; in_trash: boolean }
+  | { kind: "block_trash"; block_id: string; in_trash: boolean; parent_id?: string }
   | { kind: "page_trash"; page_id: string; in_trash: boolean }
-  | { kind: "schema"; data_source_id: string; properties: Record<string, unknown> };
+  | { kind: "schema"; data_source_id: string; properties: Record<string, unknown> }
+  | { kind: "comment_delete"; comment_id: string }
+  | { kind: "page_update"; page_id: string; payload: Record<string, unknown> }
+  | { kind: "page_move"; page_id: string; parent: Record<string, unknown> }
+  | { kind: "database_trash"; database_id: string; in_trash: boolean }
+  /** Remove a view this server created; a linked view on a page is removed with its block. */
+  | { kind: "view_delete"; view_id: string; linked_block_id?: string }
+  | { kind: "view_update"; view_id: string; payload: Record<string, unknown> }
+  | { kind: "view_create"; request: Record<string, unknown> }
+  /** Put back a chart image replaced by a refresh, from the copy saved at the time. */
+  | { kind: "image_restore"; block_id: string; path: string; caption?: unknown[] };
+
+/** Undo ops that trash newly inserted blocks. The parent lets undo check freshness with one listing, not one read per block. */
+export function insertedBlocks(ids: string[], parentId: string): UndoOp[] {
+  return ids.map((id) => ({ kind: "block_trash", block_id: id, in_trash: true, parent_id: parentId }));
+}
 
 export interface JournalEntry {
   id: string;
@@ -83,14 +99,200 @@ async function apply(op: UndoOp): Promise<void> {
     case "page_trash":
       await call(() => n.pages.update({ page_id: op.page_id, in_trash: op.in_trash } as never));
       break;
+    case "comment_delete":
+      await call(() => n.comments.delete({ comment_id: op.comment_id }));
+      break;
+    case "page_update":
+      await call(() => n.pages.update({ page_id: op.page_id, ...op.payload } as never));
+      break;
+    case "page_move":
+      await call(() => n.pages.move({ page_id: op.page_id, parent: op.parent } as never));
+      break;
+    case "database_trash":
+      await call(() => n.databases.update({ database_id: op.database_id, in_trash: op.in_trash } as never));
+      break;
+    case "view_delete":
+      if (op.linked_block_id) await call(() => n.blocks.delete({ block_id: op.linked_block_id as string }));
+      else await call(() => n.views.delete({ view_id: op.view_id }));
+      break;
+    case "view_update":
+      await call(() => n.views.update({ view_id: op.view_id, ...op.payload } as never));
+      break;
+    case "view_create":
+      await call(() => n.views.create(op.request as never));
+      break;
+    case "image_restore": {
+      const id = await uploadLocalFile(op.path, undefined, { allowAnyPath: true });
+      await call(() => n.blocks.update({ block_id: op.block_id, image: { file_upload: { id }, ...(op.caption ? { caption: op.caption } : {}) } } as never));
+      break;
+    }
     case "schema":
       await call(() => n.dataSources.update({ data_source_id: op.data_source_id, properties: op.properties } as never));
       invalidateSchema(op.data_source_id);
+      for (const v of Object.values(op.properties)) {
+        const rel = (v as { relation?: { data_source_id?: string } } | null)?.relation?.data_source_id;
+        if (rel) invalidateSchema(rel);
+      }
       break;
   }
 }
 
-export async function undo(entryId?: string): Promise<{ entry: JournalEntry; applied: number; failed: string[] }> {
+/** What an undo op would overwrite, if anything: the object whose later edits it could clobber. */
+export function undoTarget(op: UndoOp): { kind: "page" | "block" | "data_source" | "view"; id: string } | null {
+  switch (op.kind) {
+    case "page_properties":
+      return { kind: "page", id: op.page_id };
+    case "block_update":
+      return { kind: "block", id: op.block_id };
+    case "block_trash":
+      // Trashing a block we inserted would also throw away edits made inside it since.
+      return op.in_trash ? { kind: "block", id: op.block_id } : null;
+    case "page_trash":
+      // Trashing a page this server created keeps its later edits (it can be restored from Notion's trash), so no check.
+      return null;
+    case "schema":
+      // A data source's edit time moves with every schema change and some row edits (verified live), so it can't
+      // tell whether this property was changed since; schema undo only touches the property it names.
+      return null;
+    case "page_update":
+    case "page_move":
+      return { kind: "page", id: op.page_id };
+    case "view_update":
+      return { kind: "view", id: op.view_id };
+    case "image_restore":
+      return { kind: "block", id: op.block_id };
+    case "comment_delete":
+    case "database_trash":
+    case "view_delete":
+    case "view_create":
+      return null;
+  }
+}
+
+export interface UndoConflict {
+  id: string;
+  kind: string;
+  last_edited_time: string;
+  /** Later journal entries that touched the same object, which explains the edit when it was ours. */
+  later_entries: string[];
+}
+
+/** Start of the minute: Notion rounds last_edited_time down to the minute. */
+function minuteOf(iso: string): number {
+  return Math.floor(new Date(iso).getTime() / 60_000) * 60_000;
+}
+
+/**
+ * Objects edited after this entry was written. Edits within the same minute as the write can't be seen,
+ * because Notion reports last_edited_time to the minute.
+ */
+export function findConflicts(
+  entry: JournalEntry,
+  lastEdited: Map<string, string | null>,
+  entries: JournalEntry[] = []
+): UndoConflict[] {
+  const since = minuteOf(entry.at);
+  const out: UndoConflict[] = [];
+  const seen = new Set<string>();
+  for (const op of entry.undo) {
+    const t = undoTarget(op);
+    if (!t || seen.has(t.id)) continue;
+    seen.add(t.id);
+    const edited = lastEdited.get(t.id);
+    if (!edited) continue;
+    const at = new Date(edited).getTime();
+    // Pages and blocks report edit times to the minute; views report exact times, which compare exactly.
+    const threshold = at % 60_000 === 0 ? since : new Date(entry.at).getTime();
+    if (at <= threshold) continue;
+    const later = entries
+      .filter((e) => e.at > entry.at && !e.undone && e.undo.some((o) => undoTarget(o)?.id === t.id))
+      .map((e) => e.id);
+    out.push({ id: t.id, kind: t.kind, last_edited_time: edited, later_entries: later });
+  }
+  return out;
+}
+
+async function lastEditedTimes(entry: JournalEntry): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  const n = notion();
+  // Inserted blocks: one children listing per parent covers them all.
+  const parents = new Set(entry.undo.flatMap((op) => (op.kind === "block_trash" && op.in_trash && op.parent_id ? [op.parent_id] : [])));
+  for (const parentId of parents) {
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await read(() => n.blocks.children.list({ block_id: parentId, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) }));
+        for (const b of res.results) {
+          const edited = (b as { last_edited_time?: unknown }).last_edited_time;
+          if (typeof edited === "string") out.set(b.id, edited);
+        }
+        cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
+      } while (cursor);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
+  // Rows in a database: one query for rows edited since the entry finds every conflict at once.
+  const sources = new Set(entry.undo.flatMap((op) => (op.kind === "page_properties" && op.data_source_id ? [op.data_source_id] : [])));
+  const checkedRows = new Set<string>();
+  for (const dsId of sources) {
+    try {
+      let cursor: string | undefined;
+      do {
+        const res = await read(() =>
+          n.dataSources.query({
+            data_source_id: dsId,
+            page_size: 100,
+            filter: { timestamp: "last_edited_time", last_edited_time: { after: new Date(minuteOf(entry.at)).toISOString() } },
+            ...(cursor ? { start_cursor: cursor } : {}),
+          } as never)
+        );
+        for (const r of res.results) {
+          const edited = (r as { last_edited_time?: unknown }).last_edited_time;
+          if (typeof edited === "string") out.set(r.id, edited);
+        }
+        cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
+      } while (cursor);
+      for (const op of entry.undo) if (op.kind === "page_properties" && op.data_source_id === dsId) checkedRows.add(op.page_id);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+    }
+  }
+  for (const op of entry.undo) {
+    const t = undoTarget(op);
+    if (!t || out.has(t.id)) continue;
+    if (checkedRows.has(t.id)) {
+      out.set(t.id, null); // Not edited since the entry (the query above returns every row that was).
+      continue;
+    }
+    // A listed parent that no longer shows the block means it's already gone; nothing to compare.
+    if (op.kind === "block_trash" && op.parent_id && parents.has(op.parent_id)) {
+      out.set(t.id, null);
+      continue;
+    }
+    try {
+      const obj: object =
+        t.kind === "page"
+          ? await read(() => n.pages.retrieve({ page_id: t.id }))
+          : t.kind === "block"
+            ? await read(() => n.blocks.retrieve({ block_id: t.id }))
+            : t.kind === "view"
+              ? await read(() => n.views.retrieve({ view_id: t.id }))
+              : await read(() => n.dataSources.retrieve({ data_source_id: t.id }));
+      const edited = (obj as { last_edited_time?: unknown }).last_edited_time;
+      out.set(t.id, typeof edited === "string" ? edited : null);
+    } catch (e) {
+      if (!isNotFound(e)) throw e;
+      out.set(t.id, null); // Gone or unshared; applying the op will report it.
+    }
+  }
+  return out;
+}
+
+export async function undo(
+  entryId?: string,
+  opts: { force?: boolean } = {}
+): Promise<{ entry: JournalEntry; applied: number; failed: string[]; conflicts: UndoConflict[] }> {
   const entries = await load();
   const target = entryId
     ? entries.find((e) => e.id === entryId)
@@ -99,17 +301,39 @@ export async function undo(entryId?: string): Promise<{ entry: JournalEntry; app
   if (target.undone) throw new Error(`Entry ${target.id} was already undone.`);
   if (target.undo.length === 0) throw new Error(`Entry ${target.id} can't be undone: ${target.not_undoable ?? "no snapshot"}.`);
 
+  const conflicts = findConflicts(target, await lastEditedTimes(target), entries);
+  if (conflicts.length && !opts.force) {
+    const lines = conflicts.map(
+      (c) =>
+        `- ${c.kind} ${c.id} edited at ${c.last_edited_time}` +
+        (c.later_entries.length ? ` (also changed by later entries ${c.later_entries.join(", ")}; undo those first)` : " (by someone else)")
+    );
+    throw new Error(
+      `Nothing was undone. ${conflicts.length} object(s) changed after entry ${target.id} (${target.at}), and undo would overwrite those changes:\n` +
+        `${lines.join("\n")}\nCheck with the user, then call again with force: true to overwrite.`
+    );
+  }
+
   let applied = 0;
   const failed: string[] = [];
-  for (const op of [...target.undo].reverse()) {
-    try {
-      await apply(op);
-      applied++;
-    } catch (e) {
-      failed.push(`${op.kind}: ${(e as Error).message}`);
-    }
+  // Reverse order matters across kinds (a re-created property before its values), not within a run of
+  // independent row/block ops, so those runs go a few at a time.
+  const ops = [...target.undo].reverse();
+  const independent = new Set(["page_properties", "page_trash", "block_trash", "comment_delete", "block_update", "view_delete"]);
+  for (let i = 0; i < ops.length; ) {
+    let j = i + 1;
+    if (independent.has(ops[i].kind)) while (j < ops.length && ops[j].kind === ops[i].kind) j++;
+    await mapLimited(ops.slice(i, j), async (op) => {
+      try {
+        await apply(op);
+        applied++;
+      } catch (e) {
+        failed.push(`${op.kind}: ${(e as Error).message}`);
+      }
+    });
+    i = j;
   }
   target.undone = failed.length === 0;
   await save(entries);
-  return { entry: target, applied, failed };
+  return { entry: target, applied, failed, conflicts };
 }

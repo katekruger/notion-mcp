@@ -1,5 +1,5 @@
 // Offline checks for request-shaping logic. No network: Notion calls go to a fake client.
-import { test } from "node:test";
+import { test } from "vitest";
 import assert from "node:assert/strict";
 import type { Client } from "@notionhq/client";
 import { setClientForTests } from "../src/services/notion.js";
@@ -50,7 +50,7 @@ test("forApi rejects more than 100 segments instead of truncating", () => {
   assert.throws(() => forApi(many), /rich text segments/);
 });
 
-test("appendSpecs keeps every request within 2 nesting levels and preserves structure", async () => {
+test("appendSpecs keeps every request within 3 nesting levels and preserves structure", async () => {
   const { calls, client } = fakeAppendClient();
   setClientForTests(client);
   const specs: BlockSpec[] = [
@@ -63,14 +63,15 @@ test("appendSpecs keeps every request within 2 nesting levels and preserves stru
   ];
   const ids = await appendSpecs("root", specs);
   assert.deepEqual(ids, ["b1", "b2"]);
-  for (const c of calls) for (const b of c.children) assert.ok(depth(b) <= 2, `request to ${c.block_id} nests ${depth(b)} levels`);
-  // Root append: L1 without inline children (its child has children), "flat" with its leaf inline.
+  // Notion accepts a block plus two levels below it per request (verified live).
+  for (const c of calls) for (const b of c.children) assert.ok(depth(b) <= 3, `request to ${c.block_id} nests ${depth(b)} levels`);
+  // Root append: L1 alone (its subtree is 4 deep), "flat" with its leaf inline.
   assert.equal(calls[0].block_id, "root");
   assert.equal(depth(calls[0].children[0]), 1);
   assert.equal(depth(calls[0].children[1]), 2);
-  // Then L2 under L1 (b1), L3+L4 inline under L2 (b3).
-  assert.deepEqual(calls.slice(1).map((c) => c.block_id), ["b1", "b3"]);
-  assert.equal(depth(calls[2].children[0]), 2);
+  // Then L2 > L3 > L4 in one request under L1 (b1).
+  assert.deepEqual(calls.slice(1).map((c) => c.block_id), ["b1"]);
+  assert.equal(depth(calls[1].children[0]), 3);
   setClientForTests(null);
 });
 
@@ -99,7 +100,7 @@ test("appendSpecs sends more than 100 children in follow-up requests", async () 
 test("appendSpecs validates every spec before writing anything", async () => {
   const { calls, client } = fakeAppendClient();
   setClientForTests(client);
-  await assert.rejects(appendSpecs("root", [{ type: "paragraph", text: "ok", children: [{ type: "table", text: "bad" }] }]), /Unsupported block type/);
+  await assert.rejects(appendSpecs("root", [{ type: "paragraph", text: "ok", children: [{ type: "button", text: "bad" }] }]), /unsupported block type "button"/);
   assert.equal(calls.length, 0);
   setClientForTests(null);
 });

@@ -1,5 +1,78 @@
 {
   "version": 1,
-  "timezone": "UTC",
-  "rules": []
+  "timezone": "America/New_York",
+  "rules": [
+    {
+      "id": "acceptance-at-risk",
+      "name": "Past due → At Risk",
+      "enabled": true,
+      "schedule": "weekdays 09:00",
+      "database": "8b917b30-1bca-48bc-8152-3544ee78f3f6",
+      "when": {
+        "where": {
+          "Due date": {
+            "before": "today"
+          },
+          "Status": {
+            "not_in": [
+              "Done",
+              "At Risk"
+            ]
+          }
+        }
+      },
+      "actions": [
+        {
+          "set": {
+            "Status": "At Risk"
+          }
+        },
+        {
+          "comment": "Past due: **{{page.Task}}** was due {{page.Due date}}."
+        }
+      ],
+      "then": [],
+      "allow_new_options": false,
+      "limit": 50
+    },
+    {
+      "id": "acceptance-stamp-completed",
+      "name": "Done → stamp Completed Date, refresh chart",
+      "enabled": true,
+      "database": "8b917b30-1bca-48bc-8152-3544ee78f3f6",
+      "when": {
+        "where": {
+          "Status": "Done",
+          "Completed Date": null
+        }
+      },
+      "actions": [
+        {
+          "set": {
+            "Completed Date": "{{today}}"
+          }
+        }
+      ],
+      "then": [
+        {
+          "refresh_chart": {
+            "block_id": "3eb4c9c1-e28b-81d0-886b-d397125f3bcb",
+            "chart": {
+              "type": "bar",
+              "title": "Tasks per owner"
+            },
+            "source": {
+              "database": "a21d7cad-50ff-486f-a554-3eeb6878b512",
+              "x": "Assignee",
+              "y": "count",
+              "include_empty": false,
+              "max_rows": 10000
+            }
+          }
+        }
+      ],
+      "allow_new_options": false,
+      "limit": 50
+    }
+  ]
 }

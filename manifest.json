@@ -1,0 +1,53 @@
+{
+  "manifest_version": "0.3",
+  "name": "notion-plus",
+  "display_name": "Notion Plus",
+  "version": "0.7.0",
+  "description": "Precise Notion editing with undo: surgical block edits, schema-checked writes, databases, views and charts, reports, and automations.",
+  "long_description": "A local Notion server focused on edits you can trust. It changes exactly the block or field you point at, validates every value against the database schema, previews large changes, and can undo anything it did. It also creates databases with full schemas, manages views (including Notion's native charts), renders chart images, builds report pages, and runs scheduled automation rules.",
+  "author": { "name": "Kate Kruger" },
+  "repository": { "type": "git", "url": "https://github.com/katekruger/notion-mcp" },
+  "homepage": "https://github.com/katekruger/notion-mcp",
+  "documentation": "https://github.com/katekruger/notion-mcp#readme",
+  "license": "MIT",
+  "keywords": ["notion", "productivity", "databases", "charts", "automation"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "NOTION_TOKEN": "${user_config.notion_token}",
+        "NOTION_PLUS_UPLOAD_DIRS": "${user_config.upload_folder}",
+        "NOTION_PLUS_TIMEZONE": "${user_config.timezone}"
+      }
+    }
+  },
+  "user_config": {
+    "notion_token": {
+      "type": "string",
+      "title": "Notion integration secret",
+      "description": "From notion.so/profile/integrations. Share the pages and databases Claude should reach with the integration.",
+      "sensitive": true,
+      "required": true
+    },
+    "upload_folder": {
+      "type": "directory",
+      "title": "Folder for uploads",
+      "description": "Local files (images, attachments) can be uploaded to Notion only from this folder and the temp folder.",
+      "required": false
+    },
+    "timezone": {
+      "type": "string",
+      "title": "Time zone",
+      "description": "IANA zone for \"today\" in queries, e.g. America/New_York. Defaults to the computer's zone.",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=20.0.0" }
+  },
+  "tools_generated": true
+}

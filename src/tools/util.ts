@@ -8,14 +8,52 @@ export interface ToolResult {
   isError?: boolean;
 }
 
-export function ok(body: string | Record<string, unknown> | unknown[]): ToolResult {
-  let text = typeof body === "string" ? body : JSON.stringify(body, null, 2);
-  if (text.length > CHARACTER_LIMIT) {
-    text =
-      text.slice(0, CHARACTER_LIMIT) +
-      `\n\n[Truncated at ${CHARACTER_LIMIT} characters. Narrow the request: lower max_blocks/limit, add a filter, or read a sub-block.]`;
+const NARROW_HINT = "Narrow the request: lower max_blocks/limit, add a filter, pick fewer properties, or read a sub-block.";
+
+/** The longest array anywhere in a value, with a setter to replace it. */
+function longestArray(value: unknown): { arr: unknown[]; set: (v: unknown[]) => void } | null {
+  let best: { arr: unknown[]; set: (v: unknown[]) => void } | null = null;
+  const visit = (v: unknown, set: (x: unknown[]) => void): void => {
+    if (Array.isArray(v)) {
+      if (!best || v.length > best.arr.length) best = { arr: v, set };
+      v.forEach((item, i) => visit(item, (x) => (v[i] = x)));
+    } else if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      for (const k of Object.keys(o)) visit(o[k], (x) => (o[k] = x));
+    }
+  };
+  visit(value, () => undefined);
+  return best;
+}
+
+/**
+ * Serialize for the model, staying under CHARACTER_LIMIT. Structured results shrink their longest
+ * list (keeping valid JSON and saying how many items were dropped) before falling back to cutting text.
+ */
+export function fitToLimit(body: string | Record<string, unknown> | unknown[], limit = CHARACTER_LIMIT): string {
+  if (typeof body === "string") {
+    return body.length <= limit ? body : body.slice(0, limit) + `\n\n[Truncated at ${limit} characters. ${NARROW_HINT}]`;
   }
-  return { content: [{ type: "text", text }] };
+  let text = JSON.stringify(body, null, 2);
+  if (text.length <= limit) return text;
+  const copy = JSON.parse(text) as Record<string, unknown> | unknown[];
+  let dropped = 0;
+  for (let i = 0; i < 40 && text.length > limit; i++) {
+    const target = longestArray(copy);
+    if (!target || target.arr.length <= 1) break;
+    const keep = Math.max(1, Math.floor(target.arr.length * Math.min(0.9, limit / text.length)));
+    dropped += target.arr.length - keep;
+    target.set(target.arr.slice(0, keep));
+    const wrapped = Array.isArray(copy)
+      ? { items: copy, truncated: `${dropped} list items omitted to fit. ${NARROW_HINT}` }
+      : { ...copy, truncated: `${dropped} list items omitted to fit. ${NARROW_HINT}` };
+    text = JSON.stringify(wrapped, null, 2);
+  }
+  return text.length <= limit ? text : text.slice(0, limit) + `\n\n[Truncated at ${limit} characters. ${NARROW_HINT}]`;
+}
+
+export function ok(body: string | Record<string, unknown> | unknown[]): ToolResult {
+  return { content: [{ type: "text", text: fitToLimit(body) }] };
 }
 
 export function fail(error: unknown): ToolResult {

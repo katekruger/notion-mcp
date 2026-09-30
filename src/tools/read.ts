@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { PageObjectResponse } from "@notionhq/client";
-import { call, normalizeId, notion } from "../services/notion.js";
+import { read, normalizeId, notion } from "../services/notion.js";
 import { flatten, getTree, renderTree } from "../services/blocks.js";
 import { buildPattern, plain } from "../services/richtext.js";
 import {
@@ -14,7 +14,17 @@ import {
   resolvePropertyName,
   simplifyAll,
 } from "../services/schema.js";
+import { readPageMarkdown } from "../services/pagemd.js";
 import { ok, READ, safe } from "./util.js";
+
+function describeFile(f: unknown): string | null {
+  const o = f as { type?: string; emoji?: string; external?: { url: string }; custom_emoji?: { name?: string } } | null;
+  if (!o?.type) return null;
+  if (o.type === "emoji") return o.emoji ?? null;
+  if (o.type === "external") return o.external?.url ?? null;
+  if (o.type === "custom_emoji") return `custom emoji ${o.custom_emoji?.name ?? ""}`.trim();
+  return "uploaded file";
+}
 
 function pageTitle(page: PageObjectResponse): string {
   const t = Object.values(page.properties).find((p) => p.type === "title");
@@ -37,7 +47,7 @@ export function registerReadTools(server: McpServer): void {
       annotations: READ,
     },
     safe(async ({ query, type, limit }) => {
-      const res = await call(() =>
+      const res = await read(() =>
         notion().search({
           query,
           page_size: limit,
@@ -63,20 +73,23 @@ export function registerReadTools(server: McpServer): void {
     {
       title: "Get Page",
       description:
-        "Read a page: its properties as simple values, the database it belongs to (if any), and its content as an outline where " +
-        "every block shows its id in ⟨…⟩. Use those block ids with notion_patch_block, notion_insert_blocks, or notion_delete_blocks. " +
+        "Read a page: its properties as simple values, the database it belongs to (if any), and its content. format \"outline\" " +
+        "(default) lists every block with its id in ⟨…⟩, for surgical edits with notion_patch_block, notion_insert_blocks, " +
+        "notion_delete_blocks, notion_copy_blocks. format \"markdown\" returns the whole page as Notion-flavored markdown (colors, " +
+        "callouts, columns, tables, toggles, mentions), which notion_insert_blocks / notion_create_page accept back. " +
         "last_edited_time can be passed to write tools as expected_last_edited_time to avoid overwriting someone else's edit.",
       inputSchema: {
         page: z.string().describe("Page URL or id."),
         include_content: z.boolean().default(true),
+        format: z.enum(["outline", "markdown"]).default("outline"),
         max_depth: z.number().int().min(0).max(6).default(3).describe("How deep to read nested blocks."),
         max_blocks: z.number().int().min(1).max(1000).default(300),
       },
       annotations: READ,
     },
-    safe(async ({ page, include_content, max_depth, max_blocks }) => {
+    safe(async ({ page, include_content, format, max_depth, max_blocks }) => {
       const id = normalizeId(page);
-      const p = await call(() => notion().pages.retrieve({ page_id: id }));
+      const p = await read(() => notion().pages.retrieve({ page_id: id }));
       if (!isFullPage(p)) throw new Error("Could not read that page.");
       const header = {
         id: p.id,
@@ -85,9 +98,22 @@ export function registerReadTools(server: McpServer): void {
         last_edited_time: p.last_edited_time,
         data_source_id: pageDataSourceId(p),
         in_trash: p.in_trash,
+        ...(p.is_locked ? { locked: true } : {}),
+        icon: describeFile(p.icon),
+        cover: describeFile(p.cover),
         properties: simplifyAll(p),
       };
       if (!include_content) return ok(header);
+      if (format === "markdown") {
+        const md = await readPageMarkdown(id);
+        const notes = [
+          ...(md.unknown.length
+            ? [`${md.unknown.length} block(s) can't be shown as markdown and appear as <unknown …/> (${[...new Set(md.unknown.map((u) => u.type))].join(", ")}); read them with format "outline".`]
+            : []),
+          ...(md.truncated ? ["Notion truncated this page's markdown; read sections with notion_get_blocks."] : []),
+        ];
+        return ok(`${JSON.stringify(header, null, 2)}\n${notes.length ? `\nNOTES: ${notes.join(" ")}\n` : ""}\nMARKDOWN:\n${md.markdown || "(empty page)"}`);
+      }
       const tree = await getTree(id, max_depth, max_blocks);
       const outline = renderTree(tree.nodes) || "(no content)";
       return ok(
@@ -166,10 +192,11 @@ export function registerReadTools(server: McpServer): void {
     {
       title: "Query Database",
       description:
-        "Query database rows. Use `where` for simple equality ({\"Status\": \"Done\", \"Owner\": \"kate@x.com\"}); property names and " +
-        "option values are matched forgivingly and validated. Use `filter` for anything more complex (raw Notion filter JSON, " +
-        "e.g. {\"property\":\"Due\",\"date\":{\"before\":\"2026-10-01\"}}). If both are given they are combined with AND. " +
-        "Returns rows with simple property values and page ids.",
+        "Query database rows. `where` takes equality ({\"Status\": \"Done\"}), operators ({\"Due\": {\"before\": \"today\"}}, " +
+        "{\"Estimate\": {\">\": 500}}, {\"Task\": {\"contains\": \"x\"}}, {\"Owner\": null}), lists ({\"Status\": {\"in\": [\"Done\", \"Blocked\"]}}), " +
+        "{\"or\": [...]}, relative dates (\"today\", \"+7d\", \"-2w\"), and \"$created\"/\"$last_edited\"; names and options are matched " +
+        "forgivingly and validated. `filter` takes raw Notion filter JSON; both are combined with AND. Returns rows with simple " +
+        "values and page ids. For counts or totals use notion_aggregate instead of reading every row.",
       inputSchema: {
         database: z.string().describe("Database URL/id or data source id."),
         data_source_name: z.string().optional(),
@@ -197,7 +224,7 @@ export function registerReadTools(server: McpServer): void {
       let first = true;
       while ((first || next) && rows.length < limit) {
         first = false;
-        const res = await call(() =>
+        const res = await read(() =>
           notion().dataSources.query({
             data_source_id: ds.id,
             page_size: Math.min(100, limit - rows.length),

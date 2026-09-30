@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.6.0
+
+### Added
+- Scheduled rules: `schedule` takes "hourly", "daily 09:00", "weekdays 09:00", "weekly mon 09:00", "monthly 1 09:00", or cron, in the rules file's time zone. Each scheduled time fires once (state kept per rule); a rule without history only catches up a recent time.
+- `then` actions that run once per firing: `refresh_chart` (the chart's recipe is saved in the rule), `build_report` (replacing the previous report by default), and `create_page`.
+- `notion_automation`: one tool for list, get, add, update, validate, dry_run, enable, disable, delete, run, and history.
+- Run log (`automation-runs.jsonl`) and schedule state (`automation-state.json`) under `NOTION_PLUS_HOME`; `--force` for the CLI.
+- GitHub Actions: state, journal, and run log carried between runs in the cache; a `force` input; an issue opened (or commented on) when a run fails.
+
+### Changed
+- `notion_automation_list`, `notion_automation_add`, and `notion_automation_dry_run` are replaced by `notion_automation`.
+- The "acts once per row" check understands operators: a rule matching `Status not_in [Done, At Risk]` that sets "At Risk" is accepted.
+- Chart refresh and report building moved into a shared service used by both the tools and automations.
+
 ## 0.5.0
 
 ### Added

@@ -494,28 +494,29 @@ async function main(): Promise<void> {
       { id: "flag-high", database: main.db, when: { where: { Priority: "High" } }, actions: [{ comment: "High priority row" }], marker: "Automated" },
       { id: "trash-marked", database: main.db, when: { where: { Name: "Trash me" } }, actions: [{ trash: true }] },
     ];
-    await step("notion_automation_add: rules checked against the schema, with preview", async () => {
+    await step("notion_automation add: rules checked against the schema, with preview", async () => {
       trashRow = (await must("notion_create_page", { parent: main.db, title: "Trash me" })).page_id;
       await must("notion_update_properties", { page: rowB, properties: { Status: "Done", Due: null } });
       for (const rule of rules) {
-        const r = await must("notion_automation_add", { rule });
+        const r = await must("notion_automation", { action: "add", rule });
         expect(r.saved === rule.id, JSON.stringify(r));
       }
-      const listed = await must("notion_automation_list", {});
+      const listed = await must("notion_automation", { action: "list" });
       expect(listed.rules.length === 3, `listed ${listed.rules.length} rules`);
     });
-    await step("notion_automation_add: a rule that would repeat forever is refused", async () => {
-      const r = await tool("notion_automation_add", { rule: { id: "loop", database: main.db, when: { where: { Status: "Done" } }, actions: [{ comment: "again" }] } });
+    await step("notion_automation add: a rule that would repeat forever is refused", async () => {
+      const r = await tool("notion_automation", { action: "add", rule: { id: "loop", database: main.db, when: { where: { Status: "Done" } }, actions: [{ comment: "again" }] } });
       expect(r.isError && /every run/.test(r.text), r.text);
     });
-    await step("notion_automation_add: relative date conditions query cleanly", async () => {
-      const r = await must("notion_automation_add", {
+    await step("notion_automation add: relative date conditions query cleanly", async () => {
+      const r = await must("notion_automation", {
+        action: "add",
         rule: { id: "recent", enabled: false, database: main.db, when: { relative: [{ property: "$created", newer_than_days: 1 }] }, actions: [{ comment: "x" }], marker: "Automated" },
       });
       expect(/would act on [1-9]/.test(r.preview), r.preview);
     });
-    await step("notion_automation_dry_run: previews and writes nothing", async () => {
-      const r = await tool("notion_automation_dry_run", {});
+    await step("notion_automation dry_run: previews and writes nothing", async () => {
+      const r = await tool("notion_automation", { action: "dry_run" });
       expect(!r.isError && /stamp-done.*would act on 1/.test(r.text) && /flag-high.*would act on 1/.test(r.text) && /trash-marked.*would act on 1/.test(r.text), r.text);
       expect((await prop(rowB, "Due")) === null, "dry run wrote Due");
     });
@@ -1039,6 +1040,96 @@ async function main(): Promise<void> {
     await must("notion_undo", { undo_id: r.undo_id });
     const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
     expect(p.in_trash === true, "report not trashed");
+  });
+
+  // ---------- phase 5: automations ----------
+  await step("notion_automation: weekday schedule marks past-due rows At Risk with a comment; runs once; undo", async () => {
+    const rule = {
+      id: "at-risk",
+      schedule: "weekdays 09:00",
+      database: tracker.db,
+      when: { where: { Due: { before: "today" }, Status: { not_in: ["Done", "At Risk"] } } },
+      actions: [{ set: { Status: "At Risk" } }, { comment: "Past due: {{page.Task}} was due {{page.Due}}" }],
+      limit: 100,
+    };
+    const added = await must("notion_automation", { action: "add", rule });
+    expect(added.cron === "0 9 * * 1-5" && added.next_run, JSON.stringify(added));
+    const pastDue = await must("notion_query", { database: tracker.db, where: rule.when.where });
+    expect(pastDue.count > 0, "no past-due rows to test with");
+    const dry = (await tool("notion_automation", { action: "dry_run", rule_id: "at-risk", force: true })).text;
+    expect(dry.includes(`would act on ${pastDue.count}`), dry);
+    const run = await must("notion_automation", { action: "run", rule_id: "at-risk", force: true });
+    expect(!run.failed && run.undo.length === 1, JSON.stringify(run));
+    const nowAtRisk = await must("notion_query", { database: tracker.db, where: { Status: "At Risk" } });
+    expect(nowAtRisk.count >= pastDue.count, `${nowAtRisk.count} At Risk`);
+    const comments = (await call(() => n.comments.list({ block_id: pastDue.rows[0].id }))).results as Json[];
+    expect(comments.some((c) => c.rich_text.map((t: Json) => t.plain_text).join("").startsWith("Past due:")), "comment missing");
+    const again = await must("notion_automation", { action: "run", rule_id: "at-risk", force: true });
+    expect(/acted on 0 of 0/.test(again.summary), `rule re-fired: ${again.summary}`);
+    const notDue = (await tool("notion_automation", { action: "dry_run", rule_id: "at-risk" })).text;
+    expect(/not due|would act on/.test(notDue), notDue);
+    await must("notion_undo", { undo_id: run.undo[0].undo_id });
+    const back = await must("notion_query", { database: tracker.db, where: rule.when.where });
+    expect(back.count === pastDue.count, `after undo ${back.count} past-due rows`);
+    return `${pastDue.count} rows marked, re-run acted on 0, undone`;
+  });
+  await step("notion_automation: row moves to Done → stamp Completed Date and refresh the chart; undo", async () => {
+    const rule = {
+      id: "stamp-completed",
+      database: tracker.db,
+      when: { where: { Status: "Done", "Completed Date": null } },
+      actions: [{ set: { "Completed Date": "{{today}}" } }],
+      then: [{ refresh_chart: chartBlock }],
+    };
+    const added = await must("notion_automation", { action: "add", rule });
+    expect(/recipe/.test(added.note ?? ""), `recipe not embedded: ${JSON.stringify(added)}`);
+    const saved = await must("notion_automation", { action: "get", rule_id: "stamp-completed" });
+    expect(typeof saved.then[0].refresh_chart === "object" && saved.then[0].refresh_chart.source, JSON.stringify(saved.then));
+    const before = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    const run = await must("notion_automation", { action: "run", rule_id: "stamp-completed" });
+    expect(!run.failed && /acted on 6 of 6/.test(run.summary) && /then refresh chart/.test(run.summary), run.summary);
+    const stamped = await must("notion_query", { database: tracker.db, where: { "Completed Date": { is_not_empty: true } } });
+    expect(stamped.count === 6, `${stamped.count} stamped`);
+    const after = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(after.image.file.url.split("?")[0] !== before.image.file.url.split("?")[0], "chart not redrawn");
+    await must("notion_undo", { undo_id: run.undo[0].undo_id });
+    const cleared = await must("notion_query", { database: tracker.db, where: { "Completed Date": { is_not_empty: true } } });
+    expect(cleared.count === 0, `${cleared.count} still stamped`);
+  });
+  await step("notion_automation: schedule-only report replaces its previous page; create_page; manage and history", async () => {
+    const rule = {
+      id: "weekly-report",
+      schedule: "weekly mon 08:00",
+      then: [
+        { build_report: { database: tracker.db, parent: pageId, title: `${stamp} weekly {{today}}`, charts: [{ title: "By status", x: "Status" }] } },
+        { create_page: { parent: pageId, title: `${stamp} notes {{today}}`, markdown: "- [ ] Review the report" } },
+      ],
+    };
+    await must("notion_automation", { action: "add", rule });
+    const first = await must("notion_automation", { action: "run", rule_id: "weekly-report", force: true });
+    expect(!first.failed, first.summary);
+    const second = await must("notion_automation", { action: "run", rule_id: "weekly-report", force: true });
+    expect(!second.failed, second.summary);
+    const reports = (await must("notion_search", { query: `${stamp} weekly`, type: "page" })) as Json;
+    const live = (reports.results ?? []).filter((p: Json) => p.title.startsWith(`${stamp} weekly`));
+    for (const p of live) createdPages.push(p.id);
+    const notes = (await must("notion_search", { query: `${stamp} notes`, type: "page" })) as Json;
+    for (const p of notes.results ?? []) createdPages.push(p.id);
+    const firstReport = first.summary.match(/report (\S+)/)?.[1] ?? "";
+    const firstId = firstReport.match(/[0-9a-f]{32}/)?.[0];
+    if (firstId) {
+      const p = (await call(() => n.pages.retrieve({ page_id: firstId }))) as unknown as Json;
+      expect(p.in_trash === true, "previous report not replaced");
+    }
+    for (const u of [...second.undo, ...first.undo]) await must("notion_undo", { undo_id: u.undo_id, force: true });
+    await must("notion_automation", { action: "disable", rule_id: "weekly-report" });
+    const list = await must("notion_automation", { action: "list" });
+    expect(list.rules.find((r: Json) => r.id === "weekly-report").enabled === false, "disable failed");
+    const del = await must("notion_automation", { action: "delete", rule_id: "weekly-report" });
+    expect(del.removed_rule.id === "weekly-report", JSON.stringify(del));
+    const history = await tool("notion_automation", { action: "history" });
+    expect(!history.isError && Array.isArray(history.json) && history.json.length >= 4, history.text.slice(0, 200));
+    for (const id of ["at-risk", "stamp-completed"]) await must("notion_automation", { action: "delete", rule_id: id });
   });
 
   await step("notion_bulk_create: undo trashes every created row", async () => {

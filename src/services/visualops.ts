@@ -9,7 +9,7 @@ import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/cli
 import { call, normalizeId, notion, read } from "./notion.js";
 import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyName, simplify } from "./schema.js";
 import { appendSpecs, type BlockSpec } from "./blocks.js";
-import { CHART_TYPES, renderChart, type ChartRow, type ChartSpec } from "./charts.js";
+import { CHART_THEMES, CHART_TYPES, renderChart, type ChartRow, type ChartSpec } from "./charts.js";
 import { chartSourceSchema, parseMetric, pointsFromDatabase, pointsFromPages, type ChartSource } from "./chartdata.js";
 import { getChart, saveChart, saveImageCopy } from "./chartstore.js";
 import { viewRequest, type ViewSpec } from "./views.js";
@@ -44,6 +44,10 @@ export const chartSpecSchema = z
     width: z.number().int().min(240).max(1600).optional(),
     height: z.number().int().min(160).max(1200).optional(),
     sort_by_value: z.boolean().optional(),
+    theme: z
+      .enum(CHART_THEMES)
+      .optional()
+      .describe("Image surface: light (default), dark (Notion's dark background), or transparent with gray text that reads in both themes"),
   })
   .strict();
 
@@ -139,6 +143,7 @@ export const reportChartSchema = z.object({
   series: z.string().optional(),
   where: z.record(z.string(), z.unknown()).optional(),
   native: z.boolean().optional().describe("Live Notion chart view (default where Notion supports the type) or a rendered image."),
+  theme: z.enum(CHART_THEMES).optional().describe("Rendered images only: light (default), dark, or transparent."),
 });
 
 export const reportArgsShape = {
@@ -261,7 +266,7 @@ export async function buildReport(a: ReportArgs) {
       const rows = c.where ? await filterPages(c.where) : all;
       const xName = resolvePropertyName(ds, typeof c.x === "string" ? c.x : c.x.property).name;
       const points = pointsFromPages(rows, { x: xName, ...(typeof c.x !== "string" && c.x.by ? { by: c.x.by } : {}), ...(c.series ? { series: resolvePropertyName(ds, c.series).name } : {}), metric: parseMetric(ds, c.y), includeEmpty: false });
-      const spec: ChartSpec = { type: c.type, title: c.title };
+      const spec: ChartSpec = { type: c.type, title: c.title, ...(c.theme ? { theme: c.theme } : {}) };
       const { png, notes: n2 } = await renderChart(spec, points);
       notes.push(...n2.map((x) => `${c.title}: ${x}`));
       const file = path.join(tmpDir, `chart-${imageCharts.length + 1}.png`);

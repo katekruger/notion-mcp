@@ -4,10 +4,10 @@ import { call, isNotFound, normalizeId, notion, read } from "../services/notion.
 import { appendSpecs, PartialWriteError, type BlockSpec } from "../services/blocks.js";
 import {
   blockAsSpec,
-  childrenAsSpecs,
   copyFileObject,
   describeBlock,
   duplicatePage,
+  pageSegments,
   getBlock,
   getPage,
   pageTitle,
@@ -16,6 +16,7 @@ import {
   type Skipped,
 } from "../services/copy.js";
 import { fileRef } from "../services/files.js";
+import { MAX_COPY_ROWS, planDatabaseCopy, readDatabase } from "../services/dbcopy.js";
 import { plain, textToTitle, toInlineMarkdown } from "../services/richtext.js";
 import { dataSourceTitle, resolveDataSource, restoreValue } from "../services/schema.js";
 import { insertedBlocks, record, type UndoOp } from "../services/journal.js";
@@ -114,39 +115,56 @@ export function registerContentTools(server: McpServer): void {
       title: "Duplicate Page",
       description:
         "Copy a page with its icon, cover, content (every block type the API can create, with formatting), and, when it stays in " +
-        "the same database, all writable properties. Sub-pages are copied too (placed at the end of the copy). Databases inside " +
-        "the page and read-only blocks are listed as skipped. Uploaded files and images are re-uploaded so the copy doesn't depend " +
-        "on expiring links. dry_run shows what would be copied. notion_undo trashes the copy.",
+        "the same database, all writable properties. Sub-pages and databases on the page are copied in place; databases get their " +
+        "schema and (by default) their rows with content, with relations inside the copy pointing at the copied rows. Views, " +
+        "linked database views, and read-only blocks are listed as skipped. Uploaded files and images are re-uploaded so the " +
+        "copy doesn't depend on expiring links. dry_run shows what would be copied. notion_undo trashes the copy.",
       inputSchema: {
         page: z.string().describe("Page to copy."),
         to: z.string().optional().describe("Destination page or database. Defaults to the original's parent."),
         data_source_name: z.string().optional(),
         title: z.string().optional().describe('Defaults to "<original title> (copy)".'),
         include_subpages: z.boolean().default(true),
+        databases: z
+          .enum(["rows", "schema", "none"])
+          .default("rows")
+          .describe(`Databases on the page: copy schema and rows (up to ${MAX_COPY_ROWS} per data source), schema only, or skip them.`),
         dry_run: z.boolean().default(false),
       },
       annotations: { ...WRITE, idempotentHint: false },
     },
-    safe(async ({ page, to, data_source_name, title, include_subpages, dry_run }) => {
+    safe(async ({ page, to, data_source_name, title, include_subpages, databases, dry_run }) => {
       const source = await getPage(normalizeId(page));
       const dest = to ? await destinationParent(to, data_source_name) : null;
       const parent = dest?.parent ?? parentOf(source);
       if (!parent) throw new Error("This page sits at the workspace top level or inside a block; pass `to` with a destination page or database.");
       if (dry_run) {
-        const content = await childrenAsSpecs(source.id);
+        const content = await pageSegments(source.id);
+        const dbs = [];
+        const skipped: Skipped[] = [...content.skipped];
+        if (databases !== "none") {
+          for (const seg of content.segments) {
+            if (seg.kind !== "database") continue;
+            const db = await readDatabase(seg.id);
+            if (db && (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") === source.id.replace(/-/g, "")) dbs.push(await planDatabaseCopy(db, databases === "rows"));
+            else skipped.push({ id: seg.id, type: "child_database", reason: "linked database view (the API can't read or recreate it)" });
+          }
+        }
+        const pages = content.segments.filter((s) => s.kind === "page").map((s) => (s as { title: string }).title);
         return ok({
           dry_run: true,
           title: title ?? `${pageTitle(source)} (copy)`,
           destination: dest?.label ?? "same parent as the original",
           blocks: content.blockCount,
-          subpages: include_subpages ? content.nestedPages.map((p) => p.title) : [],
-          skipped: content.skipped,
+          subpages: include_subpages ? [...pages, ...content.nestedPages.map((p) => p.title)] : [],
+          databases: dbs,
+          skipped,
           next_step: "Call again with dry_run=false to copy.",
         });
       }
       const undo: UndoOp[] = [];
       try {
-        const r = await duplicatePage(source, parent, { title, includeSubpages: include_subpages }, undo);
+        const r = await duplicatePage(source, parent, { title, includeSubpages: include_subpages, databases }, undo);
         const journalId = await record("notion_duplicate_page", `Duplicated "${pageTitle(source)}" as ${r.page_id}`, undo);
         return ok({ ...r, undo_id: journalId });
       } catch (e) {

@@ -8,6 +8,7 @@ import { reuploadUrl } from "./files.js";
 import { restoreValue } from "./schema.js";
 import { textToTitle, plain } from "./richtext.js";
 import type { UndoOp } from "./journal.js";
+import { copyDatabase, readDatabase, type DatabaseCopyResult } from "./dbcopy.js";
 
 /** Largest subtree copied in one call. */
 export const MAX_COPY_BLOCKS = 3000;
@@ -30,7 +31,7 @@ export interface SubtreeSpecs {
 
 const REASONS: Record<string, string> = {
   child_page: "sub-page (copied separately as a page)",
-  child_database: "database (the API can't copy databases; recreate or link it in Notion)",
+  child_database: "database inside a block (Notion only creates databases directly on a page; copy it from there)",
   unsupported: "block type the API can't read or create",
   meeting_notes: "meeting notes (read-only in the API)",
   transcription: "meeting notes (read-only in the API)",
@@ -119,19 +120,21 @@ export interface DuplicateResult {
   url?: string;
   blocks: number;
   subpages: number;
+  databases: DatabaseCopyResult[];
   skipped: Skipped[];
   notes: string[];
 }
 
 /**
  * Duplicate a page: title, icon, cover, writable properties (when staying in the same database), and content.
- * Sub-pages are duplicated recursively after the content (Notion lists child pages where they were created,
- * so they land at the end). Databases inside the page are reported, not copied.
+ * Content is written in order, so sub-pages and databases directly on the page keep their place. Sub-pages or
+ * databases nested inside other blocks (toggles, columns) can't be created there, so sub-pages go to the end and
+ * databases are reported.
  */
 export async function duplicatePage(
   source: PageObjectResponse,
   parent: PageParent,
-  opts: { title?: string; includeSubpages: boolean; depth?: number },
+  opts: { title?: string; includeSubpages: boolean; databases?: DatabaseMode; depth?: number },
   undo: UndoOp[]
 ): Promise<DuplicateResult> {
   const notes: string[] = [];
@@ -158,29 +161,85 @@ export async function duplicatePage(
   if (icon) body.icon = icon;
   if (cover) body.cover = cover;
 
-  const content = await childrenAsSpecs(source.id);
+  const content = await pageSegments(source.id);
   const created = await call(() => notion().pages.create(body as never));
   undo.push({ kind: "page_trash", page_id: created.id, in_trash: true });
-  if (content.specs.length) await appendSpecs(created.id, content.specs);
+  const depth = opts.depth ?? 0;
+  const databasesMode = opts.databases ?? "rows";
   let subpages = 0;
+  const databases: DatabaseCopyResult[] = [];
   const skipped = [...content.skipped];
-  if (content.nestedPages.length && opts.includeSubpages) {
-    if ((opts.depth ?? 0) >= 5) {
-      notes.push(`Stopped at 5 levels of sub-pages; ${content.nestedPages.length} deeper sub-page(s) were not copied.`);
-    } else {
-      for (const sp of content.nestedPages) {
-        const child = await getPage(sp.id);
-        // Trashing the new top page also trashes these, so their own undo entries aren't needed.
-        const r = await duplicatePage(child, { page_id: created.id }, { title: sp.title, includeSubpages: true, depth: (opts.depth ?? 0) + 1 }, []);
-        subpages += 1 + r.subpages;
-        skipped.push(...r.skipped);
-      }
-      notes.push("Sub-pages were copied to the end of the new page (the API can't place a sub-page between blocks).");
+  const copySub = async (sp: { id: string; title: string }) => {
+    if (depth >= 5) {
+      skipped.push({ id: sp.id, type: "child_page", reason: "sub-page deeper than 5 levels" });
+      return;
     }
+    const child = await getPage(sp.id);
+    // Trashing the new top page also trashes these, so their own undo entries aren't needed.
+    const r = await duplicatePage(child, { page_id: created.id }, { title: sp.title, includeSubpages: true, databases: databasesMode, depth: depth + 1 }, []);
+    subpages += 1 + r.subpages;
+    databases.push(...r.databases);
+    skipped.push(...r.skipped);
+    notes.push(...r.notes.filter((n) => !notes.includes(n)));
+  };
+  for (const seg of content.segments) {
+    if (seg.kind === "blocks") await appendSpecs(created.id, seg.specs);
+    else if (seg.kind === "page") {
+      if (opts.includeSubpages) await copySub(seg);
+      else skipped.push({ id: seg.id, type: "child_page", reason: "sub-page (include_subpages is off)" });
+    } else if (databasesMode === "none") {
+      skipped.push({ id: seg.id, type: "child_database", reason: "database (databases is \"none\")" });
+    } else {
+      const db = await readDatabase(seg.id);
+      if (!db || (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") !== source.id.replace(/-/g, "")) {
+        skipped.push({ id: seg.id, type: "child_database", reason: "linked database view (the API can't read or recreate it; link the source again in Notion)" });
+        continue;
+      }
+      const r = await copyDatabase(db, created.id, {
+        withRows: databasesMode === "rows",
+        copyContent: async (from, to) => {
+          const c = await childrenAsSpecs(from);
+          if (c.specs.length) await appendSpecs(to, c.specs);
+        },
+      });
+      databases.push(r);
+    }
+  }
+  if (content.nestedPages.length && opts.includeSubpages) {
+    for (const sp of content.nestedPages) await copySub(sp);
+    notes.push("Sub-pages inside toggles or columns were copied to the end of the new page (the API only creates pages directly on a page).");
   } else if (content.nestedPages.length) {
     skipped.push(...content.nestedPages.map((p) => ({ id: p.id, type: "child_page", reason: "sub-page (include_subpages is off)" })));
   }
-  return { page_id: created.id, url: "url" in created ? created.url : undefined, blocks: content.blockCount, subpages, skipped, notes };
+  return { page_id: created.id, url: "url" in created ? created.url : undefined, blocks: content.blockCount, subpages, databases, skipped, notes };
+}
+
+export type DatabaseMode = "rows" | "schema" | "none";
+
+export type Segment =
+  | { kind: "blocks"; specs: BlockSpec[] }
+  | { kind: "page"; id: string; title: string }
+  | { kind: "database"; id: string; title: string };
+
+/** A page's content split so sub-pages and databases on the page itself can be recreated in place. */
+export async function pageSegments(pageId: string): Promise<Omit<SubtreeSpecs, "specs"> & { segments: Segment[] }> {
+  const tree = await getTree(pageId, 50, MAX_COPY_BLOCKS);
+  if (tree.truncated) throw new Error(`More than ${MAX_COPY_BLOCKS} blocks under ${pageId}; copy smaller sections (notion_copy_blocks with specific block ids).`);
+  const out: Omit<SubtreeSpecs, "specs" | "blockCount"> = { nestedPages: [], skipped: [], syncedOriginals: [] };
+  const segments: Segment[] = [];
+  for (const node of tree.nodes) {
+    const block = tree.raw.get(node.id);
+    if (!block) continue;
+    if (block.type === "child_page") segments.push({ kind: "page", id: block.id, title: block.child_page.title });
+    else if (block.type === "child_database") segments.push({ kind: "database", id: block.id, title: block.child_database.title });
+    else {
+      const specs = convert([node], tree.raw, out);
+      const last = segments[segments.length - 1];
+      if (last?.kind === "blocks") last.specs.push(...specs);
+      else if (specs.length) segments.push({ kind: "blocks", specs });
+    }
+  }
+  return { segments, blockCount: tree.raw.size, ...out };
 }
 
 async function titlePropertyName(dataSourceId: string): Promise<string> {

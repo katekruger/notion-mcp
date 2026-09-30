@@ -11,7 +11,8 @@ A local MCP server for Notion built for precise edits. It changes exactly the bl
 | Bulk changes | One call per row | Filtered bulk update with dry-run preview and rate limiting |
 | Mistakes | Manual cleanup | Every write returns an `undo_id`; `notion_undo` reverts it |
 | Stale overwrites | Not detected | Optional `expected_last_edited_time` refuses to write over newer edits |
-| Schema changes | Limited | Add properties, add select options, rename properties |
+| Schema changes | Limited | Create databases with relations, rollups, formulas, unique IDs, and status groups; add, rename, retype, or delete properties; manage options and number formats. Deleted properties keep their values for undo |
+| Views | Not available | Create, edit, and delete table, board, list, calendar, timeline, gallery, form, chart, map, and dashboard views |
 
 ## Setup
 
@@ -85,7 +86,7 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 
 **Pages**
 - `notion_update_page`: title, icon, cover, lock, or move a page under another page or into a database.
-- `notion_duplicate_page`: copy a page with its content, icon, cover, properties, and sub-pages.
+- `notion_duplicate_page`: copy a page with its content, icon, cover, properties, sub-pages, and databases (schema and rows, or schema only with `databases: "schema"`). Sub-pages and databases keep their place in the page.
 - `notion_list_templates`: a database's templates, for `notion_create_page`'s `template`.
 
 **Write data**
@@ -146,7 +147,7 @@ The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; s
 
 1. **Native Notion content** for structure and diagrams: callouts, columns, tables, equations, and Mermaid diagrams (```` ```mermaid ```` code blocks: flowcharts, sequence, Gantt, pie, timeline). Mermaid is checked before writing so a typo doesn't leave an error box.
 2. **Chart views** (`notion_views` with `type: "chart"`) when the data lives in a Notion database: they stay live, filter with the database, and people can click through. They can sit on any page as a linked view.
-3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". They are light-themed PNGs, so they don't switch in dark mode. The recipe is stored in `~/.notion-plus/charts.json`, and `refresh_block_id` redraws a chart from current data in the same block.
+3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `~/.notion-plus/charts.json`, and `refresh_block_id` redraws a chart from current data in the same block.
 4. **Embeds** (`embed` blocks) for interactive charts hosted elsewhere, when neither of the above fits.
 
 `notion_build_report` combines these: it uses a live chart view where Notion supports the chart type and renders an image otherwise.
@@ -177,13 +178,13 @@ Relation values in writes can be page ids, links, or the related row's exact tit
 
 - A block's type can't be changed in place; insert a new block and delete the old one.
 - Blocks can't be moved, so `notion_copy_blocks` with `move: true` copies and then trashes the original: moved blocks get new ids and lose their comments. It refuses moves that would lose content the API can't recreate (databases, read-only blocks) or break synced-block references. Pages are moved natively.
-- There's no API for duplicating a page; `notion_duplicate_page` rebuilds it. Databases inside the page aren't copied (they're listed as skipped), and sub-pages land at the end of the copy.
+- There's no API for duplicating a page or a database; `notion_duplicate_page` rebuilds both. Databases directly on the page are recreated in place with their schema and up to 500 rows per data source (values and content); relations inside the copied database point at the copied rows, while a two-way relation to a database outside the copy becomes one-way so nothing outside the copy changes. Views aren't copied (the copy gets a default table view), and linked database views can't be read through the API, so both are reported. Notion only creates pages and databases directly on a page, so sub-pages inside toggles or columns go to the end of the copy and databases there are skipped.
 - Button blocks can't be created or read through the API. Breadcrumbs, bookmarks, and links to pages don't appear in Notion's markdown export; this server fills them in. Code captions aren't in the markdown export either.
 - A heading 4 can't be updated without resending its text; `notion_patch_block` handles that.
 - Notion's built-in database automations can't be created or edited through the API. Button blocks, AI blocks, and some embeds are read-only (the API returns them as `unsupported`).
 - Map views need a place property (`map_by`). Dashboards can be created and given widgets, but the widget layout beyond "new row" or "existing row" is set in Notion.
 - A chart image can be replaced in place, but Notion won't take an old file link back, so a refresh keeps a copy of the previous image in `~/.notion-plus/charts/` for undo.
-- Status options can be added, each in a group (To-do, In progress, Complete). Options sent without a group all land in To-do, so this server guesses the group from the option name ("Done" → Complete) and says so. Views, including chart views, are supported by the API and planned here.
+- Status options can be added, each in a group (To-do, In progress, Complete). Options sent without a group all land in To-do, so this server guesses the group from the option name ("Done" → Complete) and says so.
 - Last-edited times are rounded to the minute, so the freshness check catches edits made in an earlier minute.
 - Select and status option names and colors can't be changed through the API. Renames are accepted and silently ignored; color changes are rejected. Rename options in Notion, or add a new option, move rows with `notion_bulk_update`, and delete the old option in Notion.
 - Leaving an option out of a schema update deletes it and clears it from every row, so this server always sends the full list.
@@ -323,4 +324,4 @@ Built in phases, each ending with the build, unit tests, and the live suite pass
 5. Automations: schedules, run state, more actions, full management from Claude. (done, 0.6.0)
 6. Distribution: MCP Bundle, tool evaluations, acceptance tests, API version 2026-03-11. (done, 0.7.0)
 
-Possible next steps: webhooks through a small hosted relay for instant automations, and chart images that follow Notion's dark mode.
+Possible next steps: webhooks through a small hosted relay for instant automations.

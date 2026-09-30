@@ -1,4 +1,5 @@
 import { formatError } from "../services/notion.js";
+import { runJournaled } from "../services/journal.js";
 
 export const CHARACTER_LIMIT = 25000;
 
@@ -74,3 +75,26 @@ export function safe<A>(fn: (args: A) => Promise<ToolResult>): (args: A) => Prom
 export const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 export const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 export const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
+
+/** Anything with the MCP SDK's registerTool shape (the real server, or a test registry). */
+interface ToolRegistry {
+  registerTool(name: string, config: { annotations?: { readOnlyHint?: boolean } }, handler: (...a: never[]) => unknown): unknown;
+}
+
+/**
+ * Wrap a server so every tool that isn't read-only writes a journal intent before its first Notion write
+ * (see runJournaled). Register tools on the returned object.
+ */
+export function journalWrites<S extends ToolRegistry>(server: S): S {
+  return new Proxy(server, {
+    get(target, prop, receiver) {
+      if (prop !== "registerTool") return Reflect.get(target, prop, receiver);
+      return (name: string, config: { annotations?: { readOnlyHint?: boolean } }, handler: (...a: unknown[]) => Promise<ToolResult>) =>
+        target.registerTool(
+          name,
+          config,
+          (config.annotations?.readOnlyHint ? handler : (...a: unknown[]) => runJournaled(name, a[0], () => handler(...a))) as never
+        );
+    },
+  });
+}

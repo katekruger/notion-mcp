@@ -10,8 +10,9 @@ import { registerContentTools } from "./tools/content.js";
 import { registerDatabaseTools } from "./tools/database.js";
 import { registerVisualTools } from "./tools/visuals.js";
 import { VERSION } from "./version.js";
+import { journalWrites } from "./tools/util.js";
 
-const server = new McpServer(
+const mcp = new McpServer(
   { name: "notion-plus-mcp-server", version: VERSION },
   {
     instructions:
@@ -23,6 +24,9 @@ const server = new McpServer(
       "with dry_run before applying. Every write returns an undo_id.",
   }
 );
+
+// Tools register through a wrapper that journals each write before it happens.
+const server = journalWrites(mcp);
 
 registerReadTools(server);
 registerPageTools(server);
@@ -38,7 +42,7 @@ async function main(): Promise<void> {
   if (!process.env.NOTION_TOKEN) {
     console.error("Warning: NOTION_TOKEN is not set; every tool call will fail until it is.");
   }
-  await server.connect(new StdioServerTransport());
+  await mcp.connect(new StdioServerTransport());
   console.error("notion-plus-mcp-server running on stdio");
 }
 

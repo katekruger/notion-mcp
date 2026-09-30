@@ -1,4 +1,4 @@
-// Polling automations: rules in automations/rules.json are evaluated as database queries and/or on a schedule.
+// Polling automations: rules (rules.json in the home folder, or NOTION_PLUS_RULES) are evaluated as database queries and/or on a schedule.
 // Matching rows get row actions through the same write paths the tools use; rule-level `then` actions (refresh a
 // chart, build a report, create a page) run once per firing. Everything a run writes is one journal entry per rule.
 import { promises as fs } from "node:fs";
@@ -6,7 +6,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { z } from "zod";
-import { call, isNotFound, normalizeId, notion } from "./notion.js";
+import { randomBytes } from "node:crypto";
+import { call, isNotFound, normalizeId, notion, requestCount } from "./notion.js";
+import { log } from "./log.js";
 import { appendSpecs, markdownToSpecs, PartialWriteError } from "./blocks.js";
 import { blockSpecSchema } from "./specSchema.js";
 import { forApi, fromInlineMarkdown, plain, textToTitle } from "./richtext.js";
@@ -14,6 +16,8 @@ import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyNa
 import { insertedBlocks, record, type UndoOp } from "./journal.js";
 import { preparePayload, snapshot } from "./writes.js";
 import { queryAll } from "./query.js";
+import { readJson, revisionOf, updateJson, withLock, writeJson, type Loaded } from "./store.js";
+import { stateDir } from "./workspace.js";
 import { homeDir } from "./files.js";
 import { isDue, nextOccurrence, toCron } from "./schedule.js";
 import { buildReport, chartSourceSchema, chartSpecSchema, refreshChart, ReportError, reportArgsShape, rowSchema } from "./visualops.js";
@@ -145,79 +149,180 @@ export const rulesFileSchema = z.object({
 });
 export type RulesFile = z.infer<typeof rulesFileSchema>;
 
-/** Rules live in the repo so the scheduled workflow and local edits share one file. */
+/**
+ * Where rules live: NOTION_PLUS_RULES (the GitHub workflow points it at the repo's automations/rules.json), else
+ * rules.json in the home folder, which survives reinstalling or upgrading the server.
+ */
 export function rulesPath(): string {
   if (process.env.NOTION_PLUS_RULES) return path.resolve(process.env.NOTION_PLUS_RULES);
+  return path.join(homeDir(), "rules.json");
+}
+
+/** Whether rules are the repo's file, so edits need a commit to reach the scheduled workflow. */
+export function rulesInRepo(): boolean {
+  return Boolean(process.env.NOTION_PLUS_RULES) && path.resolve(process.env.NOTION_PLUS_RULES as string) === path.resolve(repoRulesPath());
+}
+
+/** The rules file next to the code (automations/rules.json in a checkout; empty in a bundle). */
+export function repoRulesPath(): string {
   // dist/services/automations.js and src/services/automations.ts both sit two levels below the repo root.
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "automations", "rules.json");
 }
 
-export async function loadRules(file = rulesPath()): Promise<RulesFile> {
-  let raw: string;
+/**
+ * Before 0.10, rules defaulted to the file next to the code. The first time the home folder has no rules file,
+ * adopt that one if it has rules, so upgrading doesn't lose them.
+ */
+async function adoptRepoRules(file: string): Promise<void> {
   try {
-    raw = await fs.readFile(file, "utf8");
+    await fs.access(file);
+    return;
   } catch {
-    return { version: 1, timezone: "UTC", rules: [] };
+    /* no rules file yet */
   }
-  let json: unknown;
+  let legacy: RulesFile;
   try {
-    json = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`${file} isn't valid JSON: ${(e as Error).message}`);
+    legacy = await loadRulesWithRevision(repoRulesPath(), false).then((l) => l.data);
+  } catch {
+    return;
   }
-  const parsed = rulesFileSchema.safeParse(json);
-  if (!parsed.success) {
-    throw new Error(`${file} is invalid:\n- ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("\n- ")}`);
-  }
-  const ids = new Set<string>();
-  for (const r of parsed.data.rules) {
-    if (ids.has(r.id)) throw new Error(`${file}: duplicate rule id "${r.id}".`);
-    ids.add(r.id);
-  }
-  return parsed.data;
+  if (!legacy.rules.length) return;
+  await withLock(file, async () => {
+    try {
+      await fs.access(file);
+    } catch {
+      await writeJson(file, legacy, { trailingNewline: true });
+      log("info", "automation.rules_adopted", { from: repoRulesPath(), to: file, rules: legacy.rules.length });
+    }
+  });
 }
 
-export async function saveRules(data: RulesFile, file = rulesPath()): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = file + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2) + "\n");
-  await fs.rename(tmp, file);
+function parseRules(file: string) {
+  return (json: unknown): RulesFile => {
+    const parsed = rulesFileSchema.safeParse(json);
+    if (!parsed.success) {
+      throw new Error(`${file} is invalid:\n- ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("\n- ")}`);
+    }
+    const ids = new Set<string>();
+    for (const r of parsed.data.rules) {
+      if (ids.has(r.id)) throw new Error(`${file}: duplicate rule id "${r.id}".`);
+      ids.add(r.id);
+    }
+    return parsed.data;
+  };
+}
+
+const emptyRules = (): RulesFile => ({ version: 1, timezone: "UTC", rules: [] });
+
+/** The rules file with its revision (a content hash), for edits that must not overwrite someone else's change. */
+export async function loadRulesWithRevision(file = rulesPath(), adopt = true): Promise<Loaded<RulesFile>> {
+  if (adopt && !process.env.NOTION_PLUS_RULES && file === rulesPath()) await adoptRepoRules(file);
+  return readJson(file, parseRules(file), emptyRules);
+}
+
+export async function loadRules(file = rulesPath()): Promise<RulesFile> {
+  return (await loadRulesWithRevision(file)).data;
+}
+
+/** Replace the whole rules file (under its lock). Prefer editRules, which applies a change to the current file. */
+export async function saveRules(data: RulesFile, file = rulesPath()): Promise<string> {
+  return withLock(file, () => writeJson(file, data, { trailingNewline: true }));
+}
+
+export class RulesConflictError extends Error {
+  constructor(file: string, expected: string, actual: string | null) {
+    super(`${file} changed since it was read (expected revision ${expected}, now ${actual ?? "missing"}). Read it again (action=list) and redo the change.`);
+    this.name = "RulesConflictError";
+  }
+}
+
+/**
+ * Apply a change to the current rules file under its lock and return the new revision. With `expectedRevision`,
+ * the change is refused if the file changed since that revision was read.
+ */
+export async function editRules(change: (data: RulesFile) => void, opts: { expectedRevision?: string; file?: string } = {}): Promise<string> {
+  const file = opts.file ?? rulesPath();
+  return withLock(file, async () => {
+    const cur = await loadRulesWithRevision(file);
+    if (opts.expectedRevision && opts.expectedRevision !== cur.revision) throw new RulesConflictError(file, opts.expectedRevision, cur.revision);
+    change(cur.data);
+    return writeJson(file, cur.data, { trailingNewline: true });
+  });
 }
 
 // ---------- run state ----------
 
+/** Progress on one row whose actions haven't all finished; the next run resumes after the steps in `done`. */
+export interface RowCheckpoint {
+  /** Revision of the rule the steps belong to; an edited rule starts the row over. */
+  rule_rev: string;
+  done: string[];
+  attempts: number;
+  run_id: string;
+  last_error?: string;
+}
+
+/** A firing whose `then` actions (or rows, for a schedule) haven't all finished. */
+export interface PendingFiring {
+  /** The scheduled occurrence (ISO time), or "rows:<run id>" for a condition rule's follow-up actions. */
+  key: string;
+  rule_rev: string;
+  run_id: string;
+  started: string;
+  attempts: number;
+  then_done: number[];
+  /** The `then` actions were started (rows were acted on, or the rule has no condition). */
+  then_started?: boolean;
+  last_error?: string;
+}
+
+export type RunStatus = "succeeded" | "partial" | "failed" | "skipped";
+
 export interface RuleState {
-  /** The scheduled occurrence this rule last fired for. */
+  /** The scheduled occurrence this rule last completed. Only advances when every step of it succeeded (or was waived). */
   last_fired?: string;
   /** Report page this rule built last (for build_report replace_previous). */
   last_report_page?: string;
+  pending?: PendingFiring;
+  rows?: Record<string, RowCheckpoint>;
+  last_run?: { run_id: string; at: string; status: RunStatus };
 }
-interface StateFile {
+export interface StateFile {
   rules: Record<string, RuleState>;
 }
 
-export function statePath(): string {
-  return process.env.NOTION_PLUS_STATE ? path.resolve(process.env.NOTION_PLUS_STATE) : path.join(homeDir(), "automation-state.json");
-}
-
-export async function loadState(): Promise<StateFile> {
-  try {
-    const s = JSON.parse(await fs.readFile(statePath(), "utf8")) as StateFile;
-    return { rules: s.rules ?? {} };
-  } catch {
-    return { rules: {} };
+function parseState(raw: unknown): StateFile {
+  const o = raw as { rules?: unknown } | null;
+  if (!o || typeof o !== "object" || (o.rules !== undefined && (typeof o.rules !== "object" || o.rules === null || Array.isArray(o.rules)))) {
+    throw new Error('expected {"rules": {...}}');
   }
+  return { rules: (o.rules as Record<string, RuleState>) ?? {} };
 }
 
-async function saveState(state: StateFile): Promise<void> {
-  await fs.mkdir(path.dirname(statePath()), { recursive: true });
-  const tmp = statePath() + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-  await fs.rename(tmp, statePath());
+export async function statePath(): Promise<string> {
+  return process.env.NOTION_PLUS_STATE ? path.resolve(process.env.NOTION_PLUS_STATE) : path.join(await stateDir(), "automation-state.json");
 }
 
-export function runLogPath(): string {
-  return path.join(homeDir(), "automation-runs.jsonl");
+/** Automation state. A corrupt or unreadable file stops here instead of reading as "nothing has fired yet". */
+export async function loadState(): Promise<StateFile> {
+  return (await readJson(await statePath(), parseState, () => ({ rules: {} }))).data;
+}
+
+/**
+ * Save the rules this run touched, merged into the current file under its lock, so a run never erases what
+ * another process recorded for other rules in the meantime.
+ */
+async function saveState(state: StateFile, touched: Iterable<string>): Promise<void> {
+  const ids = [...touched];
+  if (!ids.length) return;
+  await updateJson<StateFile, null>(await statePath(), parseState, () => ({ rules: {} }), (cur) => {
+    for (const id of ids) if (state.rules[id]) cur.rules[id] = state.rules[id];
+    return { data: cur, result: null };
+  });
+}
+
+export async function runLogPath(): Promise<string> {
+  return path.join(await stateDir(), "automation-runs.jsonl");
 }
 
 // ---------- templates ----------
@@ -343,19 +448,41 @@ export function stillMatches(condition: unknown, written: unknown): boolean | nu
  * That holds when it trashes the row, uses a marker, or writes a value its condition no longer matches.
  * Returns a reason when the rule can't be shown to stop matching.
  */
+/**
+ * Properties a rule's condition checks, with the condition on each (undefined when it can't be evaluated here:
+ * raw filters, relative dates, and anything inside or/and).
+ */
+export function conditionProperties(ds: DataSourceObjectResponse, when: When): Map<string, unknown> {
+  const condition = new Map<string, unknown>();
+  for (const [k, v] of Object.entries(when.where ?? {})) {
+    if (k === "or" || k === "and") {
+      for (const name of filterProperties(v)) if (!condition.has(name)) condition.set(safeName(ds, name), undefined);
+      for (const sub of Array.isArray(v) ? v : [])
+        for (const key of Object.keys((sub ?? {}) as object)) if (!key.startsWith("$") && key !== "or" && key !== "and") condition.set(safeName(ds, key), undefined);
+      continue;
+    }
+    condition.set(k.startsWith("$") ? k : resolvePropertyName(ds, k).name, v);
+  }
+  for (const k of filterProperties(when.filter)) if (!condition.has(k)) condition.set(resolvePropertyName(ds, k).name, undefined);
+  for (const r of when.relative ?? []) {
+    if (!r.property.startsWith("$")) condition.set(resolvePropertyName(ds, r.property).name, undefined);
+  }
+  return condition;
+}
+
+function safeName(ds: DataSourceObjectResponse, name: string): string {
+  try {
+    return resolvePropertyName(ds, name).name;
+  } catch {
+    return name;
+  }
+}
+
 export function selfClearingProblem(ds: DataSourceObjectResponse, rule: Rule): string | null {
   if (!rule.when || rule.actions.length === 0) return null;
   if (rule.marker) return null;
   if (rule.actions.some((a) => "trash" in a)) return null;
-  const condition = new Map<string, unknown>();
-  for (const [k, v] of Object.entries(rule.when.where ?? {})) {
-    if (k === "or" || k === "and") continue;
-    condition.set(k.startsWith("$") ? k : resolvePropertyName(ds, k).name, v);
-  }
-  for (const k of filterProperties(rule.when.filter)) if (!condition.has(k)) condition.set(resolvePropertyName(ds, k).name, undefined);
-  for (const r of rule.when.relative ?? []) {
-    if (!r.property.startsWith("$")) condition.set(resolvePropertyName(ds, r.property).name, undefined);
-  }
+  const condition = conditionProperties(ds, rule.when);
   for (const a of rule.actions) {
     if (!("set" in a)) continue;
     for (const [k, v] of Object.entries(a.set)) {
@@ -453,16 +580,59 @@ export interface RuleResult {
   rule: string;
   database: string;
   dry_run: boolean;
+  /**
+   * succeeded: everything this firing needed is done. partial: some steps failed or were left for the next run
+   * (they resume there). failed: nothing needed succeeded, or the rule couldn't run. skipped: not due.
+   */
+  status: RunStatus;
   /** Set when a schedule isn't due: why the rule didn't run. */
   skipped?: string;
   next_run?: string;
+  /** The scheduled occurrence this run worked on. */
+  occurrence?: string;
   matched: number;
   more_waiting: boolean;
   acted: number;
-  rows: { id: string; title: string; actions: string[]; error?: string }[];
-  then: { action: string; result?: string; error?: string }[];
+  rows: { id: string; title: string; actions: string[]; resumed?: string[]; error?: string }[];
+  then: { action: string; result?: string; error?: string; done_earlier?: boolean }[];
+  notes?: string[];
   undo_id?: string;
   error?: string;
+}
+
+/** Limits for one run across all rules. Anything past a limit is left for the next run. */
+export interface RunLimits {
+  /** Rows acted on. */
+  max_rows?: number;
+  /** Notion requests (reads and writes, retries included). */
+  max_requests?: number;
+  /** Blocks appended by `append` actions. */
+  max_blocks?: number;
+  max_minutes?: number;
+}
+
+export const DEFAULT_LIMITS: Required<RunLimits> = { max_rows: 200, max_requests: 3000, max_blocks: 5000, max_minutes: 20 };
+
+export interface Budget {
+  limits: Required<RunLimits>;
+  rows: number;
+  blocks: number;
+  startRequests: number;
+  deadline: number;
+}
+
+export function newBudget(limits: RunLimits = {}, now = Date.now()): Budget {
+  const l = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(limits).filter(([, v]) => v !== undefined)) } as Required<RunLimits>;
+  return { limits: l, rows: 0, blocks: 0, startRequests: requestCount(), deadline: now + l.max_minutes * 60_000 };
+}
+
+/** Which limit is used up, if any. */
+export function budgetExhausted(b: Budget): string | null {
+  if (b.rows >= b.limits.max_rows) return `row limit (${b.limits.max_rows})`;
+  if (requestCount() - b.startRequests >= b.limits.max_requests) return `request limit (${b.limits.max_requests})`;
+  if (b.blocks >= b.limits.max_blocks) return `block limit (${b.limits.max_blocks})`;
+  if (Date.now() >= b.deadline) return `time limit (${b.limits.max_minutes} min)`;
+  return null;
 }
 
 export interface RunOptions {
@@ -470,9 +640,11 @@ export interface RunOptions {
   now?: Date;
   /** Run scheduled rules even if they aren't due (manual runs). */
   force?: boolean;
-  /** Stop writing once this many rows have been acted on across the run. */
-  budget?: { remaining: number };
+  budget?: Budget;
   state?: StateFile;
+  runId?: string;
+  /** Save the state after each step, so a crash resumes where it stopped. */
+  persist?: () => Promise<void>;
 }
 
 /** Scheduled rules fire for an occurrence once; with no record, only for an occurrence within this window. */
@@ -536,26 +708,65 @@ async function runThen(t: ThenAction, ctx: TemplateContext, rule: Rule, state: R
   return `page ${"url" in created ? created.url : created.id}`;
 }
 
-/** Evaluate one rule. Dry runs only read; real runs write and record one journal entry for the rule. */
+interface RowStep {
+  id: string;
+  describe: string;
+  run: () => Promise<void>;
+}
+
+const RESUME_NOTE = "(done in an earlier run)";
+
+/**
+ * Evaluate one rule. Dry runs only read. Real runs work through each row's steps in a fixed order, saving progress
+ * after each: property writes that keep the row matching, then content and comments, then the writes that take the
+ * row out of the rule's condition (its marker, or values the condition checks), then trash. So a row is only marked
+ * handled once everything before it landed, and a failed row is picked up again next run, skipping the steps that
+ * already succeeded. A scheduled occurrence only counts as fired when all of it succeeded.
+ */
 export async function runRule(rule: Rule, timezone: string, opts: RunOptions): Promise<RuleResult> {
   const now = opts.now ?? new Date();
-  const result: RuleResult = { rule: rule.id, database: rule.database ?? "", dry_run: opts.dryRun, matched: 0, more_waiting: false, acted: 0, rows: [], then: [] };
+  const runId = opts.runId ?? `run-${now.getTime().toString(36)}`;
+  const result: RuleResult = { rule: rule.id, database: rule.database ?? "", dry_run: opts.dryRun, status: "succeeded", matched: 0, more_waiting: false, acted: 0, rows: [], then: [] };
   const state = opts.state ?? { rules: {} };
   const rs = (state.rules[rule.id] ??= {});
+  const rev = revisionOf(JSON.stringify(rule));
+  const persist = async () => {
+    if (!opts.dryRun && opts.persist) await opts.persist();
+  };
+  const note = (n: string) => (result.notes ??= []).push(n);
 
   let occurrence: Date | null = null;
   if (rule.schedule) {
     const cron = toCron(rule.schedule);
     const due = isDue(rule.schedule, now, timezone, rs.last_fired, CATCH_UP_MS);
     occurrence = due.occurrence;
+    // An unfinished occurrence stays due until it completes or a newer one arrives, however long ago it started
+    // (with no fire history, isDue alone would give up on it after the catch-up window).
+    if (!due.due && occurrence && rs.pending?.key === occurrence.toISOString()) due.due = true;
     const next = nextOccurrence(cron, now, timezone);
     if (next) result.next_run = next.toISOString();
     if (!due.due && !opts.force) {
+      result.status = "skipped";
       result.skipped = rs.last_fired
         ? `not due (last ran for ${rs.last_fired}; next ${next?.toISOString() ?? "unknown"})`
         : `not due (next ${next?.toISOString() ?? "unknown"})`;
       return result;
     }
+    if (occurrence) result.occurrence = occurrence.toISOString();
+  }
+
+  // Unfinished work from an earlier run: resume it if it's the same firing of the same rule, otherwise report it.
+  let pending = rs.pending;
+  if (pending && pending.rule_rev !== rev) {
+    note(`The rule changed since firing ${pending.key} stopped part-way; its remaining follow-up actions were dropped.`);
+    pending = undefined;
+  } else if (pending && rule.schedule && occurrence && pending.key !== occurrence.toISOString() && !pending.key.startsWith("rows:")) {
+    note(`Occurrence ${pending.key} didn't finish (${pending.last_error ?? "see earlier runs"}) and is superseded by ${occurrence.toISOString()}.`);
+    pending = undefined;
+  }
+  if (!opts.dryRun && rs.pending !== pending) {
+    if (pending) rs.pending = pending;
+    else delete rs.pending;
   }
 
   let ds: DataSourceObjectResponse | null;
@@ -565,146 +776,342 @@ export async function runRule(rule: Rule, timezone: string, opts: RunOptions): P
     if (ds) result.database = dataSourceTitle(ds);
   } catch (e) {
     result.error = (e as Error).message;
+    result.status = "failed";
     return result;
   }
 
   const undo: UndoOp[] = [];
-  if (ds && filter) {
-    const { pages, more } = await queryAll(ds.id, { filter, max: rule.limit });
-    result.matched = pages.length;
-    result.more_waiting = more;
-    // Order within a row: property writes, content, comment, then trash last so earlier actions can still reach it.
-    const ordered = [...rule.actions].sort((a, b) => rank(a) - rank(b));
-    const markerName = rule.marker ? resolvePropertyName(ds, rule.marker).name : null;
-    for (const page of pages) {
-      const ctx: TemplateContext = { now, timezone, page };
-      const row = { id: page.id, title: pageTitle(page), actions: ordered.map((a) => describeAction(render(a, ctx))) as string[] } as RuleResult["rows"][number];
-      if (markerName) row.actions.push(`check ${markerName}`);
-      result.rows.push(row);
-      if (opts.dryRun) continue;
-      if (opts.budget && opts.budget.remaining <= 0) {
-        row.error = "skipped: run write budget used up";
-        result.more_waiting = true;
-        continue;
+  try {
+    if (ds && filter) await runRows(rule, ds, filter, { now, timezone, runId, rev, rs, result, undo, opts, persist });
+
+    // Rule-level actions: once per firing; with a condition, only when rows were acted on (or would be, in a dry run),
+    // or when an earlier run acted on rows and its follow-up didn't finish.
+    const rowsHappened = !rule.when || (opts.dryRun ? result.matched > 0 : result.acted > 0) || Boolean(pending?.then_started);
+    if (rule.then.length && rowsHappened) {
+      const key = pending?.key ?? (occurrence && !opts.force ? occurrence.toISOString() : `rows:${runId}`);
+      const firing: PendingFiring = pending ?? { key, rule_rev: rev, run_id: runId, started: now.toISOString(), attempts: 0, then_done: [] };
+      if (!opts.dryRun) {
+        firing.attempts++;
+        firing.then_started = true;
+        rs.pending = firing;
+        await persist();
       }
-      try {
-        const values: Record<string, unknown> = {};
-        for (const a of ordered) if ("set" in a) Object.assign(values, render(a.set, ctx));
-        if (markerName) values[markerName] = true;
-        if (Object.keys(values).length) {
-          const { payload } = await preparePayload(ds, values, rule.allow_new_options);
-          const names = Object.keys(payload);
-          undo.push(snapshot(await withFullProperties(page, names), names));
-          await call(() => notion().pages.update({ page_id: page.id, properties: payload } as never));
+      const ctx: TemplateContext = { now, timezone };
+      for (const [i, t] of rule.then.entries()) {
+        let described: string;
+        try {
+          described = describeThen(render(t, ctx));
+        } catch {
+          described = describeThen(t);
         }
-        for (const a of ordered) {
-          if ("append" in a) {
-            const content = render(a.append, ctx);
-            const specs = typeof content === "string" ? markdownToSpecs(content) : content;
-            let ids: string[];
-            try {
-              ids = await appendSpecs(page.id, specs);
-            } catch (e) {
-              if (e instanceof PartialWriteError) undo.push(...insertedBlocks(e.createdIds, page.id));
-              throw e;
-            }
-            undo.push(...insertedBlocks(ids, page.id));
-          } else if ("comment" in a) {
-            const text = render(a.comment, ctx);
-            const c = await call(() => notion().comments.create({ parent: { page_id: page.id }, rich_text: forApi(fromInlineMarkdown(text)) } as never));
-            undo.push({ kind: "comment_delete", comment_id: c.id });
-          } else if ("trash" in a) {
-            await call(() => notion().pages.update({ page_id: page.id, in_trash: true } as never));
-            undo.push({ kind: "page_trash", page_id: page.id, in_trash: false });
-          }
+        const entry: RuleResult["then"][number] = { action: described };
+        result.then.push(entry);
+        if (firing.then_done.includes(i)) {
+          entry.done_earlier = true;
+          continue;
         }
-        result.acted++;
-        if (opts.budget) opts.budget.remaining--;
-      } catch (e) {
-        row.error = (e as Error).message;
+        if (opts.dryRun) continue;
+        try {
+          entry.result = await runThen(t, ctx, rule, rs, undo);
+          firing.then_done.push(i);
+        } catch (e) {
+          entry.error = (e as Error).message;
+          firing.last_error = `${described}: ${entry.error}`;
+        }
+        await persist();
       }
     }
-  }
-
-  // Rule-level actions: once per firing; with a condition, only when rows were acted on (or would be, in a dry run).
-  const rowsHappened = !rule.when || (opts.dryRun ? result.matched > 0 : result.acted > 0);
-  if (rule.then.length && rowsHappened) {
-    const ctx: TemplateContext = { now, timezone };
-    for (const t of rule.then) {
-      let described: string;
-      try {
-        described = describeThen(render(t, ctx));
-      } catch {
-        described = describeThen(t);
-      }
-      const entry: RuleResult["then"][number] = { action: described };
-      result.then.push(entry);
-      if (opts.dryRun) continue;
-      try {
-        entry.result = await runThen(t, ctx, rule, rs, undo);
-      } catch (e) {
-        entry.error = (e as Error).message;
-      }
-    }
-  }
-
-  if (!opts.dryRun) {
-    if (undo.length) {
+  } catch (e) {
+    result.error = (e as Error).message;
+  } finally {
+    if (!opts.dryRun && undo.length) {
       const what = [result.acted ? `acted on ${result.acted} rows` : "", result.then.length ? `ran ${result.then.length} follow-up action(s)` : ""].filter(Boolean).join(" and ");
       result.undo_id = await record("automations", `Rule "${rule.id}" ${what || "ran"}${result.database ? ` in "${result.database}"` : ""}`, undo);
     }
-    // A scheduled rule counts as fired once it ran without a rule-level error, even if some rows failed.
-    if (rule.schedule && occurrence) rs.last_fired = occurrence.toISOString();
+  }
+
+  result.status = ruleStatus(result);
+  if (!opts.dryRun) {
+    const complete = result.status === "succeeded";
+    if (complete) {
+      delete rs.pending;
+      if (rule.schedule && occurrence) rs.last_fired = occurrence.toISOString();
+    } else if (rule.schedule && occurrence && !rs.pending) {
+      // Rows failed or were left over: remember the firing, so the next run retries it instead of moving on.
+      rs.pending = { key: occurrence.toISOString(), rule_rev: rev, run_id: runId, started: now.toISOString(), attempts: 1, then_done: [], last_error: firstError(result) };
+    } else if (rs.pending) {
+      rs.pending.last_error = firstError(result) ?? rs.pending.last_error;
+    }
+    rs.last_run = { run_id: runId, at: now.toISOString(), status: result.status };
+    await persist();
   }
   return result;
 }
 
-function rank(a: Action): number {
-  return "set" in a ? 0 : "append" in a ? 1 : "comment" in a ? 2 : 3;
+function firstError(r: RuleResult): string | undefined {
+  if (r.error) return r.error;
+  const row = r.rows.find((x) => x.error);
+  if (row) return `${row.title}: ${row.error}`;
+  const t = r.then.find((x) => x.error);
+  return t ? `${t.action}: ${t.error}` : undefined;
+}
+
+/** Overall status of one rule's run (dry runs report what they would do as succeeded). */
+export function ruleStatus(r: RuleResult): RunStatus {
+  if (r.skipped) return "skipped";
+  const rowFailures = r.rows.filter((x) => x.error && !x.error.startsWith("skipped")).length;
+  const leftOver = r.rows.filter((x) => x.error?.startsWith("skipped")).length;
+  const thenFailures = r.then.filter((t) => t.error).length;
+  const thenOk = r.then.filter((t) => t.result || t.done_earlier).length;
+  if (r.error) return r.acted || thenOk ? "partial" : "failed";
+  if (!rowFailures && !thenFailures) return leftOver ? "partial" : "succeeded";
+  return r.acted || thenOk ? "partial" : "failed";
+}
+
+interface RowContext {
+  now: Date;
+  timezone: string;
+  runId: string;
+  rev: string;
+  rs: RuleState;
+  result: RuleResult;
+  undo: UndoOp[];
+  opts: RunOptions;
+  persist: () => Promise<void>;
+}
+
+async function runRows(rule: Rule, ds: DataSourceObjectResponse, filter: Record<string, unknown>, c: RowContext): Promise<void> {
+  const { now, timezone, rs, result, opts } = c;
+  const { pages, more } = await queryAll(ds.id, { filter, max: rule.limit });
+  result.matched = pages.length;
+  result.more_waiting = more;
+  // Forget progress on rows that stopped matching (fixed by hand, or deleted), when we saw every matching row.
+  if (!opts.dryRun && rs.rows && !more) {
+    const seen = new Set(pages.map((p) => p.id));
+    rs.rows = Object.fromEntries(Object.entries(rs.rows).filter(([id]) => seen.has(id)));
+  }
+  const markerName = rule.marker ? resolvePropertyName(ds, rule.marker).name : null;
+  const checked = rule.when ? conditionProperties(ds, rule.when) : new Map<string, unknown>();
+
+  for (const page of pages) {
+    const ctx: TemplateContext = { now, timezone, page };
+    const steps = rowSteps(rule, ds, page, ctx, markerName, checked, c);
+    const saved = rs.rows?.[page.id];
+    const done = new Set(saved && saved.rule_rev === c.rev ? saved.done : []);
+    const row: RuleResult["rows"][number] = {
+      id: page.id,
+      title: pageTitle(page),
+      actions: steps.map((s) => (done.has(s.id) ? `${s.describe} ${RESUME_NOTE}` : s.describe)),
+    };
+    if (done.size) row.resumed = [...done];
+    result.rows.push(row);
+    if (opts.dryRun) continue;
+    const limit = opts.budget ? budgetExhausted(opts.budget) : null;
+    if (limit) {
+      row.error = `skipped: run ${limit} reached; it runs next time`;
+      result.more_waiting = true;
+      continue;
+    }
+    const cp: RowCheckpoint = saved && saved.rule_rev === c.rev ? saved : { rule_rev: c.rev, done: [], attempts: 0, run_id: c.runId };
+    cp.attempts++;
+    cp.run_id = c.runId;
+    try {
+      for (const step of steps) {
+        if (done.has(step.id)) continue;
+        await step.run();
+        cp.done.push(step.id);
+        (rs.rows ??= {})[page.id] = cp;
+        await c.persist();
+      }
+      if (rs.rows) rs.rows = Object.fromEntries(Object.entries(rs.rows).filter(([id]) => id !== page.id));
+      result.acted++;
+      if (opts.budget) opts.budget.rows++;
+    } catch (e) {
+      row.error = (e as Error).message;
+      cp.last_error = row.error;
+      (rs.rows ??= {})[page.id] = cp;
+      log("warn", "automation.row_failed", { run_id: c.runId, rule: rule.id, row: page.id, step: steps.find((s) => !cp.done.includes(s.id))?.id, error: row.error });
+    }
+    await c.persist();
+  }
+  if (rs.rows && !Object.keys(rs.rows).length) delete rs.rows;
+}
+
+/** A row's actions as ordered steps (see runRule). Step ids name the action, so a resumed run skips the right ones. */
+function rowSteps(
+  rule: Rule,
+  ds: DataSourceObjectResponse,
+  page: PageObjectResponse,
+  ctx: TemplateContext,
+  markerName: string | null,
+  checked: Map<string, unknown>,
+  c: RowContext
+): RowStep[] {
+  const before: Record<string, unknown> = {};
+  const commit: Record<string, unknown> = {};
+  for (const a of rule.actions) {
+    if (!("set" in a)) continue;
+    for (const [k, v] of Object.entries(render(a.set, ctx))) {
+      (checked.has(safeName(ds, k)) ? commit : before)[k] = v;
+    }
+  }
+  if (markerName) commit[markerName] = true;
+  const writeProps = async (values: Record<string, unknown>) => {
+    const { payload } = await preparePayload(ds, values, rule.allow_new_options);
+    const names = Object.keys(payload);
+    c.undo.push(snapshot(await withFullProperties(page, names), names));
+    await call(() => notion().pages.update({ page_id: page.id, properties: payload } as never));
+  };
+  const describeSet = (v: Record<string, unknown>) => `set ${Object.entries(v).map(([k, x]) => `${k}=${JSON.stringify(x)}`).join(", ")}`;
+
+  const steps: RowStep[] = [];
+  if (Object.keys(before).length) steps.push({ id: "set", describe: describeSet(before), run: () => writeProps(before) });
+  rule.actions.forEach((a, i) => {
+    if ("append" in a) {
+      const content = render(a.append, ctx);
+      steps.push({
+        id: `append:${i}`,
+        describe: describeAction({ append: content }),
+        run: async () => {
+          const specs = typeof content === "string" ? markdownToSpecs(content) : content;
+          let ids: string[];
+          try {
+            ids = await appendSpecs(page.id, specs);
+          } catch (e) {
+            if (e instanceof PartialWriteError) c.undo.push(...insertedBlocks(e.createdIds, page.id));
+            throw e;
+          }
+          c.undo.push(...insertedBlocks(ids, page.id));
+          if (c.opts.budget) c.opts.budget.blocks += ids.length;
+        },
+      });
+    }
+  });
+  rule.actions.forEach((a, i) => {
+    if ("comment" in a) {
+      const text = render(a.comment, ctx);
+      steps.push({
+        id: `comment:${i}`,
+        describe: describeAction({ comment: text }),
+        run: async () => {
+          const cm = await call(() => notion().comments.create({ parent: { page_id: page.id }, rich_text: forApi(fromInlineMarkdown(text)) } as never));
+          c.undo.push({ kind: "comment_delete", comment_id: cm.id });
+        },
+      });
+    }
+  });
+  if (Object.keys(commit).length) {
+    const shown = Object.fromEntries(Object.entries(commit).filter(([k]) => k !== markerName));
+    const describe = [Object.keys(shown).length ? describeSet(shown) : "", markerName ? `check ${markerName}` : ""].filter(Boolean).join("; ");
+    steps.push({ id: "commit", describe, run: () => writeProps(commit) });
+  }
+  if (rule.actions.some((a) => "trash" in a)) {
+    steps.push({
+      id: "trash",
+      describe: "trash",
+      run: async () => {
+        await call(() => notion().pages.update({ page_id: page.id, in_trash: true } as never));
+        c.undo.push({ kind: "page_trash", page_id: page.id, in_trash: false });
+      },
+    });
+  }
+  return steps;
+}
+
+export interface RunReport {
+  run_id: string;
+  status: Exclude<RunStatus, "skipped">;
+  results: RuleResult[];
+  /** Problems that didn't stop the run (such as the run log not being written). */
+  warnings: string[];
 }
 
 /** Run every enabled rule (or one by id). A failing rule is reported and the rest still run. */
-export async function runAll(opts: RunOptions & { ruleId?: string; maxWrites?: number; file?: string }): Promise<RuleResult[]> {
+export async function runAll(opts: RunOptions & { ruleId?: string; limits?: RunLimits; file?: string }): Promise<RunReport> {
+  const now = opts.now ?? new Date();
+  const runId = `run-${now.toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomBytes(3).toString("hex")}`;
   const data = await loadRules(opts.file);
   const rules = opts.ruleId ? data.rules.filter((r) => r.id === opts.ruleId) : data.rules.filter((r) => r.enabled);
   if (opts.ruleId && rules.length === 0) throw new Error(`No rule "${opts.ruleId}". Rules: ${data.rules.map((r) => r.id).join(", ") || "(none)"}.`);
-  const budget = { remaining: opts.maxWrites ?? 200 };
+  const budget = newBudget(opts.limits);
   const state = await loadState();
+  const warnings: string[] = [];
   const results: RuleResult[] = [];
+  log("info", "automation.run_started", { run_id: runId, dry_run: opts.dryRun, rules: rules.map((r) => r.id) });
   for (const rule of rules) {
     try {
-      results.push(await runRule(rule, data.timezone, { ...opts, budget, state }));
+      results.push(
+        await runRule(rule, data.timezone, { ...opts, now, runId, budget, state, persist: () => saveState(state, [rule.id]) })
+      );
     } catch (e) {
-      results.push({ rule: rule.id, database: rule.database ?? "", dry_run: opts.dryRun, matched: 0, more_waiting: false, acted: 0, rows: [], then: [], error: (e as Error).message });
+      results.push({ rule: rule.id, database: rule.database ?? "", dry_run: opts.dryRun, status: "failed", matched: 0, more_waiting: false, acted: 0, rows: [], then: [], error: (e as Error).message });
     }
+    const r = results[results.length - 1];
+    log(r.status === "failed" ? "error" : r.status === "partial" ? "warn" : "info", "automation.rule_finished", {
+      run_id: runId,
+      rule: r.rule,
+      status: r.status,
+      matched: r.matched,
+      acted: r.acted,
+      ...(r.undo_id ? { undo_id: r.undo_id } : {}),
+      ...(firstError(r) ? { error: firstError(r) } : {}),
+    });
   }
-  if (!opts.dryRun) await saveState(state);
-  await appendRunLog(opts, results);
-  return results;
+  if (!opts.dryRun) await saveState(state, rules.map((r) => r.id));
+  const status: RunReport["status"] = results.some((r) => r.status === "failed") ? "failed" : results.some((r) => r.status === "partial") ? "partial" : "succeeded";
+  const report: RunReport = { run_id: runId, status, results, warnings };
+  await appendRunLog(opts, report);
+  log(status === "succeeded" ? "info" : "warn", "automation.run_finished", { run_id: runId, status, warnings });
+  return report;
 }
 
-async function appendRunLog(opts: RunOptions, results: RuleResult[]): Promise<void> {
+async function appendRunLog(opts: RunOptions, report: RunReport): Promise<void> {
   const line = {
     at: (opts.now ?? new Date()).toISOString(),
+    run_id: report.run_id,
+    status: report.status,
     dry_run: opts.dryRun,
     ...(opts.force ? { forced: true } : {}),
-    rules: results.map((r) => ({
+    rules: report.results.map((r) => ({
       rule: r.rule,
+      status: r.status,
       ...(r.skipped ? { skipped: r.skipped } : {}),
+      ...(r.occurrence ? { occurrence: r.occurrence } : {}),
       matched: r.matched,
       acted: r.acted,
       then: r.then.map((t) => (t.error ? `${t.action}: failed` : t.action)),
       failed_rows: r.rows.filter((x) => x.error && !x.error.startsWith("skipped")).length,
       ...(r.undo_id ? { undo_id: r.undo_id } : {}),
-      ...(r.error ? { error: r.error } : {}),
+      ...(firstError(r) ? { error: firstError(r) } : {}),
     })),
   };
   try {
-    await fs.mkdir(homeDir(), { recursive: true });
-    await fs.appendFile(runLogPath(), JSON.stringify(line) + "\n");
-  } catch {
-    // The run log is a convenience; a write failure shouldn't fail the run.
+    await fs.appendFile(await runLogPath(), JSON.stringify(line) + "\n");
+  } catch (e) {
+    // The run's work is done; losing its log line is reported, not fatal.
+    report.warnings.push(`The run log couldn't be written: ${(e as Error).message}`);
+    log("warn", "automation.run_log_failed", { run_id: report.run_id, error: (e as Error).message });
   }
+}
+
+/**
+ * Mark a rule's unfinished firing as handled without running the rest of it: the occurrence counts as fired, and
+ * rows' saved progress is dropped (they start over if they still match). For when a failure can't be fixed or the
+ * rest of the work was done by hand.
+ */
+export async function waive(ruleId: string): Promise<{ waived: string | null; rows: number }> {
+  const file = await statePath();
+  return updateJson<StateFile, { waived: string | null; rows: number }>(file, parseState, () => ({ rules: {} }), (cur) => {
+    const rs = cur.rules[ruleId];
+    if (!rs || (!rs.pending && !rs.rows)) return { result: { waived: null, rows: 0 } };
+    const key = rs.pending?.key ?? null;
+    if (key && !key.startsWith("rows:")) rs.last_fired = key;
+    const rows = Object.keys(rs.rows ?? {}).length;
+    delete rs.pending;
+    delete rs.rows;
+    log("info", "automation.waived", { rule: ruleId, firing: key, rows });
+    return { data: cur, result: { waived: key, rows } };
+  });
 }
 
 /**
@@ -757,5 +1164,5 @@ export function summarize(results: RuleResult[]): string {
 
 /** True when any rule or row failed (for the CLI exit code and the failure notification). */
 export function anyFailed(results: RuleResult[]): boolean {
-  return results.some((r) => r.error || r.rows.some((row) => row.error && !row.error.startsWith("skipped")) || r.then.some((t) => t.error));
+  return results.some((r) => r.status === "failed" || r.status === "partial");
 }

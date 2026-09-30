@@ -7,6 +7,7 @@ import path from "node:path";
 import type { Client } from "@notionhq/client";
 
 process.env.NOTION_PLUS_HOME = mkdtempSync(path.join(os.tmpdir(), "notion-plus-journal-test-"));
+process.env.NOTION_PLUS_WORKSPACE = "test"; // never look up the integration over the network
 const { insertedBlocks, record, undo } = await import("../src/services/journal.js");
 const { setClientForTests } = await import("../src/services/notion.js");
 

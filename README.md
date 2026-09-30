@@ -141,13 +141,13 @@ Inline: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `<u>underline</u>`, 
 
 These are the same tags Notion's markdown export uses, so `notion_get_page` with `format: "markdown"` returns markdown you can edit and insert back; the live test suite checks that a full page survives the round trip line for line. Local files can be uploaded from the working directory and the temp folder; set `NOTION_PLUS_UPLOAD_DIRS` (separated by `:`, or `;` on Windows) to allow other folders.
 
-The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
+The undo journal is stored in `~/.notion-plus/workspaces/<integration id>/journal.json` (last 500 changes; see [Local state](#local-state)). Each write is journaled before it reaches Notion: if the server stops mid-write, `notion_history` shows the entry as `interrupted` with the tool's input, so you can check those objects by hand. Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
 
 ### Visuals: which to use
 
 1. **Native Notion content** for structure and diagrams: callouts, columns, tables, equations, and Mermaid diagrams (```` ```mermaid ```` code blocks: flowcharts, sequence, Gantt, pie, timeline). Mermaid is checked before writing so a typo doesn't leave an error box.
 2. **Chart views** (`notion_views` with `type: "chart"`) when the data lives in a Notion database: they stay live, filter with the database, and people can click through. They can sit on any page as a linked view.
-3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `~/.notion-plus/charts.json`, and `refresh_block_id` redraws a chart from current data in the same block.
+3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `charts.json` in the [local state](#local-state) folder, and `refresh_block_id` redraws a chart from current data in the same block.
 4. **Embeds** (`embed` blocks) for interactive charts hosted elsewhere, when neither of the above fits.
 
 `notion_build_report` combines these: it uses a live chart view where Notion supports the chart type and renders an image otherwise.
@@ -203,7 +203,7 @@ Relation values in writes can be page ids, links, or the related row's exact tit
 
 ## Automations
 
-Rules in `automations/rules.json` run on a schedule in GitHub Actions (or locally with `npm run automations`). A rule picks rows with a condition, runs at set times, or both, and acts on what it finds. Manage rules from Claude with `notion_automation` ("add an automation that…"), which checks each rule against the live database and previews it before saving.
+Rules run on a schedule in GitHub Actions (or locally with `npm run automations`). Rules you manage from Claude are saved in `rules.json` in the [local state](#local-state) folder, so they survive reinstalling or upgrading the server; the GitHub workflow runs the committed `automations/rules.json` (it sets `NOTION_PLUS_RULES` to it). Upgrading from 0.9 or earlier, rules already in `automations/rules.json` of your checkout are copied to the new location the first time. A rule picks rows with a condition, runs at set times, or both, and acts on what it finds. Manage rules from Claude with `notion_automation` ("add an automation that…"), which checks each rule against the live database and previews it before saving.
 
 ```json
 {
@@ -248,11 +248,13 @@ Strings can use `{{today}}` (in the file's `timezone`), `{{now}}`, and in row ac
 
 **Each rule acts once per row.** A rule must stop matching a row after acting on it, or it would act again on every run. The runner refuses a rule unless it writes a value its condition no longer matches (for example `Status: {"not_in": ["Done", "At Risk"]}` then setting `"At Risk"`), trashes the row, or names a `marker`: a checkbox property the runner requires to be unchecked and then checks. Scheduled rules also remember which scheduled time they last fired for, so a time fires once even if runs overlap or repeat.
 
+**Order, retries, and partial failure.** Each row's actions run as steps, and progress is saved after every step: first `set` values that keep the row matching, then `append` and `comment`, then the writes that take the row out of the condition (the `marker`, or `set` values for properties the condition checks), then `trash`. A row is only marked handled once everything before it landed. If a step fails, the row keeps matching, and the next run picks it up again from the step that failed, skipping the ones that succeeded. A scheduled occurrence only counts as fired when every row and every `then` action of it succeeded; otherwise the next run retries it (completed `then` actions aren't repeated), until it succeeds, a newer occurrence arrives, or you `waive` it. An edited rule starts unfinished rows over. Each rule's run reports `succeeded`, `partial` (some steps failed or were left for the next run), `failed`, or `skipped` (not due).
+
 **Other options**: `enabled` (default true), `limit` (rows per run, default 50; the rest wait for the next run), `allow_new_options`, `data_source_name`, `name`.
 
 ### Managing rules from Claude
 
-`notion_automation` handles every step: `list`, `get`, `add`, `update` (merge fields), `validate` (check a rule and preview what it would do), `dry_run` (never writes; `force: true` ignores schedules), `enable`, `disable`, `delete`, `run` (writes; one undo id per rule), and `history` (recent local runs). It edits the local `automations/rules.json`; commit and push it for the scheduled workflow to pick it up.
+`notion_automation` handles every step: `list`, `get`, `add`, `update` (merge fields), `validate` (check a rule and preview what it would do), `dry_run` (never writes; `force: true` ignores schedules), `enable`, `disable`, `delete`, `run` (writes; one undo id per rule; returned as an error unless every rule succeeded, with the details and undo ids kept), `history` (local runs, newest first, paged with `limit` and `cursor`), `waive` (give up on a rule's unfinished firing: the occurrence counts as fired and unfinished rows start over), `export` and `import` (the whole rules file as JSON; `import_mode` `merge` or `replace`), and `deploy` (the rules file with chart recipes embedded, plus the steps to run it in GitHub Actions). `list` and `get` return the file's `revision`; passing it back as `expected_revision` refuses the edit if the file changed in the meantime.
 
 ### Running locally
 
@@ -263,11 +265,11 @@ npm run automations -- --rule at-risk --force
 npm run automations                         # apply
 ```
 
-One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it, including deleting the comments it added and trashing pages it created. Runs are logged to `~/.notion-plus/automation-runs.jsonl`, and schedule state is kept in `~/.notion-plus/automation-state.json`.
+One run stops starting new rows once it reaches any of its limits: 200 rows (`--max-rows`, `AUTOMATIONS_MAX_ROWS`; the old `--max-writes` still works), 3000 Notion requests (`--max-requests`), 5000 appended blocks (`--max-blocks`), or 20 minutes (`--max-minutes`). Rows left over run next time, and the run reports `partial`. A failing rule is reported and the others still run. The command exits non-zero unless every rule succeeded, and logs one JSON line per event on stderr, each with the run's `run_id` (`NOTION_PLUS_LOG=text` for plain lines, `off` to silence). Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it, including deleting the comments it added and trashing pages it created. Runs are logged to `automation-runs.jsonl`, and schedule state is kept in `automation-state.json`, both in the [local state](#local-state) folder.
 
 ### GitHub Actions
 
-`.github/workflows/automations.yml` runs every hour (at minute 17) from the committed `automations/rules.json`. It never lets two runs overlap, keeps schedule state, the undo journal, and the run log in the Actions cache between runs, uploads them as an artifact (`notion-plus-journal-<run id>`, kept 90 days), and opens an issue labeled `notion-automations` when a run fails (or comments on the open one). The manual **Run workflow** button takes `dry_run` (on by default), `rule`, and `force`.
+`.github/workflows/automations.yml` runs every hour (at minute 17) from the committed `automations/rules.json`. It never lets two runs overlap. Schedule state (which occurrences fired, and unfinished rows and occurrences to resume) is committed after every run to the `notion-automations-state` branch, which only holds `automation-state.json` (no page content). Once that branch exists, a run whose state can't be restored stops instead of re-firing old occurrences. The undo journal and run log carry over in the Actions cache (best effort: an evicted cache only shortens undo history) and are uploaded as an artifact (`notion-plus-journal-<run id>`, kept 90 days). When a run fails or is partial, it opens an issue labeled `notion-automations` (creating the label if needed) or comments on the open one; if that isn't possible, the job summary says so. The manual **Run workflow** button takes `dry_run` (on by default), `rule`, and `force`.
 
 **One-time setup**
 
@@ -277,15 +279,15 @@ One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATION
 
 **Adding a rule**
 
-1. In Claude, ask for it in plain words, for example: "Every weekday at 9am, mark rows past their due date as At Risk and add a comment." Claude uses `notion_automation`, which checks the rule against the live database, shows the rows it would act on, and saves it to your local `automations/rules.json`.
-2. Commit and push `automations/rules.json`.
+1. In Claude, ask for it in plain words, for example: "Every weekday at 9am, mark rows past their due date as At Risk and add a comment." Claude uses `notion_automation`, which checks the rule against the live database, shows the rows it would act on, and saves it on your machine.
+2. Ask Claude to deploy the rules (`notion_automation` `deploy`), save the returned file as `automations/rules.json` in your repository, and commit and push it. (If you work in a checkout with `NOTION_PLUS_RULES` pointing at `automations/rules.json`, edits land there directly.)
 3. Run the workflow once by hand with "dry run" checked (and "force" to see a scheduled rule now), and read the summary. After that, the hourly runs apply it.
 
-To pause a rule, disable it (or set `"enabled": false`) and push. To stop everything, disable the workflow under **Actions → Notion automations → ••• → Disable workflow**.
+To pause a rule, disable it (or set `"enabled": false`) and push. To give up on an occurrence that keeps failing, `waive` it (locally, on a state file restored from the `notion-automations-state` branch) or fix the cause; it's retried every run until then. To stop everything, disable the workflow under **Actions → Notion automations → ••• → Disable workflow**.
 
 **Undoing a scheduled run**
 
-Download the run's `notion-plus-journal-<run id>` artifact, unzip it into a folder, point `NOTION_PLUS_HOME` at that folder (in your Claude config, or `NOTION_TOKEN=… NOTION_PLUS_HOME=… npm run inspect`), and call `notion_undo` with the undo id from the run summary.
+Download the run's `notion-plus-journal-<run id>` artifact, unzip it into a folder (it keeps the `workspaces/<integration id>/` layout), point `NOTION_PLUS_HOME` at that folder (in your Claude config, or `NOTION_TOKEN=… NOTION_PLUS_HOME=… npm run inspect`), and call `notion_undo` with the undo id from the run summary.
 
 GitHub may start scheduled runs a few minutes late, and turns off schedules in repos with no activity for 60 days.
 
@@ -293,6 +295,12 @@ GitHub may start scheduled runs a few minutes late, and turns off schedules in r
 
 - **Notion's built-in database automations** (the ⚡ button in a database) can't be created, read, or changed through the API. Rules here are the programmable alternative; they poll rather than react instantly.
 - **Webhooks** can push changes the moment they happen, but Notion needs a public HTTPS URL to deliver them, and a local server doesn't have one. A future option: a small hosted endpoint (or a tunnel such as Cloudflare Tunnel) that receives the webhook and triggers the workflow with `workflow_dispatch`, so rules run within seconds instead of within the hour.
+
+## Local state
+
+Everything the server remembers lives under `~/.notion-plus` (`NOTION_PLUS_HOME` moves it), in a folder per integration: `workspaces/<integration id>/`, with `journal.json` (undo history), `charts.json` (chart recipes), `automation-state.json` (which scheduled occurrences fired), and `automation-runs.jsonl` (run log). Two integrations sharing a machine never mix their history. `NOTION_PLUS_WORKSPACE` sets the folder name instead of looking up the integration; `NOTION_PLUS_STATE` moves just the automation state file. The first time a folder is created, state from older versions (kept directly in `~/.notion-plus`) is copied into it.
+
+These files are safe to share between several servers at once (Claude Desktop, Cowork, Claude Code, the scheduled runner): each change is made under a lock, written to a temporary file, flushed, and swapped in, with the previous version kept as `<file>.bak`. If a file can't be read (cut off by a crash or a full disk, edited by hand into invalid JSON, or not readable), the server stops with an error naming it instead of treating it as empty, since that would lose undo history or repeat scheduled automations. Fix the file, restore the `.bak`, or move it away to start fresh. A leftover `<file>.lock` from a process that died is cleared automatically.
 
 ## Development
 

@@ -91,10 +91,18 @@ export function setBeforeWrite(fn: (() => Promise<void>) | null): void {
   beforeWrite = fn;
 }
 
+let requests = 0;
+
+/** Requests started by this process (retries included), for run budgets. */
+export function requestCount(): number {
+  return requests;
+}
+
 export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Promise<T> {
   if (!opts.read && beforeWrite) await beforeWrite();
   for (let attempt = 0; ; attempt++) {
     await slot();
+    requests++;
     try {
       return await fn();
     } catch (e) {

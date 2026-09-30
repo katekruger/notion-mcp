@@ -523,7 +523,7 @@ async function main(): Promise<void> {
     });
     let undoIds: string[] = [];
     await step("automations run: set, append, comment, marker, trash", async () => {
-      const results = await runAll({ dryRun: false });
+      const { results } = await runAll({ dryRun: false });
       for (const res of results) expect(!res.error && res.acted === 1, `${res.rule}: ${res.error ?? `acted ${res.acted}`} ${JSON.stringify(res.rows)}`);
       undoIds = results.map((r) => r.undo_id).filter((x): x is string => Boolean(x));
       expect((await prop(rowB, "Due")) === today, `Due is ${JSON.stringify(await prop(rowB, "Due"))}`);
@@ -535,7 +535,7 @@ async function main(): Promise<void> {
       expect(t.in_trash === true, "row not trashed");
     });
     await step("automations run again: nothing matches (rules are one-time per row)", async () => {
-      const results = await runAll({ dryRun: false });
+      const { results } = await runAll({ dryRun: false });
       expect(results.every((r) => r.acted === 0 && !r.error), JSON.stringify(results.map((r) => [r.rule, r.acted, r.error])));
     });
     await step("automations undo: every rule's run reverts", async () => {

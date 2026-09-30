@@ -1,6 +1,6 @@
 {
   "name": "notion-plus-mcp-server",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Local Notion MCP server with surgical block edits, schema-validated writes, bulk updates, and undo.",
   "type": "module",
   "main": "dist/index.js",

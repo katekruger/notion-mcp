@@ -19,7 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: read
+  contents: write # to save automation state on the notion-automations-state branch
   issues: write # to open an issue when a run fails
 
 # Never let two runs overlap: a second run waits for the first instead of acting on the same rows.
@@ -29,6 +29,8 @@ concurrency:
 
 env:
   NOTION_PLUS_HOME: ${{ github.workspace }}/.notion-plus
+  NOTION_PLUS_RULES: ${{ github.workspace }}/automations/rules.json
+  STATE_BRANCH: notion-automations-state
 
 jobs:
   run:
@@ -43,13 +45,30 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      # Run state (which scheduled occurrences already fired), the undo journal, and the run log carry over between runs.
-      - name: Restore automation state
+      # The undo journal and run log carry over through the Actions cache. That's best effort: caches can be evicted,
+      # which only shortens undo history.
+      - name: Restore journal (best effort)
         uses: actions/cache/restore@v4
         with:
           path: .notion-plus
           key: notion-plus-state-${{ github.run_id }}
           restore-keys: notion-plus-state-
+
+      # Which scheduled occurrences fired, and unfinished work to resume, must not be lost, so it lives on its own
+      # branch. Once that branch exists, a missing state file stops the run instead of re-firing old occurrences.
+      - name: Restore automation state
+        id: state
+        run: |
+          if git ls-remote --exit-code --heads origin "$STATE_BRANCH" >/dev/null; then
+            git fetch --depth=1 origin "$STATE_BRANCH"
+            mkdir -p .notion-plus
+            git archive FETCH_HEAD | tar -x -C .notion-plus
+            echo "require=true" >> "$GITHUB_OUTPUT"
+            echo "Restored state from $STATE_BRANCH ($(git rev-parse --short FETCH_HEAD))."
+          else
+            echo "require=false" >> "$GITHUB_OUTPUT"
+            echo "No $STATE_BRANCH branch yet: starting with fresh state (first run)."
+          fi
 
       - name: Run rules
         id: run
@@ -57,10 +76,38 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           AUTOMATIONS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           AUTOMATIONS_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force || 'false' }}
+          AUTOMATIONS_REQUIRE_STATE: ${{ steps.state.outputs.require }}
           RULE: ${{ inputs.rule }}
         run: npm run automations
 
+      # Saved even when the run failed: unfinished rows and occurrences are recorded there, so the next run resumes them.
       - name: Save automation state
+        if: always() && steps.state.outcome == 'success'
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          if git ls-remote --exit-code --heads origin "$STATE_BRANCH" >/dev/null; then
+            git fetch --depth=1 origin "$STATE_BRANCH"
+            git worktree add --detach "$dir" FETCH_HEAD
+          else
+            git worktree add --detach "$dir"
+            git -C "$dir" checkout --orphan state-init
+            git -C "$dir" rm -rqf .
+          fi
+          if [ -d .notion-plus/workspaces ]; then
+            (cd .notion-plus && find workspaces -name automation-state.json -exec cp --parents {} "$dir" \;)
+          fi
+          cd "$dir"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "State unchanged."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "Automation state after run ${{ github.run_id }}"
+          git push origin "HEAD:refs/heads/$STATE_BRANCH"
+
+      - name: Save journal (best effort)
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -84,13 +131,27 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const label = "notion-automations";
             const title = "Notion automations failed";
             const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const body = `A run failed at ${new Date().toISOString()}: ${run}\n\nThe job summary lists each rule's result. Undo ids are in the run's journal artifact.`;
-            const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: "open", labels: "notion-automations" });
-            const existing = open.find((i) => i.title === title);
-            if (existing) {
-              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
-            } else {
-              await github.rest.issues.create({ ...context.repo, title, body, labels: ["notion-automations"] });
+            const body = `A run failed at ${new Date().toISOString()}: ${run}\n\nThe job summary lists each rule's status. Unfinished rows and occurrences are retried on the next run; undo ids are in the run's journal artifact.`;
+            try {
+              // Make sure the label exists; creating an issue with a missing label fails.
+              try {
+                await github.rest.issues.getLabel({ ...context.repo, name: label });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                await github.rest.issues.createLabel({ ...context.repo, name: label, color: "d73a4a", description: "Failed Notion automation runs" });
+              }
+              const { data: open } = await github.rest.issues.listForRepo({ ...context.repo, state: "open", labels: label });
+              const existing = open.find((i) => i.title === title);
+              if (existing) {
+                await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+              } else {
+                await github.rest.issues.create({ ...context.repo, title, body, labels: [label] });
+              }
+            } catch (e) {
+              // Reporting must not hide the original failure; say so in the job summary instead.
+              core.warning(`Couldn't open or update the failure issue: ${e.message}`);
+              await core.summary.addHeading("Notion automations failed").addRaw(`${body}\n\n(Opening an issue failed: ${e.message})`).write();
             }

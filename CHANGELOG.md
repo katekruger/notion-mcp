@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.10.0
+
+Automation runs that recover (audit batch 3: P1-01, P1-02, P1-05, P1-06, P1-08, P2-11, P2-12, P2-15).
+
+### Changed
+- Row actions run as ordered steps with progress saved after each. The order is `set` values that keep the row matching, then `append` and `comment`, then the marker and any `set` values the condition checks, then `trash`. A row is marked handled only after everything before it succeeded.
+- A row whose step failed is resumed on the next run from that step. Steps that already succeeded aren't repeated.
+- A scheduled occurrence counts as fired only when all its rows and `then` actions succeeded. Otherwise the next run retries it without repeating completed `then` actions. Before, a failed occurrence was marked fired and skipped for good.
+- Rules managed from Claude live in `rules.json` in the home folder, so reinstalling or upgrading keeps them. Rules in a checkout's `automations/rules.json` are copied there once. The GitHub workflow keeps running the committed file via `NOTION_PLUS_RULES`.
+- Run limits cover rows, Notion requests, appended blocks, and wall time (`--max-rows`, `--max-requests`, `--max-blocks`, `--max-minutes`). Rows past a limit wait for the next run. `--max-writes` still works as the old name for `--max-rows`.
+- The GitHub workflow saves schedule state to the `notion-automations-state` branch after every run instead of relying on the Actions cache. Once that branch exists, a missing state file stops the run (`--require-state`) instead of re-firing old occurrences.
+- The CI workflow ignores that branch.
+
+### Fixed
+- `notion_automation` `run` is an error unless every rule succeeded, so a failed automation no longer looks successful. Each rule reports `succeeded`, `partial`, `failed`, or `skipped`, with the run's `run_id`, and undo ids are kept either way. The CLI exits non-zero for partial runs too.
+- A failure to write the run log is reported as a warning instead of being dropped.
+- The workflow's failure report creates the `notion-automations` label if it's missing. If it can't open an issue, it writes to the job summary.
+- An unexpected error mid-rule still records undo for the writes that already happened.
+- A rule's first scheduled occurrence is still retried more than 70 minutes after it failed, instead of being dropped because the rule had no fire history.
+
+### Known limitation
+- If an `append` step fails part-way (some blocks landed), its retry appends the whole content again. Idempotency markers are planned for the workflow engine.
+
+### Added
+- New `notion_automation` actions:
+  - `waive`: give up on a rule's unfinished firing.
+  - `export` / `import`: the whole rules file as JSON.
+  - `deploy`: the rules file with chart recipes embedded, plus the GitHub Actions setup steps.
+- `history` pages with `limit` and `cursor` and skips malformed lines.
+- Structured JSON logs on stderr, each with the `run_id` (`NOTION_PLUS_LOG=text|off`).
+
 ## 0.9.0
 
 Durable local state (audit batch 2: P1-03, P1-04, P2-10, P3-08).

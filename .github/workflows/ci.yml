@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches-ignore: [notion-automations-state] # automation state only, no code
   pull_request:
 
 permissions:

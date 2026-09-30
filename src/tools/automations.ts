@@ -5,14 +5,14 @@ import {
   anyFailed,
   checkRule,
   embedChartRecipes,
-  loadRules,
+  editRules,
+  loadRulesWithRevision,
   loadState,
   ruleSchema,
   rulesPath,
   runAll,
   runLogPath,
   runRule,
-  saveRules,
   summarize,
   type Rule,
 } from "../services/automations.js";
@@ -34,22 +34,42 @@ export function registerAutomationTools(server: McpServer): void {
         "Strings accept {{today}}, {{now}}, {{page.<Property>}}. A rule must stop matching a row after acting on it (write a value " +
         "outside its condition, trash, or use `marker`). Actions: list, get, add, update (merge fields), validate (checks against " +
         "the live schema and previews), dry_run (never writes), enable, disable, delete, run (writes; one undo_id per rule), " +
-        "history (recent runs). Editing only changes the local rules file; commit it for the GitHub schedule.",
+        "history (recent runs). Editing only changes the local rules file; commit it for the GitHub schedule. list and get return the " +
+        "file's `revision`; pass it as expected_revision on edits so a change made elsewhere in the meantime isn't overwritten.",
       inputSchema: {
         action: z.enum(["list", "get", "add", "update", "validate", "dry_run", "enable", "disable", "delete", "run", "history"]),
         rule_id: z.string().optional(),
         rule: z.record(z.string(), z.unknown()).optional().describe("add: the whole rule; update: only the fields to change; validate: a rule to check without saving"),
         force: z.boolean().default(false).describe("dry_run/run: ignore schedules and run now"),
         timezone: z.string().optional().describe("Set the rules file's time zone (IANA, e.g. America/New_York)."),
+        expected_revision: z
+          .string()
+          .optional()
+          .describe("Edits: the revision from list/get. The edit is refused if the rules file changed since."),
       },
       annotations: { ...WRITE, destructiveHint: true, idempotentHint: false },
     },
-    safe(async ({ action, rule_id, rule, force, timezone }) => {
-      const data = await loadRules();
+    safe(async ({ action, rule_id, rule, force, timezone, expected_revision }) => {
+      const loaded = await loadRulesWithRevision();
+      const data = loaded.data;
       if (timezone) {
-        data.timezone = timezone;
         new Intl.DateTimeFormat("en-US", { timeZone: timezone });
+        data.timezone = timezone;
       }
+      /** Apply a change to the current file (re-read under its lock), keeping any time zone change. */
+      const save = (change: (d: typeof data) => void) =>
+        editRules(
+          (d) => {
+            if (timezone) d.timezone = timezone;
+            change(d);
+          },
+          { expectedRevision: expected_revision }
+        );
+      const indexIn = (d: typeof data, id: string): number => {
+        const i = d.rules.findIndex((x) => x.id === id);
+        if (i < 0) throw new Error(`Rule "${id}" was removed by another change; read the rules again.`);
+        return i;
+      };
       const find = (id: string | undefined): { index: number; rule: Rule } => {
         if (!id) throw new Error(`action=${action} needs rule_id.`);
         const index = data.rules.findIndex((r) => r.id === id);
@@ -69,6 +89,7 @@ export function registerAutomationTools(server: McpServer): void {
           const state = await loadState();
           return ok({
             file: rulesPath(),
+            revision: loaded.revision,
             timezone: data.timezone,
             rules: data.rules.map((r) => ({
               id: r.id,
@@ -84,7 +105,7 @@ export function registerAutomationTools(server: McpServer): void {
           });
         }
         case "get":
-          return ok({ ...find(rule_id).rule, ...schedule(find(rule_id).rule) });
+          return ok({ ...find(rule_id).rule, ...schedule(find(rule_id).rule), revision: loaded.revision });
         case "validate": {
           const r = rule ? parse(rule) : find(rule_id).rule;
           await checkRule(r, data.timezone);
@@ -108,11 +129,15 @@ export function registerAutomationTools(server: McpServer): void {
           r = withRecipes.rule;
           await checkRule(r, data.timezone);
           const preview = await runRule(r, data.timezone, { dryRun: true, force: true });
-          if (index >= 0) data.rules[index] = r;
-          else data.rules.push(r);
-          await saveRules(data);
+          const saved = r;
+          const revision = await save((d) => {
+            if (index >= 0) d.rules[indexIn(d, saved.id)] = saved;
+            else if (d.rules.some((x) => x.id === saved.id)) throw new Error(`A rule "${saved.id}" was added by another change; use action=update.`);
+            else d.rules.push(saved);
+          });
           return ok({
             saved: r.id,
+            revision,
             file: rulesPath(),
             ...schedule(r),
             ...(withRecipes.embedded.length ? { note: `Saved the recipe of chart(s) ${withRecipes.embedded.join(", ")} in the rule, so the scheduled workflow can redraw them.` } : {}),
@@ -122,19 +147,20 @@ export function registerAutomationTools(server: McpServer): void {
         }
         case "enable":
         case "disable": {
-          const { index, rule: r } = find(rule_id);
-          data.rules[index] = { ...r, enabled: action === "enable" };
-          await saveRules(data);
-          return ok({ rule: r.id, enabled: action === "enable", next_step: COMMIT_HINT });
+          const { rule: r } = find(rule_id);
+          const revision = await save((d) => {
+            const i = indexIn(d, r.id);
+            d.rules[i] = { ...d.rules[i], enabled: action === "enable" };
+          });
+          return ok({ rule: r.id, enabled: action === "enable", revision, next_step: COMMIT_HINT });
         }
         case "delete": {
-          const { index, rule: r } = find(rule_id);
-          data.rules.splice(index, 1);
-          await saveRules(data);
-          return ok({ deleted: r.id, removed_rule: r, note: "To restore it, call action=add with removed_rule.", next_step: COMMIT_HINT });
+          const { rule: r } = find(rule_id);
+          const revision = await save((d) => void d.rules.splice(indexIn(d, r.id), 1));
+          return ok({ deleted: r.id, removed_rule: r, revision, note: "To restore it, call action=add with removed_rule.", next_step: COMMIT_HINT });
         }
         case "dry_run": {
-          if (timezone) await saveRules(data);
+          if (timezone) await save(() => undefined);
           const results = await runAll({ dryRun: true, force, ...(rule_id ? { ruleId: rule_id } : {}) });
           return ok(summarize(results));
         }
@@ -146,7 +172,7 @@ export function registerAutomationTools(server: McpServer): void {
         case "history": {
           let lines: string[] = [];
           try {
-            lines = (await fs.readFile(runLogPath(), "utf8")).trim().split("\n").filter(Boolean);
+            lines = (await fs.readFile(await runLogPath(), "utf8")).trim().split("\n").filter(Boolean);
           } catch {
             return ok("No runs recorded on this machine yet. Scheduled runs are recorded in GitHub Actions (job summary and artifacts).");
           }

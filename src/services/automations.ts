@@ -14,7 +14,8 @@ import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyNa
 import { insertedBlocks, record, type UndoOp } from "./journal.js";
 import { preparePayload, snapshot } from "./writes.js";
 import { queryAll } from "./query.js";
-import { homeDir } from "./files.js";
+import { readJson, updateJson, withLock, writeJson, type Loaded } from "./store.js";
+import { stateDir } from "./workspace.js";
 import { isDue, nextOccurrence, toCron } from "./schedule.js";
 import { buildReport, chartSourceSchema, chartSpecSchema, refreshChart, ReportError, reportArgsShape, rowSchema } from "./visualops.js";
 import { getChart } from "./chartstore.js";
@@ -152,36 +153,56 @@ export function rulesPath(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "automations", "rules.json");
 }
 
-export async function loadRules(file = rulesPath()): Promise<RulesFile> {
-  let raw: string;
-  try {
-    raw = await fs.readFile(file, "utf8");
-  } catch {
-    return { version: 1, timezone: "UTC", rules: [] };
-  }
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`${file} isn't valid JSON: ${(e as Error).message}`);
-  }
-  const parsed = rulesFileSchema.safeParse(json);
-  if (!parsed.success) {
-    throw new Error(`${file} is invalid:\n- ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("\n- ")}`);
-  }
-  const ids = new Set<string>();
-  for (const r of parsed.data.rules) {
-    if (ids.has(r.id)) throw new Error(`${file}: duplicate rule id "${r.id}".`);
-    ids.add(r.id);
-  }
-  return parsed.data;
+function parseRules(file: string) {
+  return (json: unknown): RulesFile => {
+    const parsed = rulesFileSchema.safeParse(json);
+    if (!parsed.success) {
+      throw new Error(`${file} is invalid:\n- ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("\n- ")}`);
+    }
+    const ids = new Set<string>();
+    for (const r of parsed.data.rules) {
+      if (ids.has(r.id)) throw new Error(`${file}: duplicate rule id "${r.id}".`);
+      ids.add(r.id);
+    }
+    return parsed.data;
+  };
 }
 
-export async function saveRules(data: RulesFile, file = rulesPath()): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = file + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(data, null, 2) + "\n");
-  await fs.rename(tmp, file);
+const emptyRules = (): RulesFile => ({ version: 1, timezone: "UTC", rules: [] });
+
+/** The rules file with its revision (a content hash), for edits that must not overwrite someone else's change. */
+export async function loadRulesWithRevision(file = rulesPath()): Promise<Loaded<RulesFile>> {
+  return readJson(file, parseRules(file), emptyRules);
+}
+
+export async function loadRules(file = rulesPath()): Promise<RulesFile> {
+  return (await loadRulesWithRevision(file)).data;
+}
+
+/** Replace the whole rules file (under its lock). Prefer editRules, which applies a change to the current file. */
+export async function saveRules(data: RulesFile, file = rulesPath()): Promise<string> {
+  return withLock(file, () => writeJson(file, data, { trailingNewline: true }));
+}
+
+export class RulesConflictError extends Error {
+  constructor(file: string, expected: string, actual: string | null) {
+    super(`${file} changed since it was read (expected revision ${expected}, now ${actual ?? "missing"}). Read it again (action=list) and redo the change.`);
+    this.name = "RulesConflictError";
+  }
+}
+
+/**
+ * Apply a change to the current rules file under its lock and return the new revision. With `expectedRevision`,
+ * the change is refused if the file changed since that revision was read.
+ */
+export async function editRules(change: (data: RulesFile) => void, opts: { expectedRevision?: string; file?: string } = {}): Promise<string> {
+  const file = opts.file ?? rulesPath();
+  return withLock(file, async () => {
+    const cur = await loadRulesWithRevision(file);
+    if (opts.expectedRevision && opts.expectedRevision !== cur.revision) throw new RulesConflictError(file, opts.expectedRevision, cur.revision);
+    change(cur.data);
+    return writeJson(file, cur.data, { trailingNewline: true });
+  });
 }
 
 // ---------- run state ----------
@@ -196,28 +217,38 @@ interface StateFile {
   rules: Record<string, RuleState>;
 }
 
-export function statePath(): string {
-  return process.env.NOTION_PLUS_STATE ? path.resolve(process.env.NOTION_PLUS_STATE) : path.join(homeDir(), "automation-state.json");
-}
-
-export async function loadState(): Promise<StateFile> {
-  try {
-    const s = JSON.parse(await fs.readFile(statePath(), "utf8")) as StateFile;
-    return { rules: s.rules ?? {} };
-  } catch {
-    return { rules: {} };
+function parseState(raw: unknown): StateFile {
+  const o = raw as { rules?: unknown } | null;
+  if (!o || typeof o !== "object" || (o.rules !== undefined && (typeof o.rules !== "object" || o.rules === null || Array.isArray(o.rules)))) {
+    throw new Error('expected {"rules": {...}}');
   }
+  return { rules: (o.rules as Record<string, RuleState>) ?? {} };
 }
 
-async function saveState(state: StateFile): Promise<void> {
-  await fs.mkdir(path.dirname(statePath()), { recursive: true });
-  const tmp = statePath() + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-  await fs.rename(tmp, statePath());
+export async function statePath(): Promise<string> {
+  return process.env.NOTION_PLUS_STATE ? path.resolve(process.env.NOTION_PLUS_STATE) : path.join(await stateDir(), "automation-state.json");
 }
 
-export function runLogPath(): string {
-  return path.join(homeDir(), "automation-runs.jsonl");
+/** Automation state. A corrupt or unreadable file stops here instead of reading as "nothing has fired yet". */
+export async function loadState(): Promise<StateFile> {
+  return (await readJson(await statePath(), parseState, () => ({ rules: {} }))).data;
+}
+
+/**
+ * Save the rules this run touched, merged into the current file under its lock, so a run never erases what
+ * another process recorded for other rules in the meantime.
+ */
+async function saveState(state: StateFile, touched: Iterable<string>): Promise<void> {
+  const ids = [...touched];
+  if (!ids.length) return;
+  await updateJson<StateFile, null>(await statePath(), parseState, () => ({ rules: {} }), (cur) => {
+    for (const id of ids) if (state.rules[id]) cur.rules[id] = state.rules[id];
+    return { data: cur, result: null };
+  });
+}
+
+export async function runLogPath(): Promise<string> {
+  return path.join(await stateDir(), "automation-runs.jsonl");
 }
 
 // ---------- templates ----------
@@ -678,7 +709,7 @@ export async function runAll(opts: RunOptions & { ruleId?: string; maxWrites?: n
       results.push({ rule: rule.id, database: rule.database ?? "", dry_run: opts.dryRun, matched: 0, more_waiting: false, acted: 0, rows: [], then: [], error: (e as Error).message });
     }
   }
-  if (!opts.dryRun) await saveState(state);
+  if (!opts.dryRun) await saveState(state, rules.map((r) => r.id));
   await appendRunLog(opts, results);
   return results;
 }
@@ -700,8 +731,7 @@ async function appendRunLog(opts: RunOptions, results: RuleResult[]): Promise<vo
     })),
   };
   try {
-    await fs.mkdir(homeDir(), { recursive: true });
-    await fs.appendFile(runLogPath(), JSON.stringify(line) + "\n");
+    await fs.appendFile(await runLogPath(), JSON.stringify(line) + "\n");
   } catch {
     // The run log is a convenience; a write failure shouldn't fail the run.
   }

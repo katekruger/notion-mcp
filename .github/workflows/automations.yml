@@ -73,9 +73,9 @@ jobs:
         with:
           name: notion-plus-journal-${{ github.run_id }}
           path: |
-            .notion-plus/journal.json
-            .notion-plus/automation-runs.jsonl
-            .notion-plus/automation-state.json
+            .notion-plus/workspaces/*/journal.json
+            .notion-plus/workspaces/*/automation-runs.jsonl
+            .notion-plus/workspaces/*/automation-state.json
           if-no-files-found: ignore
           retention-days: 90
 

@@ -141,13 +141,13 @@ Inline: `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `<u>underline</u>`, 
 
 These are the same tags Notion's markdown export uses, so `notion_get_page` with `format: "markdown"` returns markdown you can edit and insert back; the live test suite checks that a full page survives the round trip line for line. Local files can be uploaded from the working directory and the temp folder; set `NOTION_PLUS_UPLOAD_DIRS` (separated by `:`, or `;` on Windows) to allow other folders.
 
-The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
+The undo journal is stored in `~/.notion-plus/workspaces/<integration id>/journal.json` (last 500 changes; see [Local state](#local-state)). Each write is journaled before it reaches Notion: if the server stops mid-write, `notion_history` shows the entry as `interrupted` with the tool's input, so you can check those objects by hand. Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
 
 ### Visuals: which to use
 
 1. **Native Notion content** for structure and diagrams: callouts, columns, tables, equations, and Mermaid diagrams (```` ```mermaid ```` code blocks: flowcharts, sequence, Gantt, pie, timeline). Mermaid is checked before writing so a typo doesn't leave an error box.
 2. **Chart views** (`notion_views` with `type: "chart"`) when the data lives in a Notion database: they stay live, filter with the database, and people can click through. They can sit on any page as a linked view.
-3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `~/.notion-plus/charts.json`, and `refresh_block_id` redraws a chart from current data in the same block.
+3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `charts.json` in the [local state](#local-state) folder, and `refresh_block_id` redraws a chart from current data in the same block.
 4. **Embeds** (`embed` blocks) for interactive charts hosted elsewhere, when neither of the above fits.
 
 `notion_build_report` combines these: it uses a live chart view where Notion supports the chart type and renders an image otherwise.
@@ -263,7 +263,7 @@ npm run automations -- --rule at-risk --force
 npm run automations                         # apply
 ```
 
-One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it, including deleting the comments it added and trashing pages it created. Runs are logged to `~/.notion-plus/automation-runs.jsonl`, and schedule state is kept in `~/.notion-plus/automation-state.json`.
+One run acts on at most 200 rows across all rules (`--max-writes` or `AUTOMATIONS_MAX_WRITES`). A failing rule is reported and the others still run. Each rule's run is one journal entry, so `notion_undo <undo_id>` reverts it, including deleting the comments it added and trashing pages it created. Runs are logged to `automation-runs.jsonl`, and schedule state is kept in `automation-state.json`, both in the [local state](#local-state) folder.
 
 ### GitHub Actions
 
@@ -285,7 +285,7 @@ To pause a rule, disable it (or set `"enabled": false`) and push. To stop everyt
 
 **Undoing a scheduled run**
 
-Download the run's `notion-plus-journal-<run id>` artifact, unzip it into a folder, point `NOTION_PLUS_HOME` at that folder (in your Claude config, or `NOTION_TOKEN=… NOTION_PLUS_HOME=… npm run inspect`), and call `notion_undo` with the undo id from the run summary.
+Download the run's `notion-plus-journal-<run id>` artifact, unzip it into a folder (it keeps the `workspaces/<integration id>/` layout), point `NOTION_PLUS_HOME` at that folder (in your Claude config, or `NOTION_TOKEN=… NOTION_PLUS_HOME=… npm run inspect`), and call `notion_undo` with the undo id from the run summary.
 
 GitHub may start scheduled runs a few minutes late, and turns off schedules in repos with no activity for 60 days.
 
@@ -293,6 +293,12 @@ GitHub may start scheduled runs a few minutes late, and turns off schedules in r
 
 - **Notion's built-in database automations** (the ⚡ button in a database) can't be created, read, or changed through the API. Rules here are the programmable alternative; they poll rather than react instantly.
 - **Webhooks** can push changes the moment they happen, but Notion needs a public HTTPS URL to deliver them, and a local server doesn't have one. A future option: a small hosted endpoint (or a tunnel such as Cloudflare Tunnel) that receives the webhook and triggers the workflow with `workflow_dispatch`, so rules run within seconds instead of within the hour.
+
+## Local state
+
+Everything the server remembers lives under `~/.notion-plus` (`NOTION_PLUS_HOME` moves it), in a folder per integration: `workspaces/<integration id>/`, with `journal.json` (undo history), `charts.json` (chart recipes), `automation-state.json` (which scheduled occurrences fired), and `automation-runs.jsonl` (run log). Two integrations sharing a machine never mix their history. `NOTION_PLUS_WORKSPACE` sets the folder name instead of looking up the integration; `NOTION_PLUS_STATE` moves just the automation state file. The first time a folder is created, state from older versions (kept directly in `~/.notion-plus`) is copied into it.
+
+These files are safe to share between several servers at once (Claude Desktop, Cowork, Claude Code, the scheduled runner): each change is made under a lock, written to a temporary file, flushed, and swapped in, with the previous version kept as `<file>.bak`. If a file can't be read (cut off by a crash or a full disk, edited by hand into invalid JSON, or not readable), the server stops with an error naming it instead of treating it as empty, since that would lose undo history or repeat scheduled automations. Fix the file, restore the `.bak`, or move it away to start fresh. A leftover `<file>.lock` from a process that died is cleared automatically.
 
 ## Development
 

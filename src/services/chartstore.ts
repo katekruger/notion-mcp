@@ -4,6 +4,8 @@ import path from "node:path";
 import type { ChartSpec, ChartRow } from "./charts.js";
 import type { ChartSource } from "./chartdata.js";
 import { homeDir } from "./files.js";
+import { readJson, updateJson } from "./store.js";
+import { stateDir } from "./workspace.js";
 
 export interface StoredChart {
   block_id: string;
@@ -15,23 +17,22 @@ export interface StoredChart {
   updated: string;
 }
 
-const file = () => path.join(homeDir(), "charts.json");
+const file = async () => path.join(await stateDir(), "charts.json");
+
+function parseCharts(raw: unknown): Record<string, StoredChart> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("expected an object of chart recipes keyed by block id");
+  return raw as Record<string, StoredChart>;
+}
 
 export async function loadCharts(): Promise<Record<string, StoredChart>> {
-  try {
-    return JSON.parse(await fs.readFile(file(), "utf8")) as Record<string, StoredChart>;
-  } catch {
-    return {};
-  }
+  return (await readJson(await file(), parseCharts, () => ({}))).data;
 }
 
 export async function saveChart(c: StoredChart): Promise<void> {
-  const all = await loadCharts();
-  all[c.block_id] = c;
-  await fs.mkdir(homeDir(), { recursive: true });
-  const tmp = file() + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(all, null, 2));
-  await fs.rename(tmp, file());
+  await updateJson<Record<string, StoredChart>, null>(await file(), parseCharts, () => ({}), (all) => {
+    all[c.block_id] = c;
+    return { data: all, result: null };
+  });
 }
 
 export async function getChart(blockId: string): Promise<StoredChart | undefined> {

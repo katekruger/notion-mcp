@@ -50,6 +50,8 @@ export interface CallOptions {
    * Only these are retried after a timeout or network failure, since the first attempt may have landed.
    */
   idempotent?: boolean;
+  /** Reads never change anything, so they skip the before-write hook. */
+  read?: boolean;
 }
 
 const NETWORK_RETRIES = 2;
@@ -82,7 +84,15 @@ export function isGatewayError(error: unknown): boolean {
   return isNotionClientError(error) && (status === 502 || status === 503 || status === 504);
 }
 
+let beforeWrite: (() => Promise<void>) | null = null;
+
+/** Hook run before any request that isn't a read (the journal uses it to write its intent first). */
+export function setBeforeWrite(fn: (() => Promise<void>) | null): void {
+  beforeWrite = fn;
+}
+
 export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Promise<T> {
+  if (!opts.read && beforeWrite) await beforeWrite();
   for (let attempt = 0; ; attempt++) {
     await slot();
     try {
@@ -117,7 +127,7 @@ export async function mapLimited<T, R>(items: T[], fn: (item: T, index: number) 
 
 /** Shorthand for reads, which are always safe to retry. */
 export function read<T>(fn: () => Promise<T>): Promise<T> {
-  return call(fn, { idempotent: true });
+  return call(fn, { idempotent: true, read: true });
 }
 
 /** Accepts a Notion URL, a dashed UUID, or a 32-char hex id. Returns a dashed UUID. */

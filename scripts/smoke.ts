@@ -29,6 +29,7 @@ const { registerContentTools } = await import("../src/tools/content.js");
 const { registerDatabaseTools } = await import("../src/tools/database.js");
 const { registerVisualTools } = await import("../src/tools/visuals.js");
 const { runAll } = await import("../src/services/automations.js");
+const { journalWrites } = await import("../src/tools/util.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 type Handler = (args: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>;
@@ -40,7 +41,7 @@ const registry = {
   },
 };
 for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools]) {
-  register(registry as never);
+  register(journalWrites(registry as never) as never);
 }
 
 /** Call a tool the way the MCP server would: parse args with its schema (applies defaults), then run the handler. */

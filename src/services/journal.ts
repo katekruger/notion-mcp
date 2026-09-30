@@ -1,8 +1,9 @@
-import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { call, isNotFound, mapLimited, notion, read } from "./notion.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { call, isNotFound, mapLimited, notion, read, setBeforeWrite } from "./notion.js";
+import { readJson, updateJson } from "./store.js";
+import { stateDir } from "./workspace.js";
 import { invalidateSchema } from "./schema.js";
 import { uploadLocalFile } from "./files.js";
 
@@ -36,35 +37,47 @@ export interface JournalEntry {
   undo: UndoOp[];
   undone: boolean;
   not_undoable?: string;
+  /**
+   * Write-ahead state. "pending": the tool started writing to Notion and hasn't finished (or its process died:
+   * see `interrupted` in history). "failed": it stopped with an error after writing, before recording undo.
+   * Absent: finished and recorded.
+   */
+  status?: "pending" | "failed";
+  pid?: number;
+  /** The tool's input, shortened, so an interrupted write can be checked by hand. */
+  args?: string;
+  error?: string;
 }
 
 const MAX_ENTRIES = 500;
-const dir = process.env.NOTION_PLUS_HOME ?? path.join(os.homedir(), ".notion-plus");
-const file = path.join(dir, "journal.json");
+
+async function journalFile(): Promise<string> {
+  return path.join(await stateDir(), "journal.json");
+}
+
+function parseEntries(raw: unknown): JournalEntry[] {
+  if (!Array.isArray(raw)) throw new Error("expected a list of entries");
+  for (const e of raw) {
+    const o = e as Partial<JournalEntry> | null;
+    if (!o || typeof o.id !== "string" || typeof o.at !== "string" || !Array.isArray(o.undo)) throw new Error("an entry is missing id, at, or undo");
+  }
+  return raw as JournalEntry[];
+}
 
 async function load(): Promise<JournalEntry[]> {
-  try {
-    return JSON.parse(await fs.readFile(file, "utf8")) as JournalEntry[];
-  } catch {
-    return [];
-  }
+  return (await readJson(await journalFile(), parseEntries, () => [])).data;
 }
 
-async function save(entries: JournalEntry[]): Promise<void> {
-  await fs.mkdir(dir, { recursive: true });
-  const tmp = file + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(entries.slice(-MAX_ENTRIES), null, 2));
-  await fs.rename(tmp, file);
+/** Change the journal under its lock. */
+async function edit<R>(fn: (entries: JournalEntry[]) => R): Promise<R> {
+  return updateJson(await journalFile(), parseEntries, () => [], (entries) => {
+    const result = fn(entries);
+    return { data: entries.slice(-MAX_ENTRIES), result };
+  });
 }
 
-export async function record(
-  tool: string,
-  summary: string,
-  undo: UndoOp[],
-  notUndoable?: string
-): Promise<string> {
-  const entries = await load();
-  const entry: JournalEntry = {
+function newEntry(tool: string, summary: string, undo: UndoOp[], notUndoable?: string): JournalEntry {
+  return {
     id: randomUUID().slice(0, 8),
     at: new Date().toISOString(),
     tool,
@@ -73,14 +86,119 @@ export async function record(
     undone: false,
     ...(notUndoable ? { not_undoable: notUndoable } : {}),
   };
-  entries.push(entry);
-  await save(entries);
-  return entry.id;
 }
 
-export async function history(limit: number): Promise<JournalEntry[]> {
+// ---------- write-ahead intents ----------
+
+interface ToolContext {
+  tool: string;
+  args: unknown;
+  /** Journal entry written before the first Notion write of this call. */
+  intentId?: string;
+  /** record() has run (it fills in the intent, or wrote its own entry), so later writes need no new intent. */
+  recorded: boolean;
+}
+
+const context = new AsyncLocalStorage<ToolContext>();
+
+function shortArgs(args: unknown): string {
+  let text: string;
+  try {
+    text = JSON.stringify(args) ?? "";
+  } catch {
+    text = String(args);
+  }
+  return text.length > 2000 ? text.slice(0, 2000) + "…" : text;
+}
+
+async function beginIntent(): Promise<void> {
+  const ctx = context.getStore();
+  if (!ctx || ctx.intentId || ctx.recorded) return;
+  const entry: JournalEntry = {
+    ...newEntry(ctx.tool, `${ctx.tool} started`, [], "the write was interrupted before undo was recorded"),
+    status: "pending",
+    pid: process.pid,
+    args: shortArgs(ctx.args),
+  };
+  ctx.intentId = entry.id;
+  await edit((entries) => entries.push(entry));
+}
+setBeforeWrite(beginIntent);
+
+/**
+ * Run a write tool so that its first Notion write is preceded by a "pending" journal entry. record() completes
+ * that entry; if the process dies in between, history shows the write as interrupted with the tool's input.
+ */
+export async function runJournaled<R extends { isError?: boolean; content?: { text?: string }[] }>(
+  tool: string,
+  args: unknown,
+  fn: () => Promise<R>
+): Promise<R> {
+  const ctx: ToolContext = { tool, args, recorded: false };
+  const settle = async (error?: string) => {
+    if (!ctx.intentId || ctx.recorded) return;
+    const id = ctx.intentId;
+    await edit((entries) => {
+      const i = entries.findIndex((e) => e.id === id);
+      if (i < 0) return;
+      // A write that finished without recording undo (undo itself, a no-op) leaves nothing to keep.
+      if (error === undefined) entries.splice(i, 1);
+      else Object.assign(entries[i], { status: "failed", summary: `${tool} stopped with an error after writing`, error: error.slice(0, 1000) });
+    });
+  };
+  try {
+    const r = await context.run(ctx, fn);
+    await settle(r?.isError ? (r.content?.[0]?.text ?? "error") : undefined);
+    return r;
+  } catch (e) {
+    await settle((e as Error).message ?? String(e));
+    throw e;
+  }
+}
+
+export async function record(
+  tool: string,
+  summary: string,
+  undo: UndoOp[],
+  notUndoable?: string
+): Promise<string> {
+  const ctx = context.getStore();
+  const intentId = ctx && !ctx.recorded ? ctx.intentId : undefined;
+  if (ctx) ctx.recorded = true;
+  const entry = newEntry(tool, summary, undo, notUndoable);
+  return edit((entries) => {
+    const i = intentId ? entries.findIndex((e) => e.id === intentId) : -1;
+    if (i < 0) {
+      entries.push(entry);
+      return entry.id;
+    }
+    // Complete the intent in place: same id, same position, now with its undo.
+    entries[i] = { ...entry, id: intentId as string, at: entries[i].at };
+    return intentId as string;
+  });
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export type HistoryEntry = JournalEntry & { interrupted?: boolean };
+
+export async function history(limit: number): Promise<HistoryEntry[]> {
   const entries = await load();
-  return entries.slice(-limit).reverse();
+  return entries
+    .slice(-limit)
+    .reverse()
+    .map((e) =>
+      e.status === "pending" && e.pid !== undefined && e.pid !== process.pid && !pidAlive(e.pid)
+        ? { ...e, interrupted: true, not_undoable: "interrupted: the process stopped mid-write; check the objects named in args by hand" }
+        : e
+    );
 }
 
 async function apply(op: UndoOp): Promise<void> {
@@ -334,6 +452,11 @@ export async function undo(
     i = j;
   }
   target.undone = failed.length === 0;
-  await save(entries);
+  if (target.undone) {
+    await edit((all) => {
+      const e = all.find((x) => x.id === target.id);
+      if (e) e.undone = true;
+    });
+  }
   return { entry: target, applied, failed, conflicts };
 }

@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.9.0
+
+Durable local state (audit batch 2: P1-03, P1-04, P2-10, P3-08).
+
+### Changed
+- All local state (undo journal, chart recipes, automation state, run log) moves to a folder per integration, `~/.notion-plus/workspaces/<integration id>/`, so two integrations on one machine never mix history. Existing files are copied there the first time. `NOTION_PLUS_WORKSPACE` sets the folder name without a lookup. The scheduled workflow's artifact keeps this layout.
+- State files are written atomically (unique temp file, flush, rename) with the previous version kept as `<file>.bak`, and every read-modify-write runs under a cross-process lock. Several servers can share the folder without losing each other's changes. Locks left by a process that died are cleared automatically.
+- An automation run saves only the rules it ran, merged into the current state file, so concurrent runs don't erase each other's schedule history.
+
+### Fixed
+- A corrupt, cut-off, or unreadable state file no longer reads as empty (which could re-fire scheduled automations or hide undo history). The server stops with an error naming the file and how to recover. Only a missing file counts as empty.
+- Writes are journaled before they reach Notion. A tool that stops with an error after writing leaves a `failed` entry, and one whose process dies leaves an entry that `notion_history` marks `interrupted`, both with the tool's input.
+
+### Added
+- `notion_automation` `list` and `get` return the rules file's `revision`. Edits accept `expected_revision` and are refused if the file changed since. Every edit now applies to the current file under its lock, so a change made elsewhere in the meantime is kept.
+
 ## 0.8.1
 
 ### Fixed

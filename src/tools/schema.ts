@@ -25,6 +25,8 @@ const MAX_DELETE_SNAPSHOT = 2000;
 /** Status options without a group all land in "To-do" (verified live), so guess a group from the name. */
 export function inferStatusGroup(name: string): (typeof STATUS_GROUPS)[number] {
   const n = name.toLowerCase();
+  // To-do words first: "Not started" must not match "started".
+  if (/\b(not started|backlog|to ?do|new|planned|queued|triage|idea)\b/.test(n)) return "To-do";
   if (/\b(done|complete|completed|closed|shipped|finished|resolved|archived|cancel+ed|won|lost)\b/.test(n)) return "Complete";
   if (/\b(progress|doing|active|review|blocked|at risk|started|waiting|testing|qa|ongoing)\b/.test(n)) return "In progress";
   return "To-do";

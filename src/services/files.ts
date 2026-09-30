@@ -34,7 +34,8 @@ export function isUrl(s: string): boolean {
 export function uploadRoots(): string[] {
   const env = process.env.NOTION_PLUS_UPLOAD_DIRS;
   const roots = env ? env.split(path.delimiter).filter(Boolean) : [process.cwd(), os.tmpdir()];
-  return roots.map((r) => path.resolve(r));
+  // Apps can start the server with "/" as its working directory; never let that open the whole disk.
+  return roots.map((r) => path.resolve(r)).filter((r) => path.parse(r).root !== r);
 }
 
 export async function checkUploadPath(p: string): Promise<string> {

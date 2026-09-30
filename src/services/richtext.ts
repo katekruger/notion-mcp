@@ -101,6 +101,23 @@ export function forApi(segments: RichTextReq[]): Record<string, unknown>[] {
   return out;
 }
 
+/** Rich text → inline markdown (bold, italic, code, strike, links); mentions and equations as their text. */
+export function toInlineMarkdown(rt: ReadonlyArray<RichTextItemResponse> | undefined): string {
+  return (rt ?? [])
+    .map((r) => {
+      let t = r.type === "equation" ? `$${r.equation.expression}$` : r.plain_text;
+      if (!t.trim()) return t;
+      const a = r.annotations;
+      if (a.code) t = `\`${t}\``;
+      if (a.strikethrough) t = `~~${t}~~`;
+      if (a.italic) t = `*${t}*`;
+      if (a.bold) t = `**${t}**`;
+      if (r.type === "text" && r.text.link) t = `[${t}](${r.text.link.url})`;
+      return t;
+    })
+    .join("");
+}
+
 export function segmentText(s: RichTextReq): string {
   if (s.type === "text") return s.text.content;
   if (s.type === "equation") return s.equation.expression;

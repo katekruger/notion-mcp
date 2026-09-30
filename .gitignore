@@ -3,3 +3,5 @@ dist/
 .env
 .env.*
 .notion-plus/
+bundles/
+acceptance-report.md

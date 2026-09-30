@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.7.0
+
+### Added
+- MCP Bundle: `manifest.json`, `npm run bundle`, and a release workflow that builds a bundle per platform on `v*` tags. The bundle asks for the integration secret, an upload folder, and a time zone.
+- `evals/notion-plus.xml`: 10 multi-step evaluation questions, with `npm run eval:seed` (fixed dataset) and `npm run eval:verify` (answers checked through the tools).
+- `npm run acceptance`: the seven acceptance scenarios end to end.
+- Comments read back as markdown (bold, italic, code, links).
+
+### Changed
+- Notion API version pinned to 2026-03-11 (`NOTION_VERSION` overrides).
+- Chart rendering libraries load on first use, so a bundle for another platform still serves every other tool.
+- Local uploads never treat the filesystem root as an allowed folder, even when the app starts the server there.
+- Status groups guessed from names check to-do words first ("Not started" → To-do).
+- Reports skip empty status groups in their default KPIs.
+
 ## 0.6.0
 
 ### Added

@@ -5,6 +5,13 @@ let client: Client | null = null;
 /** Per-request timeout. Long enough for large appends, short enough that a hung call surfaces. */
 export const REQUEST_TIMEOUT_MS = Number(process.env.NOTION_TIMEOUT_MS ?? 30_000);
 
+/**
+ * Notion API version, pinned so a client library update can't change behavior underneath us.
+ * 2026-03-11 renames `archived` → `in_trash`, `transcription` → `meeting_notes`, and drops the flat `after`
+ * parameter of block appends; this server already uses the new forms. NOTION_VERSION overrides it.
+ */
+export const NOTION_VERSION = process.env.NOTION_VERSION ?? "2026-03-11";
+
 export function notion(): Client {
   if (client) return client;
   const token = process.env.NOTION_TOKEN;
@@ -15,7 +22,11 @@ export function notion(): Client {
     );
   }
   // The official client retries 429/529 (honoring Retry-After) and, for safe methods, 500/503 with backoff.
-  client = new Client({ auth: token, retry: { maxRetries: 4 }, timeoutMs: REQUEST_TIMEOUT_MS,
+  client = new Client({
+    auth: token,
+    notionVersion: NOTION_VERSION,
+    retry: { maxRetries: 4 },
+    timeoutMs: REQUEST_TIMEOUT_MS,
     // Expected misses (e.g. trying an id as a data source before a database) are handled; only log real errors.
     logLevel: LogLevel.ERROR,
   });

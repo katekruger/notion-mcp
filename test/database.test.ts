@@ -129,6 +129,7 @@ test("status groups are guessed from option names", () => {
   assert.equal(inferStatusGroup("At Risk"), "In progress");
   assert.equal(inferStatusGroup("In Progress"), "In progress");
   assert.equal(inferStatusGroup("Backlog"), "To-do");
+  assert.equal(inferStatusGroup("Not started"), "To-do");
 });
 
 test("propertyRequest: options with colors and groups, formats, rollups; misuse is rejected", async () => {

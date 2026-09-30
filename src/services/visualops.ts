@@ -219,7 +219,7 @@ export async function buildReport(a: ReportArgs) {
   // KPIs: numbers side by side.
   let kpis = a.kpis;
   if (!kpis && statusProp && statusProp.type === "status") {
-    kpis = [{ label: "Total", value: "count" }, ...statusProp.status.groups.map((g) => ({ label: g.name, value: "count", where: { [statusProp.name]: { in: statusProp.status.options.filter((o) => g.option_ids.includes(o.id)).map((o) => o.name) } } }))].filter((k, i, arr) => i === 0 || arr.length <= 4);
+    kpis = [{ label: "Total", value: "count" }, ...statusProp.status.groups.filter((g) => g.option_ids.length > 0).map((g) => ({ label: g.name, value: "count", where: { [statusProp.name]: { in: statusProp.status.options.filter((o) => g.option_ids.includes(o.id)).map((o) => o.name) } } }))].filter((k, i, arr) => i === 0 || arr.length <= 4);
   }
   if (kpis?.length) {
     const cells: BlockSpec[][] = [];

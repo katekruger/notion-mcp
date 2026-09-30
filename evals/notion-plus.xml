@@ -1,0 +1,43 @@
+<evaluation>
+  <!-- Run `npm run eval:seed` first: these answers are fixed by the dataset it builds under your test page. -->
+  <qa_pair>
+    <question>In the Notion database "Eval: Projects", consider only projects whose Status is "In progress". Which owner has the largest total Budget across those projects? Answer with the owner's first name.</question>
+    <answer>Ada</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Projects in "Eval: Projects" are linked to clients in "Eval: Clients", and each client has a Tier. Among projects tagged "Security", which client tier has the most projects? Answer with the tier name.</question>
+    <answer>Gold</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The page "Eval: Q3 retro" records a decision about the queue migration inside a collapsed section. Who approved it? Answer with the person's full name.</question>
+    <answer>Priya Raman</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>According to the metrics table on the page "Eval: Q3 retro", what was the p95 latency in September 2025, in milliseconds? Answer with the number only.</question>
+    <answer>310</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the "Eval: Projects" database, how many Status options belong to the "Complete" status group? Answer with a number.</question>
+    <answer>2</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The "Eval: Projects" database has a board view. Which property are its columns grouped by? Answer with the property name.</question>
+    <answer>Status</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>How many projects in "Eval: Projects" have a Due date in the third quarter of 2025 (July 1 to September 30, 2025, inclusive)? Answer with a number.</question>
+    <answer>7</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The page "Eval: Runbook" has a collapsible section titled "Restart the worker" containing a code block. What language is that code block set to? Answer in lowercase.</question>
+    <answer>bash</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>There is an open comment on the page "Eval: Runbook". Which single word in it is bold? Answer with that word in lowercase.</question>
+    <answer>verify</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Consider every project in "Eval: Projects" whose client (in "Eval: Clients") is in the EMEA region. What is the median Budget of those projects, in US dollars? Answer as a whole number without symbols or separators.</question>
+    <answer>10000</answer>
+  </qa_pair>
+</evaluation>

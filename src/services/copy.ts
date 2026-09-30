@@ -33,7 +33,7 @@ const REASONS: Record<string, string> = {
   child_database: "database (the API can't copy databases; recreate or link it in Notion)",
   unsupported: "block type the API can't read or create",
   meeting_notes: "meeting notes (read-only in the API)",
-  transcription: "transcription (read-only in the API)",
+  transcription: "meeting notes (read-only in the API)",
   template: "template button (deprecated, can't be created)",
   link_preview: "link preview (can't be created through the API)",
 };

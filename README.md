@@ -19,7 +19,10 @@ A local MCP server for Notion built for precise edits. It changes exactly the bl
 
 **2. Share pages with it.** In Notion, open each top-level page or database you want Claude to reach, click `•••` → `Connections`, and add the integration. Everything under a shared page is included.
 
-**3. Install.** Requires Node 20 or later.
+**3. Install.** Two ways:
+
+- **One-click bundle (Claude Desktop and Cowork).** Download the `.mcpb` file for your computer (`darwin-arm64` for Apple silicon Macs, `darwin-x64` for Intel Macs, `win32-x64`, `linux-x64`) from the [Releases](https://github.com/katekruger/notion-mcp/releases) page, double-click it (or drag it onto Claude Desktop's Settings → Extensions), and paste your integration secret when asked. You can also pick a folder uploads may come from and your time zone. Cowork runs inside Claude Desktop and uses the extensions installed there. Skip to step 5.
+- **From source** (for Claude Code, or to run automations). Requires Node 20 or later.
 
 ```bash
 git clone https://github.com/katekruger/notion-mcp.git
@@ -30,7 +33,9 @@ npm run build
 
 To update later: `git pull && npm ci && npm run build`, then restart Claude (or start a new Claude Code session).
 
-**4. Connect it to Claude.** Use the full path to your clone.
+To build a bundle yourself: `npm run bundle` writes `bundles/notion-plus-<version>-<platform>-<arch>.mcpb`. Bundles are per platform because chart images use a native renderer; pushing a `v*` tag builds all four in GitHub Actions and attaches them to a release.
+
+**4. Connect it to Claude** (from source). Use the full path to your clone.
 
 Claude Code:
 
@@ -105,6 +110,10 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 
 **Automations** (see below)
 - `notion_automation`: list, add, update, validate, dry-run, enable, disable, delete, and run rules, and see recent runs.
+
+### API version
+
+The server pins Notion API version `2026-03-11` (set `NOTION_VERSION` to override). That version renamed `archived` to `in_trash`, `transcription` blocks to `meeting_notes`, and replaced the flat `after` parameter of block appends with `position`; this server already used the new forms, and the full live suite passes on it.
 
 ### Content formats
 
@@ -294,6 +303,11 @@ npm run check       # all of the above plus the build; CI runs this on every pus
 npm run test:live   # live integration suite against a real workspace
 ```
 
+### Evaluations and acceptance tests
+
+- `evals/notion-plus.xml` holds 10 realistic, read-only questions (in the MCP evaluation format) that each need several tools to answer: aggregation, relations, schema, views, page content, and comments. `npm run eval:seed` builds the fixed dataset they're written against under your test page; `npm run eval:verify` answers every question through the tools and checks the expected answers. To measure how well a model picks tools, run the questions with the MCP evaluation harness against this server.
+- `npm run acceptance` runs the seven acceptance scenarios (project tracker, views, report page, find/replace with preview and undo, the At Risk and Completed Date automations, and a 300-row bulk update with undo) and leaves the results under an "Acceptance <date>" page.
+
 `npm run test:live` (also `npm run smoke`) needs `NOTION_TOKEN` and `NOTION_TEST_PAGE` (a page shared with the integration), from the environment or a local `.env` file (gitignored). It creates two throwaway databases under that page, runs every tool including dry runs and `notion_undo` for each write type, then moves them to the trash. It never writes outside the test page, and its undo journal goes to a temp folder. Set `SMOKE_KEEP=1` to keep the databases for inspection.
 
 Versions follow semver; see [CHANGELOG.md](CHANGELOG.md).
@@ -307,4 +321,6 @@ Built in phases, each ending with the build, unit tests, and the live suite pass
 3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create. (done, 0.4.0)
 4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages. (done, 0.5.0)
 5. Automations: schedules, run state, more actions, full management from Claude. (done, 0.6.0)
-6. Distribution: MCP Bundle, tool evaluations, acceptance tests.
+6. Distribution: MCP Bundle, tool evaluations, acceptance tests, API version 2026-03-11. (done, 0.7.0)
+
+Possible next steps: webhooks through a small hosted relay for instant automations, and chart images that follow Notion's dark mode.

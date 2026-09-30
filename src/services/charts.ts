@@ -1,9 +1,9 @@
 // Chart images: data → Vega-Lite → SVG → PNG, styled to one validated palette so every chart reads as one system.
 // Colors are the reference categorical palette (light mode; Notion pages show images as-is in either theme),
 // assigned in fixed slot order and folded into "Other" past eight series.
-import * as vega from "vega";
-import * as vl from "vega-lite";
-import { Resvg } from "@resvg/resvg-js";
+// Rendering libraries load on first use: resvg ships a native binary per platform, so a bundle built for another
+// platform still starts and serves every other tool, and only chart images report the problem.
+import type * as vl from "vega-lite";
 
 export const CHART_TYPES = [
   "bar", "column", "stacked_bar", "stacked_column", "grouped_column", "line", "area", "stacked_area", "pie", "donut", "scatter",
@@ -230,7 +230,17 @@ export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.Top
 
 /** Render a Vega-Lite spec to PNG at 2x for crisp display. */
 export async function renderPng(spec: vl.TopLevelSpec): Promise<Uint8Array> {
-  const compiled = vl.compile(spec).spec;
+  let libs;
+  try {
+    libs = await Promise.all([import("vega"), import("vega-lite"), import("@resvg/resvg-js")]);
+  } catch (e) {
+    throw new Error(
+      `Chart images need the rendering libraries for this platform (${process.platform}-${process.arch}), which failed to load: ` +
+        `${(e as Error).message}. Reinstall with npm ci on this machine, or use a notion_views chart view instead.`
+    );
+  }
+  const [vega, vegaLite, { Resvg }] = libs;
+  const compiled = vegaLite.compile(spec).spec;
   const view = new vega.View(vega.parse(compiled), { renderer: "none" });
   const svg = await view.toSVG();
   view.finalize();

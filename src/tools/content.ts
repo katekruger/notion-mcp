@@ -16,7 +16,7 @@ import {
   type Skipped,
 } from "../services/copy.js";
 import { fileRef } from "../services/files.js";
-import { plain, textToTitle } from "../services/richtext.js";
+import { plain, textToTitle, toInlineMarkdown } from "../services/richtext.js";
 import { dataSourceTitle, resolveDataSource, restoreValue } from "../services/schema.js";
 import { insertedBlocks, record, type UndoOp } from "../services/journal.js";
 import { checkFresh, iconRef } from "./pages.js";
@@ -360,7 +360,7 @@ export function registerContentTools(server: McpServer): void {
           const res = await read(() => n.comments.list({ block_id: id, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) }));
           for (const c of res.results) {
             const full = c as { id: string; discussion_id: string; created_time: string; created_by: { id: string; name?: string }; rich_text: Parameters<typeof plain>[0] };
-            comments.push({ id: full.id, discussion_id: full.discussion_id, at: full.created_time, by: full.created_by.name ?? full.created_by.id, text: plain(full.rich_text) });
+            comments.push({ id: full.id, discussion_id: full.discussion_id, at: full.created_time, by: full.created_by.name ?? full.created_by.id, text: toInlineMarkdown(full.rich_text) });
           }
           cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
         } while (cursor && comments.length < limit);

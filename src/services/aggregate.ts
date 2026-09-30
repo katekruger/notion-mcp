@@ -104,7 +104,8 @@ function round(n: number): number {
   return Math.round(n * 1e4) / 1e4;
 }
 
-function compute(m: Metric, rows: PageObjectResponse[]): number | string | null {
+/** One metric over a set of rows. */
+export function computeMetric(m: Metric, rows: PageObjectResponse[]): number | string | null {
   if (m.op === "count") return rows.length;
   const props = rows.map((r) => r.properties[m.property as string]);
   switch (m.op) {
@@ -142,7 +143,7 @@ function compute(m: Metric, rows: PageObjectResponse[]): number | string | null 
 /** Group rows and compute metrics. Rows with several keys (multi-select, people, relations) count in each group. */
 export function aggregate(rows: PageObjectResponse[], spec: AggregateSpec): { groups: Group[]; totals: Record<string, number | string | null>; group_count: number } {
   const metrics = spec.metrics.length ? spec.metrics : [{ op: "count" as const }];
-  const totals = Object.fromEntries(metrics.map((m) => [metricName(m), compute(m, rows)]));
+  const totals = Object.fromEntries(metrics.map((m) => [metricName(m), computeMetric(m, rows)]));
   if (!spec.group_by) return { groups: [], totals, group_count: 0 };
   const buckets = new Map<string, PageObjectResponse[]>();
   for (const r of rows) {
@@ -154,7 +155,7 @@ export function aggregate(rows: PageObjectResponse[], spec: AggregateSpec): { gr
   }
   let groups: Group[] = [...buckets.entries()].map(([key, list]) => ({
     key,
-    ...Object.fromEntries(metrics.map((m) => [metricName(m), compute(m, list)])),
+    ...Object.fromEntries(metrics.map((m) => [metricName(m), computeMetric(m, list)])),
   }));
   const first = metricName(metrics[0]);
   const sort = spec.sort ?? (spec.group_by.by ? "key_asc" : "value_desc");

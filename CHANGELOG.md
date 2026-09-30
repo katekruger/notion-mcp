@@ -2,7 +2,20 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
-## 0.4.0
+## 0.5.0
+
+### Added
+- `notion_views`: list, get, create, update, delete views of every type (table, board, list, calendar, timeline, gallery, form, map, dashboard, chart), with filters, sorts, grouping, visible properties, and native chart settings. Views can be database tabs, linked views at an exact spot on a page, or dashboard widgets. All reversible.
+- `notion_create_chart`: chart images rendered locally (Vega-Lite → PNG) with a validated, colorblind-safe palette; data inline or from a database query; refresh in place from current data, with undo.
+- `notion_build_report`: report pages with a summary, KPIs, live chart views and chart images, a key-rows table (plus an optional live table), and a Mermaid Gantt chart.
+- Mermaid code blocks are checked before writing.
+
+### Changed
+- Reads (including database queries, which are POSTs) retry Notion's 502/503/504 gateway errors.
+- `notion_undo` returns an error when none of an entry's steps could be applied, instead of reporting success.
+- Undo's edit check compares exact timestamps for objects that have them (views), and by minute for pages and blocks.
+
+
 
 ### Added
 - `notion_create_database`: full schema in one call, including status options with groups, number formats, formulas, one- and two-way relations (also to the same database), rollups, unique IDs, files, and places.

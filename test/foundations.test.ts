@@ -55,6 +55,12 @@ test("findConflicts flags objects edited in a later minute, ignores the write's 
   assert.deepEqual(conflicts[0].later_entries, ["e2"]);
 });
 
+test("findConflicts compares exact edit times exactly (views), minute-rounded ones by minute", () => {
+  const e = entry("2026-09-30T15:51:02.654Z", [{ kind: "view_update", view_id: "v", payload: {} }]);
+  assert.deepEqual(findConflicts(e, new Map([["v", "2026-09-30T15:51:02.527Z"]])), []);
+  assert.equal(findConflicts(e, new Map([["v", "2026-09-30T15:51:03.100Z"]])).length, 1);
+});
+
 test("undoTarget: restores and comment deletes can't clobber newer edits; trashing inserted content can", () => {
   assert.equal(undoTarget({ kind: "comment_delete", comment_id: "c" }), null);
   assert.equal(undoTarget({ kind: "block_trash", block_id: "b", in_trash: false }), null);
@@ -118,4 +124,21 @@ test("mapLimited keeps order and never runs more than the limit at once", async 
   }, 3);
   assert.deepEqual(out, [50, 10, 40, 20, 30]);
   assert.equal(peak, 3);
+});
+
+test("reads retry Notion gateway errors; writes don't", { timeout: 15_000 }, async () => {
+  const { APIResponseError } = await import("@notionhq/client");
+  const gateway = () => Object.assign(Object.create(APIResponseError.prototype), { status: 502, code: "service_unavailable", message: "502", name: "APIResponseError" });
+  let n = 0;
+  const r = await call(async () => {
+    if (++n < 2) throw gateway();
+    return "ok";
+  }, { idempotent: true });
+  assert.equal(r, "ok");
+  let w = 0;
+  await assert.rejects(call(async () => {
+    w++;
+    throw gateway();
+  }));
+  assert.equal(w, 1);
 });

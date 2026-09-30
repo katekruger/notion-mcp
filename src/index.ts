@@ -8,6 +8,7 @@ import { registerSafetyTools, registerSchemaTools } from "./tools/schema.js";
 import { registerAutomationTools } from "./tools/automations.js";
 import { registerContentTools } from "./tools/content.js";
 import { registerDatabaseTools } from "./tools/database.js";
+import { registerVisualTools } from "./tools/visuals.js";
 import { VERSION } from "./version.js";
 
 const server = new McpServer(
@@ -29,6 +30,7 @@ registerBlockTools(server);
 registerContentTools(server);
 registerSchemaTools(server);
 registerDatabaseTools(server);
+registerVisualTools(server);
 registerSafetyTools(server);
 registerAutomationTools(server);
 

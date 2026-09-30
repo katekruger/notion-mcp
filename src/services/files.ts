@@ -73,8 +73,17 @@ export async function uploadBytes(data: Uint8Array, filename: string, contentTyp
   return up.id;
 }
 
-export async function uploadLocalFile(p: string, filename?: string): Promise<string> {
-  const resolved = await checkUploadPath(p);
+/** Where this server keeps its own files (journal, chart copies). */
+export function homeDir(): string {
+  return process.env.NOTION_PLUS_HOME ?? path.join(os.homedir(), ".notion-plus");
+}
+
+/**
+ * Upload a local file. Paths must be inside the allowed upload folders, except files this server saved itself
+ * (`allowAnyPath`, used for undo copies under its home folder).
+ */
+export async function uploadLocalFile(p: string, filename?: string, opts: { allowAnyPath?: boolean } = {}): Promise<string> {
+  const resolved = opts.allowAnyPath && path.resolve(p).startsWith(path.resolve(homeDir()) + path.sep) ? path.resolve(p) : await checkUploadPath(p);
   const data = new Uint8Array(await fs.readFile(resolved));
   return uploadBytes(data, filename ?? path.basename(resolved));
 }

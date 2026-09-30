@@ -94,6 +94,11 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 - `notion_create_database`: a database with its full schema in one call: options (status options with groups), number formats, formulas, one- or two-way relations (including to itself), rollups, unique IDs, files, places.
 - `notion_schema`: add, rename, or delete a property (delete previews first and undo restores the values), add select/multi-select/status options, change number formats and descriptions.
 
+**Views and visuals**
+- `notion_views`: list, read, create, update, and delete views: table, board, list, calendar, timeline, gallery, form, map, dashboard, and Notion's native chart views (column, bar, line, donut, number, with stacking). A view can be a database tab, a linked view placed anywhere on a page, or a dashboard widget.
+- `notion_create_chart`: render a chart image (bar, column, stacked, grouped, line, area, pie, donut, scatter) from inline data or a database query, and refresh it in place later.
+- `notion_build_report`: a report page for a database: summary, KPI numbers, live and image charts, a table of key rows (such as overdue items), and a Mermaid Gantt chart.
+
 **Safety**
 - `notion_history`: recent changes and their undo ids.
 - `notion_undo`: revert a change. Refuses if anything it would restore was edited afterward, and lists what; pass `force: true` to overwrite.
@@ -130,6 +135,15 @@ These are the same tags Notion's markdown export uses, so `notion_get_page` with
 
 The undo journal is stored in `~/.notion-plus/journal.json` (last 500 changes; set `NOTION_PLUS_HOME` to move it). Undo restores the snapshot taken at write time. Before writing, it checks every page, block, or database it would restore; if any was edited after the original change (by a person, or by a later change through this server, which it names), it writes nothing and lists them. The check is per object, so an edit to a different field of the same page also counts, and edits in the same minute as the original change can't be seen. Undoing added options deletes them, which also clears them from any rows that used them since. Schema changes are the exception to the edit check: a database's edit time moves with every schema change, so it can't tell whose change it was; schema undo only touches the property it names.
 
+### Visuals: which to use
+
+1. **Native Notion content** for structure and diagrams: callouts, columns, tables, equations, and Mermaid diagrams (```` ```mermaid ```` code blocks: flowcharts, sequence, Gantt, pie, timeline). Mermaid is checked before writing so a typo doesn't leave an error box.
+2. **Chart views** (`notion_views` with `type: "chart"`) when the data lives in a Notion database: they stay live, filter with the database, and people can click through. They can sit on any page as a linked view.
+3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". They are light-themed PNGs, so they don't switch in dark mode. The recipe is stored in `~/.notion-plus/charts.json`, and `refresh_block_id` redraws a chart from current data in the same block.
+4. **Embeds** (`embed` blocks) for interactive charts hosted elsewhere, when neither of the above fits.
+
+`notion_build_report` combines these: it uses a live chart view where Notion supports the chart type and renders an image otherwise.
+
 ### Queries and aggregation
 
 `where` in `notion_query`, `notion_aggregate`, `notion_bulk_update`, and automation rules accepts:
@@ -160,6 +174,8 @@ Relation values in writes can be page ids, links, or the related row's exact tit
 - Button blocks can't be created or read through the API. Breadcrumbs, bookmarks, and links to pages don't appear in Notion's markdown export; this server fills them in. Code captions aren't in the markdown export either.
 - A heading 4 can't be updated without resending its text; `notion_patch_block` handles that.
 - Notion's built-in database automations can't be created or edited through the API. Button blocks, AI blocks, and some embeds are read-only (the API returns them as `unsupported`).
+- Map views need a place property (`map_by`). Dashboards can be created and given widgets, but the widget layout beyond "new row" or "existing row" is set in Notion.
+- A chart image can be replaced in place, but Notion won't take an old file link back, so a refresh keeps a copy of the previous image in `~/.notion-plus/charts/` for undo.
 - Status options can be added, each in a group (To-do, In progress, Complete). Options sent without a group all land in To-do, so this server guesses the group from the option name ("Done" → Complete) and says so. Views, including chart views, are supported by the API and planned here.
 - Last-edited times are rounded to the minute, so the freshness check catches edits made in an earlier minute.
 - Select and status option names and colors can't be changed through the API. Renames are accepted and silently ignored; color changes are rejected. Rename options in Notion, or add a new option, move rows with `notion_bulk_update`, and delete the old option in Notion.
@@ -279,6 +295,6 @@ Built in phases, each ending with the build, unit tests, and the live suite pass
 1. Foundations: tests, lint, CI, timeouts, partial-failure reporting, safer undo. (done, 0.2.0)
 2. Content: every creatable block type, rich text colors and mentions, markdown round trip, move/copy/duplicate, icons, covers, templates, comments. (done, 0.3.0)
 3. Databases: create with full schemas, schema editing (including status options), every property type, aggregation, bulk create. (done, 0.4.0)
-4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages.
+4. Views and visuals: views including native chart views, generated chart images, Mermaid, report pages. (done, 0.5.0)
 5. Automations: schedules, run state, more actions, full management from Claude.
 6. Distribution: MCP Bundle, tool evaluations, acceptance tests.

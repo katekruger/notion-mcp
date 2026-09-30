@@ -65,13 +65,20 @@ async function slot(): Promise<void> {
   await s;
 }
 
+/** Gateway errors from Notion's edge (502/503/504): safe to retry for requests that can run twice. */
+export function isGatewayError(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  return isNotionClientError(error) && (status === 502 || status === 503 || status === 504);
+}
+
 export async function call<T>(fn: () => Promise<T>, opts: CallOptions = {}): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     await slot();
     try {
       return await fn();
     } catch (e) {
-      if (!opts.idempotent || attempt >= NETWORK_RETRIES || !isTransientNetworkError(e)) throw e;
+      // The client already retries GETs on 5xx; queries are POSTs, so reads get the same treatment here.
+      if (!opts.idempotent || attempt >= NETWORK_RETRIES || !(isTransientNetworkError(e) || isGatewayError(e))) throw e;
       await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
     }
   }

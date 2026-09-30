@@ -27,6 +27,7 @@ const { registerSafetyTools, registerSchemaTools } = await import("../src/tools/
 const { registerAutomationTools } = await import("../src/tools/automations.js");
 const { registerContentTools } = await import("../src/tools/content.js");
 const { registerDatabaseTools } = await import("../src/tools/database.js");
+const { registerVisualTools } = await import("../src/tools/visuals.js");
 const { runAll } = await import("../src/services/automations.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -38,7 +39,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerSafetyTools, registerAutomationTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools]) {
   register(registry as never);
 }
 
@@ -934,6 +935,112 @@ async function main(): Promise<void> {
       return `update ${Math.round((t1 - t0) / 1000)}s, undo ${Math.round((t2 - t1) / 1000)}s`;
     });
   }
+  // ---------- phase 4: views and visuals ----------
+  let reportHost = "";
+  await step("notion_views: board, timeline, calendar, and chart tabs; list and get", async () => {
+    const made: string[] = [];
+    for (const view of [
+      { name: "By status", type: "board", group_by: "Status", properties: ["Priority", "Due"] },
+      { name: "Timeline", type: "timeline", date: "Due", zoom: "week" },
+      { name: "Calendar", type: "calendar", date: "Due" },
+      { name: "Open by client", type: "chart", where: { Status: { "!=": "Done" } }, chart: { type: "column", x: "Client", y: "count", stack_by: "Priority", labels: true } },
+      { name: "Budget", type: "chart", chart: { type: "number", y: "sum:Estimate" } },
+    ]) {
+      const r = await must("notion_views", { action: "create", database: tracker.db, view });
+      made.push(r.undo_id);
+    }
+    const list = await must("notion_views", { action: "list", database: tracker.db });
+    for (const want of ["By status", "Timeline", "Calendar", "Open by client", "Budget"]) expect(list.views.some((v: Json) => v.name === want), `missing view ${want}`);
+    const board = list.views.find((v: Json) => v.name === "By status");
+    const got = await must("notion_views", { action: "get", view_id: board.id });
+    expect(got.configuration.group_by.property === "Status", JSON.stringify(got.configuration));
+    for (const u of made.reverse()) await must("notion_undo", { undo_id: u });
+    const after = await must("notion_views", { action: "list", database: tracker.db });
+    expect(after.views.length === list.views.length - 5, `${after.views.length} views after undo`);
+    return `${list.views.length} views, then ${after.views.length}`;
+  });
+  await step("notion_views: update and delete revert with undo", async () => {
+    const r = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Work", type: "table", sorts: [{ property: "Due" }] } });
+    const upd = await must("notion_views", { action: "update", view_id: r.view_id, view: { name: "Work (high)", type: "table", where: { Priority: "High" } } });
+    let v = await must("notion_views", { action: "get", view_id: r.view_id });
+    expect(v.name === "Work (high)" && JSON.stringify(v.filter).includes("Priority"), JSON.stringify(v));
+    await must("notion_undo", { undo_id: upd.undo_id });
+    v = await must("notion_views", { action: "get", view_id: r.view_id });
+    expect(v.name === "Work" && !v.filter, `after undo: ${JSON.stringify(v).slice(0, 200)}`);
+    const del = await must("notion_views", { action: "delete", view_id: r.view_id });
+    await must("notion_undo", { undo_id: del.undo_id });
+    const list = await must("notion_views", { action: "list", database: tracker.db });
+    const back = list.views.filter((x: Json) => x.name === "Work");
+    expect(back.length === 1, "deleted view not re-created");
+    await must("notion_views", { action: "delete", view_id: back[0].id });
+  });
+  await step("notion_views: linked chart on a page at an exact spot, and a dashboard widget", async () => {
+    reportHost = (await must("notion_create_page", { parent: pageId, title: `${stamp} visuals`, markdown: "First\n\nLast" })).page_id;
+    createdPages.push(reportHost);
+    const first = await blockAt(reportHost, "First");
+    const r = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Per client", type: "chart", chart: { type: "donut", x: "Client" } }, on: { page: reportHost, after_block: first } });
+    const outline = (await tool("notion_get_blocks", { block: reportHost, max_depth: 0 })).text.split("\n");
+    expect(outline.length === 3 && outline[1].includes("child_database"), outline.join(" | "));
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = (await tool("notion_get_blocks", { block: reportHost, max_depth: 0 })).text.split("\n");
+    expect(after.length === 2, `linked view not removed: ${after.join(" | ")}`);
+    const dash = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Dashboard", type: "dashboard" } });
+    const w = await must("notion_views", { action: "create", database: tracker.db, view: { name: "Count", type: "chart", chart: { type: "number", y: "count" } }, on: { dashboard: dash.view_id } });
+    expect(w.view_id, JSON.stringify(w));
+    await must("notion_undo", { undo_id: w.undo_id });
+    await must("notion_undo", { undo_id: dash.undo_id });
+  });
+  let chartBlock = "";
+  await step("notion_create_chart: image from a database query and from inline data", async () => {
+    const r = await must("notion_create_chart", {
+      parent: reportHost, chart: { type: "bar", title: "Estimate by priority", value_format: "currency" },
+      source: { database: tracker.db, x: "Priority", y: "sum:Estimate" },
+    });
+    chartBlock = r.block_id;
+    expect(r.points === 3 && r.rows_scanned === 15, JSON.stringify(r));
+    const b = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(b.type === "image" && b.image.type === "file", JSON.stringify(b.image).slice(0, 200));
+    const inline = await must("notion_create_chart", {
+      parent: reportHost, position: "start", chart: { type: "line", title: "Burndown" },
+      data: [{ x: "2026-09-01", y: 15, series: "Open" }, { x: "2026-09-08", y: 11, series: "Open" }, { x: "2026-09-15", y: 6, series: "Open" }],
+    });
+    await must("notion_undo", { undo_id: inline.undo_id });
+    const bad = await tool("notion_create_chart", { parent: reportHost, chart: { type: "pie" }, data: [{ x: "a", y: -1 }] });
+    expect(bad.isError && /negative/.test(bad.text), bad.text);
+  });
+  await step("notion_create_chart: refresh in place from new data, then undo", async () => {
+    const before = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    await must("notion_bulk_update", { database: tracker.db, where: { Priority: "Low" }, set: { Estimate: 99999 }, dry_run: false });
+    const r = await must("notion_create_chart", { refresh_block_id: chartBlock });
+    const mid = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(mid.image.file.url.split("?")[0] !== before.image.file.url.split("?")[0], "image not replaced");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const after = (await call(() => n.blocks.retrieve({ block_id: chartBlock }))) as unknown as Json;
+    expect(after.image.file.url.split("?")[0] !== mid.image.file.url.split("?")[0], "image not restored");
+    await must("notion_undo", {});
+  });
+  await step("notion_build_report: summary, KPIs, live and image charts, overdue table, gantt; undo", async () => {
+    const r = await must("notion_build_report", {
+      database: tracker.db, parent: pageId, title: `${stamp} Tracker report`,
+      charts: [
+        { title: "Tasks by status", type: "column", x: "Status" },
+        { title: "Estimate by client and priority", type: "grouped_column", x: "Client", y: "sum:Estimate", series: "Priority" },
+      ],
+      table: { title: "Overdue", where: { Due: { before: "today" }, Status: { "!=": "Done" } }, properties: ["Task", "Status", "Due", "Client"], sort: { property: "Due" }, linked_view: true },
+      gantt: { title: "Upcoming work", start: "Due", section: "Client", where: { Status: { "!=": "Done" } } },
+    });
+    createdPages.push(r.page_id);
+    expect(r.sections.native_charts === 1 && r.sections.image_charts === 1 && r.sections.kpis === 4, JSON.stringify(r.sections));
+    const outline = (await tool("notion_get_blocks", { block: r.page_id, max_depth: 3, max_blocks: 400 })).text;
+    for (const want of ["(callout)", "(column_list)", "(child_database)", "(image)", "(table)", "(code)", "Overdue", "Upcoming work"]) expect(outline.includes(want), `report lacks ${want}`);
+    expect((outline.match(/\(child_database\)/g) ?? []).length === 2, "expected a live chart and a live table");
+    const md = (await tool("notion_get_page", { page: r.page_id, format: "markdown" })).text;
+    expect(md.includes("```mermaid") && md.includes("gantt"), "gantt missing");
+    await must("notion_undo", { undo_id: r.undo_id });
+    const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
+    expect(p.in_trash === true, "report not trashed");
+  });
+
   await step("notion_bulk_create: undo trashes every created row", async () => {
     await must("notion_undo", { undo_id: bulkUndo });
     const q = await must("notion_query", { database: tracker.db });

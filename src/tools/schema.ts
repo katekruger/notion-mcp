@@ -342,6 +342,9 @@ export function registerSafetyTools(server: McpServer): void {
     },
     safe(async ({ undo_id, force }) => {
       const r = await undo(undo_id, { force });
+      if (r.applied === 0 && r.failed.length) {
+        throw new Error(`Undo of ${r.entry.id} failed; nothing was reverted:\n- ${r.failed.join("\n- ")}`);
+      }
       return ok({
         undone: r.entry.id,
         summary: r.entry.summary,

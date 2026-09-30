@@ -5,6 +5,7 @@ import { forApi, fromInlineMarkdown, normalizeColor, plain, toRequest, type Rich
 import { fileRef, isUrl, reuploadUrl, uploadLocalFile } from "./files.js";
 import { resolveUserMentions } from "./schema.js";
 import { markdownToSpecs } from "./markdown.js";
+import { checkMermaid } from "./mermaid.js";
 
 export { markdownToSpecs };
 
@@ -283,6 +284,13 @@ function normalizeSpec(input: BlockSpec, where: string): BlockSpec {
     // Surfaces bad inline syntax (unknown colors, malformed mentions) and the 100-segment cap now.
     if (t === "table_row") spec.cells?.forEach((c) => forApi(c));
     else forApi(richFromSpec(spec));
+  }
+  if (t === "code" && normalizeLanguage(spec.language) === "mermaid" && !spec.rich_text) {
+    try {
+      checkMermaid(spec.text ?? "");
+    } catch (e) {
+      fail((e as Error).message);
+    }
   }
   if (spec.caption) forApi(fromInlineMarkdown(spec.caption));
   if (spec.children) spec.children = spec.children.map((c, i) => normalizeSpec(c, `${where}.children[${i}]`));

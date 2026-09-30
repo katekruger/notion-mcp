@@ -1,6 +1,6 @@
 {
   "name": "notion-plus-mcp-server",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local Notion MCP server with surgical block edits, schema-validated writes, bulk updates, and undo.",
   "type": "module",
   "main": "dist/index.js",
@@ -27,6 +27,9 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
     "@notionhq/client": "^5.26.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "vega": "^6.4.0",
+    "vega-lite": "^6.4.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {

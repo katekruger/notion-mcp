@@ -752,6 +752,8 @@ async function main(): Promise<void> {
     await call(() => n.dataSources.update({ data_source_id: ds, properties: { Parent: { relation: { data_source_id: ds, type: "dual_property", dual_property: { synced_property_name: "Children" } } } } } as never));
     const a = await call(() => n.pages.create({ parent: { data_source_id: ds }, properties: { Task: { title: [{ text: { content: "A" } }] }, Pts: { number: 3 } } } as never));
     await call(() => n.pages.create({ parent: { data_source_id: ds }, properties: { Task: { title: [{ text: { content: "B" } }] }, Parent: { relation: [{ id: a.id }] } } } as never));
+    // Row A has its own sub-page, which must be copied under the copied row (not silently dropped).
+    await call(() => n.pages.create({ parent: { page_id: a.id }, properties: { title: { title: [{ text: { content: "A notes" } }] } } } as never));
     await call(() => n.blocks.children.append({ block_id: holder, children: [{ paragraph: { rich_text: [{ text: { content: "below" } }] } }] } as never));
     const dry = await must("notion_duplicate_page", { page: holder, dry_run: true });
     expect(dry.databases?.[0]?.data_sources?.[0]?.rows === 2, JSON.stringify(dry));
@@ -766,6 +768,8 @@ async function main(): Promise<void> {
     const b = rows.results.find((x: Json) => x.properties.Task.title[0]?.plain_text === "B");
     const copiedA = rows.results.find((x: Json) => x.properties.Task.title[0]?.plain_text === "A");
     expect(b?.properties.Parent.relation[0]?.id === copiedA?.id, "relation not re-pointed at the copied row");
+    const aKids = (await call(() => n.blocks.children.list({ block_id: copiedA.id }))) as unknown as Json;
+    expect(aKids.results.some((k: Json) => k.type === "child_page" && k.child_page.title === "A notes"), "row sub-page not copied");
     await must("notion_undo", { undo_id: r.undo_id });
   });
   await step("notion_update_page: title, icon, cover, lock, move; undo", async () => {

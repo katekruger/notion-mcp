@@ -2,7 +2,7 @@
 // The API has no database duplicate, so this rebuilds it. Relations inside the copied database point at the
 // copied rows; relations to other databases keep pointing there but become one-way, so nothing outside is changed.
 import type { DataSourceObjectResponse, DatabaseObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, mapLimited, notion, read } from "./notion.js";
+import { call, isNotFound, mapLimited, notion, read } from "./notion.js";
 import { configToRequest } from "./dbschema.js";
 import { queryAll } from "./query.js";
 import { restoreValue, withFullProperties } from "./schema.js";
@@ -32,13 +32,18 @@ function richTextRequest(rt: RichText): Record<string, unknown>[] {
   return rt.map((t) => ({ type: "text", text: { content: t.plain_text, ...(t.href ? { link: { url: t.href } } : {}) }, annotations: t.annotations }));
 }
 
-/** The database behind a child_database block, or null for a linked view (which the API can't read or recreate). */
+/**
+ * The database behind a child_database block, or null when the API can't read it: a linked view, or a source
+ * database not shared with the integration (Notion answers both with not-found). Every other failure (auth,
+ * rate limit, timeout, server error) is thrown, so a copy never reports a database as skipped when it just failed.
+ */
 export async function readDatabase(blockId: string): Promise<DatabaseObjectResponse | null> {
   try {
     const db = await read(() => notion().databases.retrieve({ database_id: blockId }));
     return "data_sources" in db ? (db as DatabaseObjectResponse) : null;
-  } catch {
-    return null;
+  } catch (e) {
+    if (isNotFound(e)) return null;
+    throw e;
   }
 }
 
@@ -50,11 +55,11 @@ async function readSources(db: DatabaseObjectResponse): Promise<DataSourceObject
   return out;
 }
 
-export async function planDatabaseCopy(db: DatabaseObjectResponse, withRows: boolean): Promise<DatabaseCopyPlan> {
+export async function planDatabaseCopy(db: DatabaseObjectResponse, withRows: boolean, maxRows = MAX_COPY_ROWS): Promise<DatabaseCopyPlan> {
   const sources = await readSources(db);
   const data_sources = [];
   for (const ds of sources) {
-    const q = withRows ? await queryAll(ds.id, { max: MAX_COPY_ROWS }) : { pages: [], more: false };
+    const q = withRows ? await queryAll(ds.id, { max: Math.min(maxRows, MAX_COPY_ROWS) }) : { pages: [], more: false };
     data_sources.push({ id: ds.id, name: plain(ds.title) || "(untitled)", rows: q.pages.length, more: q.more });
   }
   return { id: db.id, title: plain(db.title) || "(untitled)", data_sources };
@@ -134,8 +139,9 @@ const FULL_TYPES = new Set(["title", "rich_text", "relation", "people"]);
 export async function copyDatabase(
   db: DatabaseObjectResponse,
   parentPageId: string,
-  opts: { withRows: boolean; copyContent: (fromPageId: string, toPageId: string) => Promise<void> }
+  opts: { withRows: boolean; maxRows?: number; copyContent?: (fromPageId: string, toPageId: string) => Promise<void> }
 ): Promise<DatabaseCopyResult> {
+  const maxRows = Math.min(opts.maxRows ?? MAX_COPY_ROWS, MAX_COPY_ROWS);
   const notes: string[] = [];
   const sources = await readSources(db);
   const copiedIds = new Set(sources.map((s) => s.id));
@@ -181,8 +187,8 @@ export async function copyDatabase(
     const rowMap = new Map<string, string>();
     const pending: { newId: string; relations: Record<string, { id: string }[]> }[] = [];
     for (const p of plans) {
-      const q = await queryAll(p.ds.id, { max: MAX_COPY_ROWS });
-      if (q.more) notes.push(`"${plain(p.ds.title) || title}" has more than ${MAX_COPY_ROWS} rows; the first ${MAX_COPY_ROWS} were copied.`);
+      const q = await queryAll(p.ds.id, { max: maxRows });
+      if (q.more) notes.push(`"${plain(p.ds.title) || title}" has more than ${maxRows} rows; the first ${maxRows} were copied.`);
       const writable = new Set([...Object.keys(p.first), ...Object.keys(p.later)]);
       const internal = new Set(Object.keys(p.later).filter((k) => p.later[k].type === "relation"));
       await mapLimited(q.pages, async (row: PageObjectResponse) => {
@@ -205,7 +211,7 @@ export async function copyDatabase(
         );
         rowMap.set(row.id, page.id);
         if (Object.values(relations).some((r) => r.length)) pending.push({ newId: page.id, relations });
-        await opts.copyContent(row.id, page.id);
+        if (opts.copyContent) await opts.copyContent(row.id, page.id);
       });
       rows += q.pages.length;
     }

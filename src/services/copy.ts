@@ -118,6 +118,8 @@ export function parentOf(page: PageObjectResponse): PageParent | null {
 export interface DuplicateResult {
   page_id: string;
   url?: string;
+  /** "partial" when anything was skipped (listed in `skipped`); failures throw instead. */
+  status: "complete" | "partial";
   blocks: number;
   subpages: number;
   databases: DatabaseCopyResult[];
@@ -134,7 +136,7 @@ export interface DuplicateResult {
 export async function duplicatePage(
   source: PageObjectResponse,
   parent: PageParent,
-  opts: { title?: string; includeSubpages: boolean; databases?: DatabaseMode; depth?: number },
+  opts: { title?: string; includeSubpages: boolean; databases?: DatabaseMode; depth?: number; maxRows?: number; copyRowContent?: boolean },
   undo: UndoOp[]
 ): Promise<DuplicateResult> {
   const notes: string[] = [];
@@ -164,55 +166,113 @@ export async function duplicatePage(
   const content = await pageSegments(source.id);
   const created = await call(() => notion().pages.create(body as never));
   undo.push({ kind: "page_trash", page_id: created.id, in_trash: true });
-  const depth = opts.depth ?? 0;
-  const databasesMode = opts.databases ?? "rows";
-  let subpages = 0;
-  const databases: DatabaseCopyResult[] = [];
-  const skipped = [...content.skipped];
+  const c = await writeContent(source.id, created.id, content, { ...opts, databases: opts.databases ?? "rows", depth: opts.depth ?? 0 });
+  notes.push(...c.notes.filter((n) => !notes.includes(n)));
+  return {
+    page_id: created.id,
+    url: "url" in created ? created.url : undefined,
+    status: c.skipped.length ? "partial" : "complete",
+    blocks: c.blocks,
+    subpages: c.subpages,
+    databases: c.databases,
+    skipped: c.skipped,
+    notes,
+  };
+}
+
+interface ContentOptions {
+  includeSubpages: boolean;
+  databases: DatabaseMode;
+  depth: number;
+  maxRows?: number;
+  /** Copy each database row's own content (blocks, sub-pages, databases). Defaults to true. */
+  copyRowContent?: boolean;
+}
+
+interface ContentResult {
+  blocks: number;
+  subpages: number;
+  databases: DatabaseCopyResult[];
+  skipped: Skipped[];
+  notes: string[];
+}
+
+/** Deepest level of sub-pages and row pages copied; deeper ones are reported. */
+export const MAX_COPY_DEPTH = 5;
+
+/**
+ * Write a page's content (already split into segments) onto another page, recreating sub-pages and databases in
+ * place. Used for duplicated pages and for every copied database row, so rows keep their sub-pages, nested
+ * databases, and a full list of what couldn't be copied.
+ */
+async function writeContent(
+  sourceId: string,
+  targetId: string,
+  content: Awaited<ReturnType<typeof pageSegments>>,
+  opts: ContentOptions
+): Promise<ContentResult> {
+  const r: ContentResult = { blocks: content.blockCount, subpages: 0, databases: [], skipped: [...content.skipped], notes: [] };
+  const addNotes = (ns: string[]) => r.notes.push(...ns.filter((n) => !r.notes.includes(n)));
   const copySub = async (sp: { id: string; title: string }) => {
-    if (depth >= 5) {
-      skipped.push({ id: sp.id, type: "child_page", reason: "sub-page deeper than 5 levels" });
+    if (opts.depth >= MAX_COPY_DEPTH) {
+      r.skipped.push({ id: sp.id, type: "child_page", reason: `sub-page deeper than ${MAX_COPY_DEPTH} levels` });
       return;
     }
     const child = await getPage(sp.id);
     // Trashing the new top page also trashes these, so their own undo entries aren't needed.
-    const r = await duplicatePage(child, { page_id: created.id }, { title: sp.title, includeSubpages: true, databases: databasesMode, depth: depth + 1 }, []);
-    subpages += 1 + r.subpages;
-    databases.push(...r.databases);
-    skipped.push(...r.skipped);
-    notes.push(...r.notes.filter((n) => !notes.includes(n)));
+    const d = await duplicatePage(child, { page_id: targetId }, { ...opts, title: sp.title, depth: opts.depth + 1 }, []);
+    r.subpages += 1 + d.subpages;
+    r.databases.push(...d.databases);
+    r.skipped.push(...d.skipped);
+    addNotes(d.notes);
   };
   for (const seg of content.segments) {
-    if (seg.kind === "blocks") await appendSpecs(created.id, seg.specs);
+    if (seg.kind === "blocks") await appendSpecs(targetId, seg.specs);
     else if (seg.kind === "page") {
       if (opts.includeSubpages) await copySub(seg);
-      else skipped.push({ id: seg.id, type: "child_page", reason: "sub-page (include_subpages is off)" });
-    } else if (databasesMode === "none") {
-      skipped.push({ id: seg.id, type: "child_database", reason: "database (databases is \"none\")" });
+      else r.skipped.push({ id: seg.id, type: "child_page", reason: "sub-page (include_subpages is off)" });
+    } else if (opts.databases === "none") {
+      r.skipped.push({ id: seg.id, type: "child_database", reason: 'database (databases is "none")' });
     } else {
       const db = await readDatabase(seg.id);
-      if (!db || (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") !== source.id.replace(/-/g, "")) {
-        skipped.push({ id: seg.id, type: "child_database", reason: "linked database view (the API can't read or recreate it; link the source again in Notion)" });
+      if (!db || (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") !== sourceId.replace(/-/g, "")) {
+        r.skipped.push({ id: seg.id, type: "child_database", reason: LINKED_VIEW_REASON });
         continue;
       }
-      const r = await copyDatabase(db, created.id, {
-        withRows: databasesMode === "rows",
-        copyContent: async (from, to) => {
-          const c = await childrenAsSpecs(from);
-          if (c.specs.length) await appendSpecs(to, c.specs);
-        },
+      const copyRows = opts.copyRowContent ?? true;
+      const d = await copyDatabase(db, targetId, {
+        withRows: opts.databases === "rows",
+        maxRows: opts.maxRows,
+        copyContent: copyRows
+          ? async (from, to) => {
+              if (opts.depth >= MAX_COPY_DEPTH) {
+                r.skipped.push({ id: from, type: "database_row", reason: `row content deeper than ${MAX_COPY_DEPTH} levels` });
+                return;
+              }
+              const rc = await writeContent(from, to, await pageSegments(from), { ...opts, depth: opts.depth + 1 });
+              r.blocks += rc.blocks;
+              r.subpages += rc.subpages;
+              r.databases.push(...rc.databases);
+              r.skipped.push(...rc.skipped);
+              addNotes(rc.notes);
+            }
+          : undefined,
       });
-      databases.push(r);
+      if (!copyRows && opts.databases === "rows") d.notes.push(`"${d.title}": row content wasn't copied (copy_row_content is off).`);
+      r.databases.push(d);
     }
   }
   if (content.nestedPages.length && opts.includeSubpages) {
     for (const sp of content.nestedPages) await copySub(sp);
-    notes.push("Sub-pages inside toggles or columns were copied to the end of the new page (the API only creates pages directly on a page).");
+    addNotes(["Sub-pages inside toggles or columns were copied to the end of the new page (the API only creates pages directly on a page)."]);
   } else if (content.nestedPages.length) {
-    skipped.push(...content.nestedPages.map((p) => ({ id: p.id, type: "child_page", reason: "sub-page (include_subpages is off)" })));
+    r.skipped.push(...content.nestedPages.map((p) => ({ id: p.id, type: "child_page", reason: "sub-page (include_subpages is off)" })));
   }
-  return { page_id: created.id, url: "url" in created ? created.url : undefined, blocks: content.blockCount, subpages, databases, skipped, notes };
+  return r;
 }
+
+export const LINKED_VIEW_REASON =
+  "linked database view, or a database not shared with the integration (the API can't read it; share the source or link it again in Notion)";
 
 export type DatabaseMode = "rows" | "schema" | "none";
 

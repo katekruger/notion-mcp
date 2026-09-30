@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.8.1
+
+### Fixed
+- `notion_duplicate_page` no longer reports a database as a "linked view" when reading it actually failed. Permission, auth, rate-limit, timeout, and server errors now stop the copy with the real error; only not-found (a linked view, or a source not shared with the integration) is skipped.
+- Database rows are copied with all their content: sub-pages and databases inside a row are recreated under the copied row, and anything a row can't carry is listed in `skipped`. Previously these were dropped without a warning.
+
+### Added
+- Duplicate results carry `status`: `complete`, or `partial` when anything was skipped.
+- `notion_duplicate_page` options `max_rows` (rows per data source) and `copy_row_content` (turn off for large databases where only values matter).
+- The dry run includes an `estimate` of rows, API calls, and minutes.
+
 ## 0.8.0
 
 ### Added

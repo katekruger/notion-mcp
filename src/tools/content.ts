@@ -7,6 +7,7 @@ import {
   copyFileObject,
   describeBlock,
   duplicatePage,
+  LINKED_VIEW_REASON,
   pageSegments,
   getBlock,
   getPage,
@@ -117,7 +118,8 @@ export function registerContentTools(server: McpServer): void {
         "Copy a page with its icon, cover, content (every block type the API can create, with formatting), and, when it stays in " +
         "the same database, all writable properties. Sub-pages and databases on the page are copied in place; databases get their " +
         "schema and (by default) their rows with content, with relations inside the copy pointing at the copied rows. Views, " +
-        "linked database views, and read-only blocks are listed as skipped. Uploaded files and images are re-uploaded so the " +
+        "linked database views, and read-only blocks are listed as skipped, and the result's status is \"partial\" when anything was. " +
+        "Database rows keep their own content, sub-pages, and databases. Uploaded files and images are re-uploaded so the " +
         "copy doesn't depend on expiring links. dry_run shows what would be copied. notion_undo trashes the copy.",
       inputSchema: {
         page: z.string().describe("Page to copy."),
@@ -129,11 +131,16 @@ export function registerContentTools(server: McpServer): void {
           .enum(["rows", "schema", "none"])
           .default("rows")
           .describe(`Databases on the page: copy schema and rows (up to ${MAX_COPY_ROWS} per data source), schema only, or skip them.`),
+        max_rows: z.number().int().min(1).max(MAX_COPY_ROWS).optional().describe(`Rows copied per data source (default and cap ${MAX_COPY_ROWS}).`),
+        copy_row_content: z
+          .boolean()
+          .default(true)
+          .describe("Copy each row's own content (blocks, sub-pages, databases). Turn off for large databases where only values matter."),
         dry_run: z.boolean().default(false),
       },
       annotations: { ...WRITE, idempotentHint: false },
     },
-    safe(async ({ page, to, data_source_name, title, include_subpages, databases, dry_run }) => {
+    safe(async ({ page, to, data_source_name, title, include_subpages, databases, max_rows, copy_row_content, dry_run }) => {
       const source = await getPage(normalizeId(page));
       const dest = to ? await destinationParent(to, data_source_name) : null;
       const parent = dest?.parent ?? parentOf(source);
@@ -146,11 +153,19 @@ export function registerContentTools(server: McpServer): void {
           for (const seg of content.segments) {
             if (seg.kind !== "database") continue;
             const db = await readDatabase(seg.id);
-            if (db && (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") === source.id.replace(/-/g, "")) dbs.push(await planDatabaseCopy(db, databases === "rows"));
-            else skipped.push({ id: seg.id, type: "child_database", reason: "linked database view (the API can't read or recreate it)" });
+            if (db && (db.parent as { page_id?: string }).page_id?.replace(/-/g, "") === source.id.replace(/-/g, "")) dbs.push(await planDatabaseCopy(db, databases === "rows", max_rows));
+            else skipped.push({ id: seg.id, type: "child_database", reason: LINKED_VIEW_REASON });
           }
         }
         const pages = content.segments.filter((s) => s.kind === "page").map((s) => (s as { title: string }).title);
+        const rows = dbs.reduce((n, d) => n + d.data_sources.reduce((m, ds) => m + ds.rows, 0), 0);
+        // Rough request count: page create, ~1 append per 100 blocks, and per row a read, a create, a relation
+        // update, and (with row content) a content read and append. Sub-pages and row sub-pages add more.
+        const estimate = {
+          rows,
+          api_calls_at_least: 1 + Math.ceil(content.blockCount / 100) + dbs.length * 3 + rows * (copy_row_content ? 5 : 3),
+          minutes_at_least: Math.ceil(((1 + Math.ceil(content.blockCount / 100) + rows * (copy_row_content ? 5 : 3)) * 0.34) / 60),
+        };
         return ok({
           dry_run: true,
           title: title ?? `${pageTitle(source)} (copy)`,
@@ -158,13 +173,14 @@ export function registerContentTools(server: McpServer): void {
           blocks: content.blockCount,
           subpages: include_subpages ? [...pages, ...content.nestedPages.map((p) => p.title)] : [],
           databases: dbs,
+          estimate,
           skipped,
           next_step: "Call again with dry_run=false to copy.",
         });
       }
       const undo: UndoOp[] = [];
       try {
-        const r = await duplicatePage(source, parent, { title, includeSubpages: include_subpages, databases }, undo);
+        const r = await duplicatePage(source, parent, { title, includeSubpages: include_subpages, databases, maxRows: max_rows, copyRowContent: copy_row_content }, undo);
         const journalId = await record("notion_duplicate_page", `Duplicated "${pageTitle(source)}" as ${r.page_id}`, undo);
         return ok({ ...r, undo_id: journalId });
       } catch (e) {

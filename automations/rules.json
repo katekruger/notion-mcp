@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "timezone": "UTC",
+  "timezone": "America/New_York",
   "rules": [
     {
       "id": "acceptance-at-risk",

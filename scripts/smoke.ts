@@ -28,8 +28,9 @@ const { registerAutomationTools } = await import("../src/tools/automations.js");
 const { registerContentTools } = await import("../src/tools/content.js");
 const { registerDatabaseTools } = await import("../src/tools/database.js");
 const { registerVisualTools } = await import("../src/tools/visuals.js");
+const { registerDoctorTools } = await import("../src/tools/doctor.js");
 const { runAll } = await import("../src/services/automations.js");
-const { journalWrites } = await import("../src/tools/util.js");
+const { journalWrites, unwrap } = await import("../src/tools/util.js");
 
 type Json = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 type Handler = (args: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>;
@@ -40,7 +41,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools, registerDoctorTools]) {
   register(journalWrites(registry as never) as never);
 }
 
@@ -49,14 +50,9 @@ async function tool(name: string, args: Record<string, unknown>): Promise<{ text
   const t = tools.get(name);
   if (!t) throw new Error(`No tool ${name}`);
   const r = await t.handler(t.schema.parse(args));
-  const text = r.content[0]?.text ?? "";
-  let json: Json = {};
-  try {
-    json = JSON.parse(text);
-  } catch {
-    // Some tools return prose.
-  }
-  return { text, json, isError: Boolean(r.isError) };
+  // Results are envelopes; read them back in the shape each tool built (undo_id, notes, … in place).
+  const { text, json } = unwrap(r);
+  return { text, json: json as Json, isError: Boolean(r.isError) };
 }
 
 /** Like tool(), but a tool error fails the step. */
@@ -1161,7 +1157,7 @@ async function main(): Promise<void> {
     const del = await must("notion_automation", { action: "delete", rule_id: "weekly-report" });
     expect(del.removed_rule.id === "weekly-report", JSON.stringify(del));
     const history = await tool("notion_automation", { action: "history" });
-    expect(!history.isError && Array.isArray(history.json) && history.json.length >= 4, history.text.slice(0, 200));
+    expect(!history.isError && Array.isArray(history.json.runs) && history.json.runs.length >= 4, history.text.slice(0, 200));
     for (const id of ["at-risk", "stamp-completed"]) await must("notion_automation", { action: "delete", rule_id: id });
   });
 
@@ -1184,10 +1180,20 @@ async function main(): Promise<void> {
     const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
     expect(p.in_trash === true, "sub-page not trashed");
   });
+  await step("notion_doctor: every check passes against the test workspace", async () => {
+    const r = await tool("notion_doctor", {});
+    const checks = (r.json.checks ?? []) as Json[];
+    const failed = checks.filter((c) => c.status === "fail");
+    expect(!r.isError && checks.length >= 8 && failed.length === 0, JSON.stringify(failed));
+  });
+  await step("notion_capabilities: reports the API version and read access", async () => {
+    const r = await must("notion_capabilities", {});
+    expect(typeof r.api_version === "string" && r.integration?.read_content === "yes", JSON.stringify(r).slice(0, 300));
+  });
   await step("notion_history", async () => {
     const r = await tool("notion_history", { limit: 50 });
-    expect(!r.isError && Array.isArray(r.json) && r.json.length > 0, r.text.slice(0, 200));
-    return `${r.json.length} entries`;
+    expect(!r.isError && Array.isArray(r.json.entries) && r.json.entries.length > 0, r.text.slice(0, 200));
+    return `${r.json.entries.length} entries`;
   });
 }
 

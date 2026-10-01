@@ -5,3 +5,4 @@ dist/
 .notion-plus/
 bundles/
 acceptance-report.md
+coverage/

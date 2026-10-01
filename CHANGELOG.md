@@ -2,6 +2,63 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.11.0
+
+Safe to operate and verify (audit batch 4: P1-07, P2-05 to P2-09, P2-13, P2-14, P2-17, P3-01 to P3-06).
+
+### Breaking
+- **Every tool returns the same JSON shape:** `{status, summary, data, warnings?, undo?, pagination?, next_actions?}`.
+  - A tool's own result moves into `data`.
+  - `undo_id` becomes `undo: {id, coverage}`.
+  - `notes` and `note` become `warnings`.
+  - `next_cursor` becomes `pagination`.
+  - `next_step` becomes `next_actions`.
+  - Errors are `{status: "error", summary, error}`.
+  - Scripts can use `unwrap()` from `src/tools/util.ts` to read results in the old shape.
+- **`notion_history` returns `{entries, next_cursor?}`** instead of a bare list. Entries carry `id` (was `undo_id`), and their status can now be `partly undoable`, `interrupted`, `in progress`, or `failed`.
+- **Node 22 or later is required.** Node 20 reached end of life in April 2026.
+
+### Added
+- **`notion_doctor`** checks the setup and says how to fix what isn't working. It covers:
+  - settings, the token, and the integration's capabilities;
+  - whether any pages are shared with it;
+  - the local state folder and its files, and the upload folders;
+  - the chart renderer;
+  - automation rules and unfinished runs.
+- **`notion_capabilities`** reports what the server can do with this integration (probed with read-only calls), plus the API version and the limits.
+- **Settings are checked in one place** (`src/config.ts`).
+  - A bad value, such as a timeout that isn't a number, an API version that isn't a date, a misspelled time zone, or an unknown log mode, is reported with every problem listed.
+  - The server still starts, so the message reaches the conversation through the tools and `notion_doctor`.
+  - The startup log includes a redacted settings summary.
+- **Undo coverage** on every write (`full`, `partial`, or `none`), and an "Undo coverage" table in the README.
+- **`notion_views` `list`** pages with `limit` and `cursor`, and reads view details a few at a time.
+- **The server's instructions, and every result carrying page, block, comment, or row text, say that Notion content is untrusted data,** not instructions.
+- `SUPPORT.md`: supported versions, hosts, platforms, and the deprecation policy.
+
+### Changed
+- **Downloads have limits.** Re-uploaded files and chart backups only fetch HTTPS URLs, refuse private, local, and link-local addresses (checked at the address actually connected to, at every redirect), follow at most 5 redirects, cap the size (50 MB, 20 MB for chart backups), and time out.
+- **Large results stay valid JSON.** They shrink their longest list and report how many items were left out. They are never cut mid-text.
+- **Tool annotations are explicit.**
+  - Writes default to not idempotent.
+  - `notion_update_properties`, `notion_bulk_update`, `notion_patch_block`, and `notion_update_page` are marked idempotent.
+  - `notion_views` is marked destructive, because it can delete views.
+- **Fewer type casts.** The most common Notion calls go through typed adapters, cutting `as never` casts from 55 to 33.
+- **CI:**
+  - runs on Node 22 and 24;
+  - checks that versions agree;
+  - fails on high-severity runtime advisories;
+  - enforces coverage thresholds.
+  - Dependency review runs on pull requests. Dependabot proposes npm and Actions updates weekly. Every Action is pinned to a commit.
+- **Release:**
+  - runs the full check;
+  - install-tests each platform's bundle (unpack, start, list every tool, render a chart);
+  - publishes `sha256sums.txt`, a CycloneDX SBOM, and build provenance.
+- **Live tests:** `live.yml` runs the live smoke and acceptance suites nightly and on tags once the `NOTION_TOKEN` and `NOTION_TEST_PAGE` secrets exist. Until then it passes with a notice.
+- **Vitest 5** fixes the moderate advisory. Property tests (fast-check) cover CSV round-trips, markdown input, schedule occurrences, and state-file parsing.
+
+### Known
+- `npm audit` still reports `tmp` (high) through `@anthropic-ai/mcpb`'s interactive prompts. It's a dev-only tool used to build bundles, with no fix upstream yet. Runtime dependencies have no advisories.
+
 ## 0.10.0
 
 Automation runs that recover (audit batch 3: P1-01, P1-02, P1-05, P1-06, P1-08, P2-11, P2-12, P2-15).

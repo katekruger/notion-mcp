@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, read, isNotFound, mapLimited, normalizeId, notion } from "../services/notion.js";
+import { call, isNotFound, mapLimited, normalizeId, notion, read, updatePage } from "../services/notion.js";
 import { appendSpecs, markdownToSpecs, normalizeSpecs } from "../services/blocks.js";
 import { fileRef, isUrl } from "../services/files.js";
 import { blockSpecSchema } from "../services/specSchema.js";
@@ -20,7 +20,7 @@ import {
 import { record, type UndoOp } from "../services/journal.js";
 import { beforeAfter, getFullPage, preparePayload, snapshot } from "../services/writes.js";
 import { queryAll } from "../services/query.js";
-import { DESTRUCTIVE, ok, safe, WRITE } from "./util.js";
+import { DESTRUCTIVE, ok, safe, WRITE, IDEMPOTENT_WRITE } from "./util.js";
 
 /** Page icon from an emoji, image URL, or local image path. */
 export async function iconRef(source: string): Promise<Record<string, unknown>> {
@@ -70,7 +70,7 @@ export function registerPageTools(server: McpServer): void {
         expected_last_edited_time: z.string().optional().describe("From a prior read; refuses to write if the page changed since."),
         dry_run: z.boolean().default(false),
       },
-      annotations: WRITE,
+      annotations: IDEMPOTENT_WRITE,
     },
     safe(async ({ page, properties, allow_new_options, expected_last_edited_time, dry_run }) => {
       const p0 = await getFullPage(normalizeId(page));
@@ -85,7 +85,7 @@ export function registerPageTools(server: McpServer): void {
       if (dry_run) return ok({ dry_run: true, page_id: p.id, before, will_set: payload, notes });
 
       const undoOp = snapshot(p, names);
-      const updated = await call(() => notion().pages.update({ page_id: p.id, properties: payload } as never));
+      const updated = await call(() => updatePage({ page_id: p.id, properties: payload }));
       if (notes.some((n) => n.startsWith("creates new option"))) invalidateSchema(ds.id);
       const after = isFullPage(updated) ? beforeAfter(await withFullProperties(updated, names), names) : undefined;
       const journalId = await record("notion_update_properties", `Updated ${names.join(", ")} on ${p.id}`, [undoOp]);
@@ -115,7 +115,7 @@ export function registerPageTools(server: McpServer): void {
         cover: z.string().optional().describe("Image URL or local image path."),
         template: z.string().optional().describe('Database parents: "default", or a template name or id from notion_list_templates.'),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ parent, data_source_name, title, properties, allow_new_options, markdown, blocks, icon, icon_emoji, cover, template }) => {
       const specs = normalizeSpecs([...(markdown ? markdownToSpecs(markdown) : []), ...(blocks ?? [])]);
@@ -199,7 +199,7 @@ export function registerPageTools(server: McpServer): void {
         limit: z.number().int().min(1).max(MAX_BULK_UPDATE).default(100).describe("Safety cap on rows touched (where/filter mode)."),
         dry_run: z.boolean().default(true),
       },
-      annotations: { ...WRITE, destructiveHint: true },
+      annotations: { ...IDEMPOTENT_WRITE, destructiveHint: true },
     },
     safe(async ({ database, data_source_name, where, filter, set, rows, allow_new_options, limit, dry_run }) => {
       interface Target {
@@ -263,7 +263,7 @@ export function registerPageTools(server: McpServer): void {
       await mapLimited(targets, async (t) => {
         try {
           const op = snapshot(await withFullProperties(t.page, t.names), t.names);
-          await call(() => notion().pages.update({ page_id: t.page.id, properties: t.payload } as never));
+          await call(() => updatePage({ page_id: t.page.id, properties: t.payload }));
           undoOps.push(op);
         } catch (e) {
           failed.push({ id: t.page.id, error: (e as Error).message });
@@ -293,7 +293,7 @@ export function registerPageTools(server: McpServer): void {
     },
     safe(async ({ page }) => {
       const id = normalizeId(page);
-      await call(() => notion().pages.update({ page_id: id, in_trash: true } as never));
+      await call(() => updatePage({ page_id: id, in_trash: true }));
       const journalId = await record("notion_trash_page", `Trashed page ${id}`, [{ kind: "page_trash", page_id: id, in_trash: false }]);
       return ok({ trashed: id, undo_id: journalId });
     })

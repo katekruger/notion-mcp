@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { DataSourceObjectResponse } from "@notionhq/client";
-import { call, normalizeId, notion } from "../services/notion.js";
+import { call, normalizeId, notion, updateDataSource } from "../services/notion.js";
 import { dataSourceTitle, describeSchema, invalidateSchema, resolveDataSource, resolvePropertyName, restoreValue } from "../services/schema.js";
 import { history, record, undo, type UndoOp } from "../services/journal.js";
 import {
@@ -78,7 +78,7 @@ export function registerSchemaTools(server: McpServer): void {
         cover: z.string().optional(),
         inline: z.boolean().default(false).describe("Show the database inline on the parent page instead of as a sub-page."),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ parent, title, description, properties, icon, cover, inline }) => {
       const notes: string[] = [];
@@ -130,12 +130,12 @@ export function registerSchemaTools(server: McpServer): void {
           const self = await resolveDataSource(dsId);
           const extra: Record<string, unknown> = {};
           for (const spec of second.filter((s) => s.type === "relation")) extra[spec.name] = await propertyRequest(spec, self, dsId);
-          if (Object.keys(extra).length) await call(() => notion().dataSources.update({ data_source_id: dsId, properties: extra } as never));
+          if (Object.keys(extra).length) await call(() => updateDataSource({ data_source_id: dsId, properties: extra }));
           invalidateSchema(dsId);
           const rollups: Record<string, unknown> = {};
           const withRelations = await resolveDataSource(dsId);
           for (const spec of second.filter((s) => s.type === "rollup")) rollups[spec.name] = await propertyRequest(spec, withRelations, dsId);
-          if (Object.keys(rollups).length) await call(() => notion().dataSources.update({ data_source_id: dsId, properties: rollups } as never));
+          if (Object.keys(rollups).length) await call(() => updateDataSource({ data_source_id: dsId, properties: rollups }));
         } catch (e) {
           throw new Error(`Database ${db.id} was created, but adding ${second.map((s) => `"${s.name}"`).join(", ")} failed: ${(e as Error).message} undo_id ${journalId} trashes it.`);
         }
@@ -187,8 +187,7 @@ export function registerSchemaTools(server: McpServer): void {
     },
     safe(async (a) => {
       const ds = await resolveDataSource(a.database, a.data_source_name);
-      const n = notion();
-      const update = (properties: Record<string, unknown>) => call(() => n.dataSources.update({ data_source_id: ds.id, properties } as never));
+      const update = (properties: Record<string, unknown>) => call(() => updateDataSource({ data_source_id: ds.id, properties }));
       const title = dataSourceTitle(ds);
 
       if (a.action === "add") {
@@ -361,22 +360,42 @@ export function registerSafetyTools(server: McpServer): void {
     "notion_history",
     {
       title: "Change History",
-      description: "List recent changes made through this server, newest first, with their undo ids.",
-      inputSchema: { limit: z.number().int().min(1).max(100).default(20) },
+      description:
+        "List changes made through this server, newest first, with their undo ids and how much of each undo can revert. " +
+        "Entries marked interrupted or failed stopped part-way; their input is included so the objects can be checked.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(100).default(20),
+        cursor: z.number().int().min(0).optional().describe("next_cursor from the previous page."),
+      },
       annotations: READ,
     },
-    safe(async ({ limit }) => {
-      const entries = await history(limit);
-      if (entries.length === 0) return ok("No changes recorded yet.");
-      return ok(
-        entries.map((e) => ({
-          undo_id: e.id,
-          at: e.at,
-          tool: e.tool,
-          summary: e.summary,
-          status: e.undone ? "undone" : e.undo.length ? "undoable" : "not undoable",
-        }))
-      );
+    safe(async ({ limit, cursor }) => {
+      const start = cursor ?? 0;
+      const page = await history(limit + 1, start);
+      if (page.length === 0) return ok(start ? "No more changes." : "No changes recorded yet.");
+      const entries = page.slice(0, limit).map((e) => ({
+        id: e.id,
+        at: e.at,
+        tool: e.tool,
+        summary: e.summary,
+        status: e.interrupted
+          ? "interrupted"
+          : e.status === "pending"
+            ? "in progress"
+            : e.status === "failed"
+              ? "failed"
+              : e.undone
+                ? "undone"
+                : e.undo.length
+                  ? e.not_undoable
+                    ? "partly undoable"
+                    : "undoable"
+                  : "not undoable",
+        ...(e.not_undoable ? { not_undoable: e.not_undoable } : {}),
+        ...(e.args && (e.interrupted || e.status) ? { input: e.args } : {}),
+        ...(e.error ? { error: e.error } : {}),
+      }));
+      return ok({ entries, ...(page.length > limit ? { next_cursor: start + limit } : {}) }, { summary: `${entries.length} change(s), newest first.` });
     })
   );
 }

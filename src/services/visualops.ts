@@ -6,7 +6,7 @@ import path from "node:path";
 import { z } from "zod";
 import { isFullBlock } from "@notionhq/client";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, normalizeId, notion, read } from "./notion.js";
+import { call, createPage, normalizeId, notion, read, updateBlock } from "./notion.js";
 import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyName, simplify } from "./schema.js";
 import { appendSpecs, type BlockSpec } from "./blocks.js";
 import { CHART_THEMES, CHART_TYPES, renderChart, type ChartRow, type ChartSpec } from "./charts.js";
@@ -19,6 +19,7 @@ import { queryAll } from "./query.js";
 import { uploadBytes } from "./files.js";
 import { plain, textToTitle } from "./richtext.js";
 import type { UndoOp } from "./journal.js";
+import { safeFetch } from "./fetch.js";
 
 export { chartSourceSchema };
 
@@ -122,12 +123,16 @@ export async function refreshChart(args: RefreshArgs): Promise<{ undo: UndoOp[];
     const url = img.type === "file" ? img.file?.url : img.external?.url;
     let copy: string | null = null;
     if (url) {
-      const res = await fetch(url);
-      if (res.ok) copy = await saveImageCopy(blockId, new Uint8Array(await res.arrayBuffer()));
+      try {
+        const res = await safeFetch(url, { maxBytes: 20 * 1024 * 1024, timeoutMs: 30_000 });
+        if (res.status >= 200 && res.status < 300) copy = await saveImageCopy(blockId, res.body);
+      } catch {
+        // Without a copy, the refresh still happens; it's just recorded as not undoable.
+      }
     }
     const { uploadId, notes } = await renderAndUpload(spec, points);
     const cap = caption ? textToTitle(caption) : captionFor(spec, got?.label);
-    await call(() => notion().blocks.update({ block_id: blockId, image: { file_upload: { id: uploadId }, caption: cap } } as never));
+    await call(() => updateBlock({ block_id: blockId, image: { file_upload: { id: uploadId }, caption: cap } }));
     const now = new Date().toISOString();
     await saveChart({ block_id: blockId, page_id: stored?.page_id ?? "", spec, ...(src ? { source: src } : { data: points }), created: stored?.created ?? now, updated: now });
     const undo: UndoOp[] = copy ? [{ kind: "image_restore", block_id: blockId, path: copy, caption: (block.image as { caption: unknown[] }).caption }] : [];
@@ -335,7 +340,7 @@ export async function buildReport(a: ReportArgs) {
 
   // Create the page, then fill it.
   const page = await call(() =>
-    notion().pages.create({ parent: { type: "page_id", page_id: normalizeId(a.parent) }, icon: { type: "emoji", emoji: "📊" }, properties: { title: { title: textToTitle(a.title ?? `${dbTitle} report`) } } } as never)
+    createPage({ parent: { type: "page_id", page_id: normalizeId(a.parent) }, icon: { type: "emoji", emoji: "📊" }, properties: { title: { title: textToTitle(a.title ?? `${dbTitle} report`) } } })
   );
   const undo: UndoOp[] = [{ kind: "page_trash", page_id: page.id, in_trash: true }];
   try {

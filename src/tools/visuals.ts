@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { call, normalizeId, notion, read } from "../services/notion.js";
+import { call, mapLimited, normalizeId, notion, read } from "../services/notion.js";
 import { dataSourceTitle, resolveDataSource } from "../services/schema.js";
 import type { ChartRow } from "../services/charts.js";
 import { pointsFromDatabase } from "../services/chartdata.js";
@@ -41,6 +41,8 @@ export function registerVisualTools(server: McpServer): void {
         database: z.string().optional().describe("list, create"),
         data_source_name: z.string().optional(),
         view_id: z.string().optional().describe("get, update, delete (a view id or a view URL with ?v=)"),
+        limit: z.number().int().min(1).max(100).default(25).describe("list: views per page."),
+        cursor: z.string().optional().describe("list: next_cursor from the previous page."),
         view: viewSpecSchema.optional().describe("create: the full view; update: name, type, and only what should change"),
         on: z
           .union([
@@ -50,9 +52,9 @@ export function registerVisualTools(server: McpServer): void {
           .optional()
           .describe("create: place a linked view on a page, or a widget on a dashboard view. Omit for a database tab."),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: { ...WRITE, destructiveHint: true }, // action=delete removes a view
     },
-    safe(async ({ action, database, data_source_name, view_id, view, on }) => {
+    safe(async ({ action, database, data_source_name, view_id, view, on, limit, cursor }) => {
       const n = notion();
       const viewIdOf = (v: string) => {
         const m = v.match(/[?&]v=([0-9a-f-]{32,36})/i);
@@ -62,13 +64,18 @@ export function registerVisualTools(server: McpServer): void {
         if (!database) throw new Error("action=list needs `database`.");
         const ds = await resolveDataSource(database, data_source_name);
         const dbId = await databaseIdOf(ds);
-        const refs = await read(() => n.views.list({ database_id: dbId, page_size: 100 } as never));
-        const views = [];
-        for (const r of refs.results.slice(0, 50)) {
+        // The list only has ids; details are read for this page of views, a few at a time.
+        const refs = await read(() => n.views.list({ database_id: dbId, page_size: limit, ...(cursor ? { start_cursor: cursor } : {}) }));
+        const views = await mapLimited(refs.results, async (r) => {
           const v = (await read(() => n.views.retrieve({ view_id: r.id }))) as unknown as Record<string, unknown>;
-          views.push({ id: v.id, name: v.name, type: v.type, url: v.url });
-        }
-        return ok({ database: dataSourceTitle(ds), count: refs.results.length, views });
+          return { id: v.id, name: v.name, type: v.type, url: v.url };
+        });
+        return ok({
+          database: dataSourceTitle(ds),
+          count: views.length,
+          views,
+          ...(refs.has_more && refs.next_cursor ? { next_cursor: refs.next_cursor, note: "More views exist; pass next_cursor as cursor for the next page." } : {}),
+        });
       }
       if (action === "create") {
         if (!view) throw new Error("action=create needs `view`.");
@@ -127,7 +134,7 @@ export function registerVisualTools(server: McpServer): void {
         refresh_block_id: z.string().optional().describe("An image block made by this tool: re-render it in place."),
         caption: z.string().optional(),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ chart, data, source, parent, position, after_block_id, refresh_block_id, caption }) => {
       if (data && source) throw new Error("Give `data` or `source`, not both.");
@@ -179,7 +186,7 @@ export function registerVisualTools(server: McpServer): void {
       inputSchema: {
         ...reportArgsShape,
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async (a) => {
       try {

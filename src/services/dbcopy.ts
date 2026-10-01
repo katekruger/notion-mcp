@@ -2,7 +2,7 @@
 // The API has no database duplicate, so this rebuilds it. Relations inside the copied database point at the
 // copied rows; relations to other databases keep pointing there but become one-way, so nothing outside is changed.
 import type { DataSourceObjectResponse, DatabaseObjectResponse, PageObjectResponse } from "@notionhq/client";
-import { call, isNotFound, mapLimited, notion, read } from "./notion.js";
+import { call, isNotFound, mapLimited, notion, read, updateDataSource, updatePage } from "./notion.js";
 import { configToRequest } from "./dbschema.js";
 import { queryAll } from "./query.js";
 import { restoreValue, withFullProperties } from "./schema.js";
@@ -164,7 +164,7 @@ export async function copyDatabase(
   const dsMap = new Map<string, string>();
   dsMap.set(head.ds.id, createdDb.data_sources[0].id);
   if (sources.length > 1 || plain(head.ds.title) !== title) {
-    await call(() => notion().dataSources.update({ data_source_id: dsMap.get(head.ds.id) as string, title: richTextRequest(head.ds.title) } as never));
+    await call(() => updateDataSource({ data_source_id: dsMap.get(head.ds.id) as string, title: richTextRequest(head.ds.title) }));
   }
   for (const p of rest) {
     const ds = await call(() =>
@@ -178,8 +178,8 @@ export async function copyDatabase(
     // Relations first, then the rollups that read them.
     const rels = Object.fromEntries(Object.entries(properties).filter(([, v]) => v.type === "relation"));
     const rolls = Object.fromEntries(Object.entries(properties).filter(([, v]) => v.type !== "relation"));
-    if (Object.keys(rels).length) await call(() => notion().dataSources.update({ data_source_id: dsMap.get(p.ds.id) as string, properties: rels } as never));
-    if (Object.keys(rolls).length) await call(() => notion().dataSources.update({ data_source_id: dsMap.get(p.ds.id) as string, properties: rolls } as never));
+    if (Object.keys(rels).length) await call(() => updateDataSource({ data_source_id: dsMap.get(p.ds.id) as string, properties: rels }));
+    if (Object.keys(rolls).length) await call(() => updateDataSource({ data_source_id: dsMap.get(p.ds.id) as string, properties: rolls }));
   }
 
   let rows = 0;
@@ -219,7 +219,7 @@ export async function copyDatabase(
       const properties = Object.fromEntries(
         Object.entries(relations).map(([k, ids]) => [k, { relation: ids.map((r) => rowMap.get(r.id)).filter(Boolean).map((id) => ({ id })) }])
       );
-      await call(() => notion().pages.update({ page_id: newId, properties } as never));
+      await call(() => updatePage({ page_id: newId, properties }));
     });
   }
   notes.push(`"${title}": views aren't copied; the copy has a default table view (add others with notion_views).`);

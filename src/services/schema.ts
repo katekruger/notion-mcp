@@ -3,6 +3,7 @@ import type { DataSourceObjectResponse, PageObjectResponse, UserObjectResponse }
 import { read, isNotFound, normalizeId, notion } from "./notion.js";
 import { isUrl, uploadLocalFile } from "./files.js";
 import { forApi, fromInlineMarkdown, pendingUserLookups, plain, toRequest, USER_LOOKUP } from "./richtext.js";
+import { config } from "../config.js";
 
 export type PropertyConfig = DataSourceObjectResponse["properties"][string];
 export type PageProperty = PageObjectResponse["properties"][string];
@@ -491,7 +492,7 @@ export async function withFullProperties(page: PageObjectResponse, names: string
 
 /** YYYY-MM-DD in the configured zone (NOTION_PLUS_TIMEZONE, else the system zone). */
 function localDate(d: Date): string {
-  const tz = process.env.NOTION_PLUS_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const tz = config().timezone;
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
 }
 

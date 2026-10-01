@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { isFullBlock } from "@notionhq/client";
 import type { BlockObjectResponse, PageObjectResponse, RichTextItemResponse } from "@notionhq/client";
-import { call, read, normalizeId, notion } from "../services/notion.js";
+import { call, normalizeId, notion, read, updateBlock, updatePage } from "../services/notion.js";
 import {
   blockContent,
   blockText,
@@ -24,7 +24,7 @@ import { blockSpecSchema, checkFresh } from "./pages.js";
 import { fileRef, isUrl } from "../services/files.js";
 import { normalizeColor } from "../services/richtext.js";
 import { resolveUserMentions } from "../services/schema.js";
-import { DESTRUCTIVE, fail, ok, safe, WRITE } from "./util.js";
+import { DESTRUCTIVE, fail, ok, safe, WRITE, IDEMPOTENT_WRITE } from "./util.js";
 
 async function getBlock(id: string): Promise<BlockObjectResponse> {
   const b = await read(() => notion().blocks.retrieve({ block_id: id }));
@@ -54,7 +54,7 @@ export function registerBlockTools(server: McpServer): void {
         cells: z.array(z.string()).optional().describe("table_row blocks: new text for every cell, in order"),
         expected_last_edited_time: z.string().optional(),
       },
-      annotations: WRITE,
+      annotations: IDEMPOTENT_WRITE,
     },
     safe(async ({ block_id, text, checked, language, caption, color, toggleable, icon, cells, expected_last_edited_time }) => {
       const b = await getBlock(normalizeId(block_id));
@@ -105,7 +105,7 @@ export function registerBlockTools(server: McpServer): void {
 
       const restore = restorePayload(b);
       const before = blockText(b);
-      const updated = await call(() => notion().blocks.update({ block_id: b.id, [b.type]: content } as never));
+      const updated = await call(() => updateBlock({ block_id: b.id, [b.type]: content }));
       const undo: UndoOp[] = restore ? [{ kind: "block_update", block_id: b.id, payload: restore }] : [];
       const journalId = await record("notion_patch_block", `Patched ${b.type} ${b.id}`, undo);
       const after = isFullBlock(updated) ? blockText(updated) : undefined;
@@ -132,7 +132,7 @@ export function registerBlockTools(server: McpServer): void {
         markdown: z.string().optional(),
         blocks: z.array(blockSpecSchema).optional(),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ parent, position, after_block_id, markdown, blocks }) => {
       const specs = [...(markdown ? markdownToSpecs(markdown) : []), ...(blocks ?? [])];
@@ -189,7 +189,7 @@ export function registerBlockTools(server: McpServer): void {
         max_replacements: z.number().int().min(1).max(1000).default(200),
         dry_run: z.boolean().default(true),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ page, find, replace, regex, case_sensitive, include_title, block_ids, max_replacements, dry_run }) => {
       const pattern = buildPattern(find, regex, case_sensitive);
@@ -301,7 +301,7 @@ export function registerBlockTools(server: McpServer): void {
       if (titleChange) {
         try {
           const op = snapshot(titleChange.page, [titleChange.name]);
-          await call(() => notion().pages.update({ page_id: pageId, properties: { [titleChange.name]: { title: titleChange.value } } } as never));
+          await call(() => updatePage({ page_id: pageId, properties: { [titleChange.name]: { title: titleChange.value } } }));
           undo.push(op);
         } catch (e) {
           failed.push({ id: pageId, error: `title: ${(e as Error).message}` });
@@ -310,7 +310,7 @@ export function registerBlockTools(server: McpServer): void {
       for (const c of changes.filter((x) => x.count > 0)) {
         try {
           const restore = restorePayload(c.block);
-          await call(() => notion().blocks.update({ block_id: c.block.id, [c.block.type]: c.content } as never));
+          await call(() => updateBlock({ block_id: c.block.id, [c.block.type]: c.content }));
           if (restore) undo.push({ kind: "block_update", block_id: c.block.id, payload: restore });
         } catch (e) {
           failed.push({ id: c.block.id, error: (e as Error).message });

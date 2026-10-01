@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { z } from "zod";
 import { isFullPage } from "@notionhq/client";
 import type { DataSourceObjectResponse } from "@notionhq/client";
-import { call, mapLimited, notion, read } from "../services/notion.js";
+import { call, createPage, mapLimited, notion, read } from "../services/notion.js";
 import { buildWhereFilter, dataSourceTitle, invalidateSchema, resolveDataSource, resolvePropertyName } from "../services/schema.js";
 import { preparePayload } from "../services/writes.js";
 import { aggregate, DATE_BUCKETS, EMPTY_KEY, METRIC_OPS, metricName, type Metric } from "../services/aggregate.js";
@@ -125,7 +125,7 @@ export function registerDatabaseTools(server: McpServer): void {
         allow_new_options: z.boolean().default(false),
         dry_run: z.boolean().default(true),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ database, data_source_name, rows, csv, csv_path, allow_new_options, dry_run }) => {
       const sources = [rows, csv, csv_path].filter((x) => x !== undefined).length;
@@ -178,7 +178,7 @@ export function registerDatabaseTools(server: McpServer): void {
       const failed: { row: number; error: string }[] = [];
       await mapLimited(prepared, async (p) => {
         try {
-          const created = await call(() => notion().pages.create({ parent: { type: "data_source_id", data_source_id: ds.id }, properties: p.payload } as never));
+          const created = await call(() => createPage({ parent: { type: "data_source_id", data_source_id: ds.id }, properties: p.payload }));
           undo.push({ kind: "page_trash", page_id: created.id, in_trash: true });
         } catch (e) {
           failed.push({ row: p.index + 1, error: (e as Error).message });

@@ -1,5 +1,6 @@
 // Calls tool handlers the way the MCP server would (schema-parsed args), without a transport. Used by the eval scripts.
 import { z } from "zod";
+import { unwrap } from "../src/tools/util.js";
 
 try {
   process.loadEnvFile?.(".env");
@@ -24,6 +25,7 @@ const mods = await Promise.all([
   import("../src/tools/database.js"),
   import("../src/tools/visuals.js"),
   import("../src/tools/automations.js"),
+  import("../src/tools/doctor.js"),
 ]);
 for (const m of mods) for (const [k, fn] of Object.entries(m)) if (k.startsWith("register") && typeof fn === "function") fn(registry as never);
 
@@ -34,14 +36,9 @@ export async function tool(name: string, args: Record<string, unknown>): Promise
   const t = tools.get(name);
   if (!t) throw new Error(`No tool ${name}`);
   const r = await t.handler(t.schema.parse(args));
-  const text = r.content[0].text;
-  let json: Json = {};
-  try {
-    json = JSON.parse(text) as Json;
-  } catch {
-    // Some tools answer in text.
-  }
-  return { text, json, isError: Boolean(r.isError) };
+  // Results are envelopes; read them back in the shape each tool built (undo_id, notes, … in place).
+  const { text, json } = unwrap(r);
+  return { text, json: json as Json, isError: Boolean(r.isError) };
 }
 
 export async function must(name: string, args: Record<string, unknown>): Promise<Json> {

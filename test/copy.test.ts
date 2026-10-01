@@ -104,10 +104,15 @@ test("readDatabase: not-found means an unreadable view; every other failure is t
       [APIErrorCode.RestrictedResource, 403],
       [APIErrorCode.Unauthorized, 401],
       [APIErrorCode.RateLimited, 429],
+      [APIErrorCode.InternalServerError, 500],
+      [APIErrorCode.ServiceUnavailable, 503],
     ] as const) {
       setClientForTests({ databases: { retrieve: async () => Promise.reject(apiError(code, status)) } } as unknown as Client);
       await assert.rejects(readDatabase("db1"), (e: unknown) => (e as APIResponseError).code === code);
     }
+    // A timeout is a failure to read, not a linked view.
+    setClientForTests({ databases: { retrieve: async () => Promise.reject(Object.assign(new Error("Request to Notion API has timed out"), { code: "notionhq_client_request_timeout" })) } } as unknown as Client);
+    await assert.rejects(readDatabase("db1"), /timed out/);
   } finally {
     setClientForTests(null);
   }

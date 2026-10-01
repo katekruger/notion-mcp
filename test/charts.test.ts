@@ -117,6 +117,13 @@ test("raw Vega-Lite: inline data only, no links or images, bounded size; house t
   assert.match(ok.config.font, /Inter/);
 });
 
+test("raw Vega-Lite takes the requested theme where it sets no colors of its own", () => {
+  const spec = { mark: "bar", data: { values: [{ a: 1 }] }, encoding: { x: { field: "a", type: "quantitative" } } };
+  assert.equal((checkCustomSpec(spec, "dark") as { background: string }).background, "#191919");
+  assert.equal((checkCustomSpec(spec, "transparent") as { background: string }).background, "transparent");
+  assert.equal((checkCustomSpec({ ...spec, background: "#fff000" }, "dark") as { background: string }).background, "#fff000");
+});
+
 test("charts describe themselves for alt text and data tables", async () => {
   assert.match(describeChart({ type: "column", title: "Sales" }, [{ x: "A", y: 5 }, { x: "B", y: 2 }]), /Column chart "Sales": 2 categories\. Highest: A \(5\); lowest: B \(2\); total 7\./);
   assert.match(describeChart({ type: "waterfall" }, SAMPLES.waterfall), /2 increases and 1 decreases, ending at 125/);

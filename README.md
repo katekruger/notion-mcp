@@ -390,7 +390,7 @@ npm run test:live        # live integration suite against a real workspace
 npm run bundle && node scripts/bundle-smoke.mjs   # build this platform's bundle and install-test it
 ```
 
-CI also fails on known high-severity advisories in runtime dependencies, reviews new dependencies in pull requests, and Dependabot proposes updates weekly. Every GitHub Action is pinned to a commit. A release builds a bundle on each platform, install-tests it (unpack, start, list every tool, render a chart), and publishes it with `sha256sums.txt`, an SBOM, and build provenance.
+CI also fails on known high-severity advisories in runtime dependencies, reviews new dependencies in pull requests (on public repos, or private ones with GitHub Code Security once the repository variable `DEPENDENCY_REVIEW` is `true`), and Dependabot proposes updates weekly. Every GitHub Action is pinned to a commit. A release builds a bundle on each platform, install-tests it (unpack, start, list every tool, render a chart), and publishes it with `sha256sums.txt`, an SBOM, and build provenance.
 
 **Live tests in CI.** `.github/workflows/live.yml` runs the smoke and acceptance suites nightly and on release tags once two repository secrets exist: `NOTION_TOKEN` (an integration used only for testing, in a throwaway workspace) and `NOTION_TEST_PAGE` (a page shared with it). Until then it passes with a notice. It never runs for pull requests, so forks can't reach the secrets.
 

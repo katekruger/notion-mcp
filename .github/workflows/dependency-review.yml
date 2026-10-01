@@ -10,6 +10,10 @@ permissions:
 
 jobs:
   review:
+    # GitHub only offers dependency review on public repos, or private repos with GitHub Code Security. Elsewhere the
+    # job is skipped (CI's `npm audit --omit=dev` step still checks runtime dependencies). Set the repository
+    # variable DEPENDENCY_REVIEW=true to run it on a private repo that has Code Security.
+    if: ${{ !github.event.repository.private || vars.DEPENDENCY_REVIEW == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

@@ -1,5 +1,15 @@
 # Notion Plus MCP: remediation and extension plan
 
+> **Status: complete.** Every batch shipped:
+> - Batch 1: #3.
+> - Batches 2–3: #4.
+> - Batch 4: #5.
+> - Batch 5: #12.
+> - Batch 6: #13.
+> - Batch 7 (Sankey and network charts, `database-report`): #14.
+>
+> 1.0.0 closes it out. [AUDIT-STATUS.md](AUDIT-STATUS.md) maps each audit finding to its fix and its test. This page is kept as the record of how the work was planned.
+
 ## Fix the failing Dependency review check on PR #12
 
 ### Context

@@ -140,6 +140,7 @@ test("the scheduled runner stops instead of starting fresh when required state i
   const home = mkdtempSync(path.join(os.tmpdir(), "notion-plus-tools-test-"));
   const r = spawnSync(process.execPath, ["--import", "tsx", "src/automations-cli.ts", "--require-state"], {
     env: { ...process.env, NOTION_PLUS_HOME: home, NOTION_PLUS_WORKSPACE: "test", NOTION_TOKEN: "secret_dummy" },
+    cwd: path.resolve(import.meta.dirname, ".."),
     encoding: "utf8",
     timeout: 60_000,
   });

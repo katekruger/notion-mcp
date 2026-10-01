@@ -249,6 +249,7 @@ test("a value the condition checks is written in the commit step, after content"
 
 test("notion_automation run is an error unless every rule succeeded; history pages and skips bad lines", async () => {
   const { registerAutomationTools } = await import("../src/tools/automations.js");
+  const { unwrap } = await import("../src/tools/util.js");
   const { runLogPath } = await import("../src/services/automations.js");
   const { appendFile } = await import("node:fs/promises");
   const handlers = new Map<string, (a: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>>();
@@ -267,19 +268,21 @@ test("notion_automation run is an error unless every rule succeeded; history pag
   try {
     const failed = await tool({ action: "run" });
     assert.equal(failed.isError, true);
-    const body = JSON.parse(failed.content[0].text);
+    const { env, json: body } = unwrap(failed);
+    assert.equal(env?.status, "error");
     assert.equal(body.status, "failed");
-    assert.ok(body.undo.length === 1, "undo ids are still returned");
+    assert.ok((body.undo as unknown[]).length === 1, "undo ids are still returned");
     const fixed = await tool({ action: "run" });
     assert.equal(fixed.isError, undefined);
-    assert.equal(JSON.parse(fixed.content[0].text).status, "succeeded");
+    assert.equal(unwrap(fixed).json.status, "succeeded");
+    assert.equal(unwrap(fixed).env?.status, "ok");
 
     await appendFile(await runLogPath(), "{not json\n");
-    const page1 = JSON.parse((await tool({ action: "history", limit: 1 })).content[0].text);
+    const page1 = unwrap(await tool({ action: "history", limit: 1 })).json as { runs: unknown[]; unreadable_lines: number; next_cursor: number };
     assert.equal(page1.runs.length, 0);
     assert.equal(page1.unreadable_lines, 1);
     assert.equal(page1.next_cursor, 1);
-    const page2 = JSON.parse((await tool({ action: "history", limit: 5, cursor: page1.next_cursor })).content[0].text);
+    const page2 = unwrap(await tool({ action: "history", limit: 5, cursor: page1.next_cursor })).json as { runs: { status: string }[] };
     assert.ok(page2.runs.length >= 2);
     assert.equal(page2.runs[0].status, "succeeded");
   } finally {

@@ -11,15 +11,19 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: [22, 24] # the supported versions (SUPPORT.md)
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - name: Versions agree
+        run: npm run check:version
+      - name: No known advisories in runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Lint, typecheck, tests with coverage thresholds, build
+        run: npm run check

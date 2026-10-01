@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/client";
 import { z } from "zod";
 import { randomBytes } from "node:crypto";
-import { call, isNotFound, normalizeId, notion, requestCount } from "./notion.js";
+import { call, isNotFound, normalizeId, notion, requestCount, updatePage } from "./notion.js";
 import { log } from "./log.js";
 import { appendSpecs, markdownToSpecs, PartialWriteError } from "./blocks.js";
 import { blockSpecSchema } from "./specSchema.js";
@@ -671,7 +671,7 @@ async function runThen(t: ThenAction, ctx: TemplateContext, rule: Rule, state: R
     undo.push(...r.undo);
     if (replace_previous && state.last_report_page) {
       try {
-        await call(() => notion().pages.update({ page_id: state.last_report_page as string, in_trash: true } as never));
+        await call(() => updatePage({ page_id: state.last_report_page as string, in_trash: true }));
         undo.push({ kind: "page_trash", page_id: state.last_report_page, in_trash: false });
       } catch (e) {
         if (!isNotFound(e)) throw e;
@@ -960,7 +960,7 @@ function rowSteps(
     const { payload } = await preparePayload(ds, values, rule.allow_new_options);
     const names = Object.keys(payload);
     c.undo.push(snapshot(await withFullProperties(page, names), names));
-    await call(() => notion().pages.update({ page_id: page.id, properties: payload } as never));
+    await call(() => updatePage({ page_id: page.id, properties: payload }));
   };
   const describeSet = (v: Record<string, unknown>) => `set ${Object.entries(v).map(([k, x]) => `${k}=${JSON.stringify(x)}`).join(", ")}`;
 
@@ -1010,7 +1010,7 @@ function rowSteps(
       id: "trash",
       describe: "trash",
       run: async () => {
-        await call(() => notion().pages.update({ page_id: page.id, in_trash: true } as never));
+        await call(() => updatePage({ page_id: page.id, in_trash: true }));
         c.undo.push({ kind: "page_trash", page_id: page.id, in_trash: false });
       },
     });

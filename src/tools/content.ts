@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { call, isNotFound, normalizeId, notion, read } from "../services/notion.js";
+import { call, isNotFound, normalizeId, notion, read, updatePage } from "../services/notion.js";
 import { appendSpecs, PartialWriteError, type BlockSpec } from "../services/blocks.js";
 import {
   blockAsSpec,
@@ -22,7 +22,7 @@ import { plain, textToTitle, toInlineMarkdown } from "../services/richtext.js";
 import { dataSourceTitle, resolveDataSource, restoreValue } from "../services/schema.js";
 import { insertedBlocks, record, type UndoOp } from "../services/journal.js";
 import { checkFresh, iconRef } from "./pages.js";
-import { ok, READ, safe, WRITE } from "./util.js";
+import { ok, READ, safe, WRITE, IDEMPOTENT_WRITE, UNTRUSTED } from "./util.js";
 
 /** A page or database given as a destination. Databases become data source parents. */
 async function destinationParent(input: string, dataSourceName?: string): Promise<{ parent: PageParent; label: string }> {
@@ -56,7 +56,7 @@ export function registerContentTools(server: McpServer): void {
         data_source_name: z.string().optional(),
         expected_last_edited_time: z.string().optional(),
       },
-      annotations: WRITE,
+      annotations: IDEMPOTENT_WRITE,
     },
     safe(async ({ page, title, icon, cover, locked, move_to, data_source_name, expected_last_edited_time }) => {
       const p = await getPage(normalizeId(page));
@@ -92,7 +92,7 @@ export function registerContentTools(server: McpServer): void {
       const undo: UndoOp[] = [];
       const notes: string[] = [];
       if (Object.keys(payload).length) {
-        await call(() => notion().pages.update({ page_id: p.id, ...payload } as never));
+        await call(() => updatePage({ page_id: p.id, ...payload }));
         undo.push({ kind: "page_update", page_id: p.id, payload: restore });
       }
       let movedTo: string | undefined;
@@ -138,7 +138,7 @@ export function registerContentTools(server: McpServer): void {
           .describe("Copy each row's own content (blocks, sub-pages, databases). Turn off for large databases where only values matter."),
         dry_run: z.boolean().default(false),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ page, to, data_source_name, title, include_subpages, databases, max_rows, copy_row_content, dry_run }) => {
       const source = await getPage(normalizeId(page));
@@ -381,7 +381,7 @@ export function registerContentTools(server: McpServer): void {
         text: z.string().optional().describe("add, reply: markdown body."),
         limit: z.number().int().min(1).max(200).default(50),
       },
-      annotations: { ...WRITE, idempotentHint: false },
+      annotations: WRITE,
     },
     safe(async ({ action, target, discussion_id, text, limit }) => {
       const n = notion();
@@ -399,7 +399,10 @@ export function registerContentTools(server: McpServer): void {
           cursor = res.has_more && res.next_cursor ? res.next_cursor : undefined;
         } while (cursor && comments.length < limit);
         const threads = new Set(comments.map((c) => c.discussion_id)).size;
-        return ok({ count: comments.length, discussions: threads, comments: comments.slice(0, limit), note: "Resolved discussions aren't returned by Notion's API." });
+        return ok(
+          { count: comments.length, discussions: threads, comments: comments.slice(0, limit), note: "Resolved discussions aren't returned by Notion's API." },
+          { warnings: [UNTRUSTED] }
+        );
       }
       if (!text) throw new Error(`action=${action} needs \`text\`.`);
       let body: Record<string, unknown>;

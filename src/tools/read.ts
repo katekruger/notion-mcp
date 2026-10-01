@@ -15,7 +15,7 @@ import {
   simplifyAll,
 } from "../services/schema.js";
 import { readPageMarkdown } from "../services/pagemd.js";
-import { ok, READ, safe } from "./util.js";
+import { ok, READ, safe, UNTRUSTED } from "./util.js";
 
 function describeFile(f: unknown): string | null {
   const o = f as { type?: string; emoji?: string; external?: { url: string }; custom_emoji?: { name?: string } } | null;
@@ -104,6 +104,7 @@ export function registerReadTools(server: McpServer): void {
         properties: simplifyAll(p),
       };
       if (!include_content) return ok(header);
+      const untrusted = { warnings: [UNTRUSTED] };
       if (format === "markdown") {
         const md = await readPageMarkdown(id);
         const notes = [
@@ -112,12 +113,13 @@ export function registerReadTools(server: McpServer): void {
             : []),
           ...(md.truncated ? ["Notion truncated this page's markdown; read sections with notion_get_blocks."] : []),
         ];
-        return ok(`${JSON.stringify(header, null, 2)}\n${notes.length ? `\nNOTES: ${notes.join(" ")}\n` : ""}\nMARKDOWN:\n${md.markdown || "(empty page)"}`);
+        return ok(`${JSON.stringify(header, null, 2)}\n${notes.length ? `\nNOTES: ${notes.join(" ")}\n` : ""}\nMARKDOWN:\n${md.markdown || "(empty page)"}`, untrusted);
       }
       const tree = await getTree(id, max_depth, max_blocks);
       const outline = renderTree(tree.nodes) || "(no content)";
       return ok(
-        `${JSON.stringify(header, null, 2)}\n\nCONTENT${tree.truncated ? " (partial: raise max_depth/max_blocks or read a sub-block with notion_get_blocks)" : ""}:\n${outline}`
+        `${JSON.stringify(header, null, 2)}\n\nCONTENT${tree.truncated ? " (partial: raise max_depth/max_blocks or read a sub-block with notion_get_blocks)" : ""}:\n${outline}`,
+        untrusted
       );
     })
   );
@@ -136,7 +138,7 @@ export function registerReadTools(server: McpServer): void {
     },
     safe(async ({ block, max_depth, max_blocks }) => {
       const tree = await getTree(normalizeId(block), max_depth, max_blocks);
-      return ok((renderTree(tree.nodes) || "(no children)") + (tree.truncated ? "\n\n(partial result)" : ""));
+      return ok((renderTree(tree.nodes) || "(no children)") + (tree.truncated ? "\n\n(partial result)" : ""), { warnings: [UNTRUSTED] });
     })
   );
 
@@ -164,7 +166,7 @@ export function registerReadTools(server: McpServer): void {
         .filter((n) => new RegExp(pattern.source, pattern.flags.replace("g", "")).test(n.text))
         .slice(0, max_results)
         .map((n) => ({ id: n.id, type: n.type, text: n.text, depth: n.depth, last_edited_time: n.last_edited_time }));
-      return ok({ count: hits.length, matches: hits, ...(tree.truncated ? { note: "Page was only partially scanned." } : {}) });
+      return ok({ count: hits.length, matches: hits, ...(tree.truncated ? { note: "Page was only partially scanned." } : {}) }, { warnings: [UNTRUSTED] });
     })
   );
 
@@ -250,7 +252,7 @@ export function registerReadTools(server: McpServer): void {
         has_more: Boolean(next),
         ...(next ? { next_cursor: next } : {}),
         rows,
-      });
+      }, { warnings: [UNTRUSTED] });
     })
   );
 }

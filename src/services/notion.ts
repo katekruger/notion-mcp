@@ -1,20 +1,19 @@
 import { Client, isNotionClientError, APIErrorCode, LogLevel, RequestTimeoutError } from "@notionhq/client";
+import { config } from "../config.js";
 
 let client: Client | null = null;
 
-/** Per-request timeout. Long enough for large appends, short enough that a hung call surfaces. */
-export const REQUEST_TIMEOUT_MS = Number(process.env.NOTION_TIMEOUT_MS ?? 30_000);
-
-/**
- * Notion API version, pinned so a client library update can't change behavior underneath us.
- * 2026-03-11 renames `archived` → `in_trash`, `transcription` → `meeting_notes`, and drops the flat `after`
- * parameter of block appends; this server already uses the new forms. NOTION_VERSION overrides it.
+/*
+ * Notion API version: pinned (DEFAULT_NOTION_VERSION in config.ts) so a client library update can't change behavior
+ * underneath us. 2026-03-11 renames `archived` → `in_trash`, `transcription` → `meeting_notes`, and drops the flat
+ * `after` parameter of block appends; this server already uses the new forms. NOTION_VERSION overrides it.
+ * The per-request timeout (NOTION_TIMEOUT_MS, default 30 s) is long enough for large appends and short enough that
+ * a hung call surfaces.
  */
-export const NOTION_VERSION = process.env.NOTION_VERSION ?? "2026-03-11";
-
 export function notion(): Client {
   if (client) return client;
-  const token = process.env.NOTION_TOKEN;
+  const cfg = config();
+  const token = cfg.NOTION_TOKEN;
   if (!token) {
     throw new Error(
       "NOTION_TOKEN is not set. Create an internal integration at https://www.notion.so/profile/integrations, " +
@@ -24,9 +23,9 @@ export function notion(): Client {
   // The official client retries 429/529 (honoring Retry-After) and, for safe methods, 500/503 with backoff.
   client = new Client({
     auth: token,
-    notionVersion: NOTION_VERSION,
+    notionVersion: cfg.NOTION_VERSION,
     retry: { maxRetries: 4 },
-    timeoutMs: REQUEST_TIMEOUT_MS,
+    timeoutMs: cfg.NOTION_TIMEOUT_MS,
     // Expected misses (e.g. trying an id as a data source before a database) are handled; only log real errors.
     logLevel: LogLevel.ERROR,
   });
@@ -171,7 +170,7 @@ export function formatError(error: unknown): string {
       case APIErrorCode.ConflictError:
         return "Error: Notion reported a write conflict (someone else edited at the same moment). Re-read and retry.";
       case "notionhq_client_request_timeout":
-        return `Error: Notion didn't answer within ${REQUEST_TIMEOUT_MS / 1000}s. For reads, retry; for writes, re-read first to see whether it landed.`;
+        return `Error: Notion didn't answer within ${timeoutSeconds()}s. For reads, retry; for writes, re-read first to see whether it landed.`;
       case APIErrorCode.ValidationError:
         return `Error: Notion rejected the request: ${error.message}`;
       default:
@@ -187,4 +186,58 @@ export function isNotFound(error: unknown): boolean {
     isNotionClientError(error) &&
     (error.code === APIErrorCode.ObjectNotFound || error.code === APIErrorCode.ValidationError)
   );
+}
+
+function timeoutSeconds(): number {
+  try {
+    return config().NOTION_TIMEOUT_MS / 1000;
+  } catch {
+    return 30;
+  }
+}
+
+// ---------- typed request adapters ----------
+// The SDK's request types lag the pinned API version (2026-03-11 fields such as `in_trash`, `template`, data source
+// parents, view placement), so calls used to cast their whole body `as never`, which also hid real mistakes. These
+// adapters take the fields this server sends, typed loosely but checked for the required ids, and cast in one place.
+
+/** Body of a page update: properties in request form, trash state, icon/cover, lock, template application. */
+export interface PageUpdateArgs {
+  page_id: string;
+  properties?: Record<string, unknown>;
+  in_trash?: boolean;
+  [field: string]: unknown;
+}
+
+export function updatePage(args: PageUpdateArgs) {
+  return notion().pages.update(args as never);
+}
+
+export interface PageCreateArgs {
+  parent: { page_id: string } | { data_source_id: string } | { type: string; [k: string]: unknown };
+  properties: Record<string, unknown>;
+  [field: string]: unknown;
+}
+
+export function createPage(args: PageCreateArgs) {
+  return notion().pages.create(args as never);
+}
+
+export interface DataSourceUpdateArgs {
+  data_source_id: string;
+  properties?: Record<string, unknown>;
+  [field: string]: unknown;
+}
+
+export function updateDataSource(args: DataSourceUpdateArgs) {
+  return notion().dataSources.update(args as never);
+}
+
+export interface BlockUpdateArgs {
+  block_id: string;
+  [field: string]: unknown;
+}
+
+export function updateBlock(args: BlockUpdateArgs) {
+  return notion().blocks.update(args as never);
 }

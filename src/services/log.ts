@@ -3,7 +3,8 @@
 export type LogLevel = "info" | "warn" | "error";
 
 export function log(level: LogLevel, event: string, fields: Record<string, unknown> = {}): void {
-  const mode = process.env.NOTION_PLUS_LOG ?? "json";
+  const v = process.env.NOTION_PLUS_LOG;
+  const mode = v === "text" || v === "off" ? v : "json"; // never throw from logging; config() reports a bad value
   if (mode === "off") return;
   const at = new Date().toISOString();
   if (mode === "text") {

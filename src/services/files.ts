@@ -1,8 +1,9 @@
 // File Upload API helpers: local files and downloaded bytes become file_upload ids for image, file, and cover blocks.
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { call, notion } from "./notion.js";
+import { config } from "../config.js";
+import { safeFetch } from "./fetch.js";
 
 /** Notion's single-part limit; larger files go up in parts. */
 const SINGLE_PART_MAX = 20 * 1024 * 1024;
@@ -32,8 +33,7 @@ export function isUrl(s: string): boolean {
  * NOTION_PLUS_UPLOAD_DIRS (path-separated) replaces the list. Keeps a prompt from uploading arbitrary files.
  */
 export function uploadRoots(): string[] {
-  const env = process.env.NOTION_PLUS_UPLOAD_DIRS;
-  const roots = env ? env.split(path.delimiter).filter(Boolean) : [process.cwd(), os.tmpdir()];
+  const roots = config().uploadDirs;
   // Apps can start the server with "/" as its working directory; never let that open the whole disk.
   return roots.map((r) => path.resolve(r)).filter((r) => path.parse(r).root !== r);
 }
@@ -76,7 +76,7 @@ export async function uploadBytes(data: Uint8Array, filename: string, contentTyp
 
 /** Where this server keeps its own files (journal, chart copies). */
 export function homeDir(): string {
-  return process.env.NOTION_PLUS_HOME ?? path.join(os.homedir(), ".notion-plus");
+  return config().home;
 }
 
 /**
@@ -91,11 +91,11 @@ export async function uploadLocalFile(p: string, filename?: string, opts: { allo
 
 /** Download a file (e.g. a Notion-hosted file with an expiring link) and upload it again. */
 export async function reuploadUrl(url: string, filename?: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Couldn't download ${url.split("?")[0]}: HTTP ${res.status}.`);
+  const res = await safeFetch(url);
+  if (res.status < 200 || res.status >= 300) throw new Error(`Couldn't download ${url.split("?")[0]}: HTTP ${res.status}.`);
   const name = filename ?? decodeURIComponent(new URL(url).pathname.split("/").pop() || "file");
-  const type = res.headers.get("content-type")?.split(";")[0] || contentTypeFor(name);
-  return uploadBytes(new Uint8Array(await res.arrayBuffer()), name, type);
+  const type = res.contentType || contentTypeFor(name);
+  return uploadBytes(res.body, name, type);
 }
 
 /** A file reference for icons, covers, and media blocks: external URL as-is, local path uploaded. */

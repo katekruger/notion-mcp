@@ -1,7 +1,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { call, isNotFound, mapLimited, notion, read, setBeforeWrite } from "./notion.js";
+import { call, isNotFound, mapLimited, notion, read, setBeforeWrite, updateBlock, updateDataSource, updatePage } from "./notion.js";
 import { readJson, updateJson } from "./store.js";
 import { stateDir } from "./workspace.js";
 import { invalidateSchema } from "./schema.js";
@@ -156,7 +156,30 @@ export async function runJournaled<R extends { isError?: boolean; content?: { te
   }
 }
 
+/**
+ * How much of a write undo can revert: all of it, part of it (some effects have no undo, named in the entry), or
+ * none. Kept for recent entries so tool results can report it.
+ */
+export type UndoCoverage = "full" | "partial" | "none";
+const coverage = new Map<string, UndoCoverage>();
+
+export function undoCoverage(id: string): UndoCoverage | undefined {
+  return coverage.get(id);
+}
+
 export async function record(
+  tool: string,
+  summary: string,
+  undo: UndoOp[],
+  notUndoable?: string
+): Promise<string> {
+  const id = await recordEntry(tool, summary, undo, notUndoable);
+  coverage.set(id, undo.length === 0 ? "none" : notUndoable ? "partial" : "full");
+  if (coverage.size > 500) coverage.delete(coverage.keys().next().value as string);
+  return id;
+}
+
+async function recordEntry(
   tool: string,
   summary: string,
   undo: UndoOp[],
@@ -189,11 +212,13 @@ function pidAlive(pid: number): boolean {
 
 export type HistoryEntry = JournalEntry & { interrupted?: boolean };
 
-export async function history(limit: number): Promise<HistoryEntry[]> {
+/** Entries newest first, skipping `offset` of the newest. */
+export async function history(limit: number, offset = 0): Promise<HistoryEntry[]> {
   const entries = await load();
   return entries
-    .slice(-limit)
+    .slice()
     .reverse()
+    .slice(offset, offset + limit)
     .map((e) =>
       e.status === "pending" && e.pid !== undefined && e.pid !== process.pid && !pidAlive(e.pid)
         ? { ...e, interrupted: true, not_undoable: "interrupted: the process stopped mid-write; check the objects named in args by hand" }
@@ -205,23 +230,23 @@ async function apply(op: UndoOp): Promise<void> {
   const n = notion();
   switch (op.kind) {
     case "page_properties":
-      await call(() => n.pages.update({ page_id: op.page_id, properties: op.properties } as never));
+      await call(() => updatePage({ page_id: op.page_id, properties: op.properties }));
       break;
     case "block_update":
-      await call(() => n.blocks.update({ block_id: op.block_id, ...op.payload } as never));
+      await call(() => updateBlock({ block_id: op.block_id, ...op.payload }));
       break;
     case "block_trash":
       if (op.in_trash) await call(() => n.blocks.delete({ block_id: op.block_id }));
-      else await call(() => n.blocks.update({ block_id: op.block_id, in_trash: false } as never));
+      else await call(() => updateBlock({ block_id: op.block_id, in_trash: false }));
       break;
     case "page_trash":
-      await call(() => n.pages.update({ page_id: op.page_id, in_trash: op.in_trash } as never));
+      await call(() => updatePage({ page_id: op.page_id, in_trash: op.in_trash }));
       break;
     case "comment_delete":
       await call(() => n.comments.delete({ comment_id: op.comment_id }));
       break;
     case "page_update":
-      await call(() => n.pages.update({ page_id: op.page_id, ...op.payload } as never));
+      await call(() => updatePage({ page_id: op.page_id, ...op.payload }));
       break;
     case "page_move":
       await call(() => n.pages.move({ page_id: op.page_id, parent: op.parent } as never));
@@ -241,11 +266,11 @@ async function apply(op: UndoOp): Promise<void> {
       break;
     case "image_restore": {
       const id = await uploadLocalFile(op.path, undefined, { allowAnyPath: true });
-      await call(() => n.blocks.update({ block_id: op.block_id, image: { file_upload: { id }, ...(op.caption ? { caption: op.caption } : {}) } } as never));
+      await call(() => updateBlock({ block_id: op.block_id, image: { file_upload: { id }, ...(op.caption ? { caption: op.caption } : {}) } }));
       break;
     }
     case "schema":
-      await call(() => n.dataSources.update({ data_source_id: op.data_source_id, properties: op.properties } as never));
+      await call(() => updateDataSource({ data_source_id: op.data_source_id, properties: op.properties }));
       invalidateSchema(op.data_source_id);
       for (const v of Object.values(op.properties)) {
         const rel = (v as { relation?: { data_source_id?: string } } | null)?.relation?.data_source_id;

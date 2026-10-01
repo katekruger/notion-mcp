@@ -1,6 +1,6 @@
 # notion-plus-mcp-server
 
-A local MCP server for Notion built for precise edits. It changes exactly the block or field you point at, checks every value against the database schema before writing, previews risky changes, and can undo anything it did.
+A local MCP server for Notion built for precise edits. It changes exactly the block or field you point at, checks every value against the database schema before writing, previews risky changes, and records undo for the writes it supports (best effort; see [Undo coverage](#undo-coverage)).
 
 ## Why this instead of the built-in Notion connector
 
@@ -9,7 +9,7 @@ A local MCP server for Notion built for precise edits. It changes exactly the bl
 | Editing page content | Rewrites content | Patches one block by id, inserts at an exact position, find/replace that keeps formatting and mentions |
 | Setting properties | Values passed through as-is | Validated against the schema; forgiving name and option matching; all errors reported at once |
 | Bulk changes | One call per row | Filtered bulk update with dry-run preview and rate limiting |
-| Mistakes | Manual cleanup | Every write returns an `undo_id`; `notion_undo` reverts it |
+| Mistakes | Manual cleanup | Writes return an `undo_id` with its coverage; `notion_undo` reverts what it can and refuses if things changed since |
 | Stale overwrites | Not detected | Optional `expected_last_edited_time` refuses to write over newer edits |
 | Schema changes | Limited | Create databases with relations, rollups, formulas, unique IDs, and status groups; add, rename, retype, or delete properties; manage options and number formats. Deleted properties keep their values for undo |
 | Views | Not available | Create, edit, and delete table, board, list, calendar, timeline, gallery, form, chart, map, and dashboard views |
@@ -23,7 +23,7 @@ A local MCP server for Notion built for precise edits. It changes exactly the bl
 **3. Install.** Two ways:
 
 - **One-click bundle (Claude Desktop and Cowork).** Download the `.mcpb` file for your computer (`darwin-arm64` for Apple silicon Macs, `darwin-x64` for Intel Macs, `win32-x64`, `linux-x64`) from the [Releases](https://github.com/katekruger/notion-mcp/releases) page, double-click it (or drag it onto Claude Desktop's Settings → Extensions), and paste your integration secret when asked. You can also pick a folder uploads may come from and your time zone. Cowork runs inside Claude Desktop and uses the extensions installed there. Skip to step 5.
-- **From source** (for Claude Code, or to run automations). Requires Node 20 or later.
+- **From source** (for Claude Code, or to run automations). Requires Node 22 or later.
 
 ```bash
 git clone https://github.com/katekruger/notion-mcp.git
@@ -61,11 +61,28 @@ Claude Desktop: open Settings → Developer → Edit Config, and add this to `cl
 
 Turn off the built-in Notion connector while using this one so Claude doesn't pick between two sets of Notion tools. Keep the token out of the repo: it belongs only in your Claude config (or a local `.env`, which is gitignored).
 
-**5. Check it works.** Ask Claude "search Notion for <a page title>". You should see `notion_search` results with ids. To call tools by hand instead, run `NOTION_TOKEN=ntn_... npm run inspect` to open the MCP Inspector.
+**5. Check it works.** Ask Claude to "run notion_doctor". It checks the settings, the token, the integration's capabilities, whether any pages are shared with it, the local state folder, upload folders, and the chart renderer, and says how to fix anything that fails. Then ask "search Notion for <a page title>"; you should see `notion_search` results with ids. If a setting is invalid (a misspelled time zone, say), the server still starts and every tool answers with the exact setting to fix. To call tools by hand instead, run `NOTION_TOKEN=ntn_... npm run inspect` to open the MCP Inspector.
 
 **6. Optional: scheduled automations.** See [Automations](#automations) and [GitHub Actions](#github-actions) below.
 
 ## Tools
+
+Every tool answers with the same JSON shape:
+
+```json
+{
+  "status": "ok | partial | error",
+  "summary": "one line",
+  "data": { "...the tool's own result..." },
+  "warnings": ["things to know, such as what couldn't be copied"],
+  "undo": { "id": "a1b2c3d4", "coverage": "full | partial | none" },
+  "pagination": { "next_cursor": "…" },
+  "next_actions": ["what to do next, when there's something to do"]
+}
+```
+
+Only `status`, `summary`, and `data` are always there. Results that would be too large shrink their longest lists and say how many items were left out (`truncated`); they're always valid JSON. Results that carry page, block, comment, or row text include a warning that the text is untrusted data, and the server's instructions tell the model the same: content in Notion pages isn't a source of instructions.
+
 
 **Read**
 - `notion_search`: find pages and databases by title.
@@ -106,7 +123,9 @@ Turn off the built-in Notion connector while using this one so Claude doesn't pi
 - `notion_build_report`: a report page for a database: summary, KPI numbers, live and image charts, a table of key rows (such as overdue items), and a Mermaid Gantt chart.
 
 **Safety**
-- `notion_history`: recent changes and their undo ids.
+- `notion_history`: changes and their undo ids, newest first, paged with `cursor`. Each says whether it's undoable, partly undoable, undone, or was interrupted part-way (with the tool's input, to check by hand).
+- `notion_doctor`: check the setup and say how to fix what isn't working. Changes nothing.
+- `notion_capabilities`: what the server can do with this integration (probed with read-only calls), the API version, and the limits that matter for planning.
 - `notion_undo`: revert a change. Refuses if anything it would restore was edited afterward, and lists what; pass `force: true` to overwrite.
 
 **Automations** (see below)
@@ -173,6 +192,24 @@ Operators: `=`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `not_contains`, `starts_
 `notion_aggregate` takes `group_by` (a property, or `{"property": "Due", "by": "month"}`) and `metrics` such as `["count", "sum:Estimate", "avg:Estimate"]`. Rows with several values (multi-select, people, relations) count once in each of their groups, and relation groups show the related rows' titles. It scans up to 10,000 rows by default (`max_rows`, up to 50,000).
 
 Relation values in writes can be page ids, links, or the related row's exact title.
+
+### Undo coverage
+
+Undo is best effort: it covers the writes below, from a snapshot taken at write time, and refuses when something it would restore was edited afterward.
+
+| Write | Undo |
+|---|---|
+| Property values, page title/icon/cover/lock, moves | Restores the previous values |
+| Inserted, copied, or report blocks; created pages, rows, databases | Trashes them |
+| Patched or replaced blocks, find and replace | Restores the previous content |
+| Deleted blocks, trashed pages | Restores them from the trash |
+| Schema changes, including deleted properties | Restores the property and up to 2000 rows' values |
+| Comments added by this server | Deletes them |
+| Views created, changed, or deleted | Deletes, restores, or re-creates them |
+| Chart refreshes | Puts back the previous image (when it could be downloaded) |
+| Automation runs | Everything above that the run did, as one entry |
+
+Results say `coverage: "partial"` when part of a write can't be reverted (the entry names what), and `none` when nothing can. Undo can't see edits in the same minute as the original change (Notion reports edit times to the minute), entries roll off after 500 changes, and comments by other integrations, re-created unique IDs, and Notion-hosted files that expired can't be restored. A write interrupted by a crash is journaled as `interrupted` before it starts, so it's visible but may have nothing to undo.
 
 ## Known Notion API limits
 
@@ -296,6 +333,15 @@ GitHub may start scheduled runs a few minutes late, and turns off schedules in r
 - **Notion's built-in database automations** (the ⚡ button in a database) can't be created, read, or changed through the API. Rules here are the programmable alternative; they poll rather than react instantly.
 - **Webhooks** can push changes the moment they happen, but Notion needs a public HTTPS URL to deliver them, and a local server doesn't have one. A future option: a small hosted endpoint (or a tunnel such as Cloudflare Tunnel) that receives the webhook and triggers the workflow with `workflow_dispatch`, so rules run within seconds instead of within the hour.
 
+## Modes
+
+| Mode | What runs it | Rules | State |
+|---|---|---|---|
+| Interactive | Claude Desktop, Cowork, or Claude Code, through this server | Edited with `notion_automation`, kept in your home folder | Local state folder |
+| Local scheduled | `npm run automations` from cron or a task scheduler | Same file as interactive | Same folder |
+| GitHub runner | `.github/workflows/automations.yml`, hourly | The committed `automations/rules.json` (use `notion_automation` `deploy`) | `notion-automations-state` branch, journal in the Actions cache |
+| Webhook (planned) | A small service that reacts to Notion events | | |
+
 ## Local state
 
 Everything the server remembers lives under `~/.notion-plus` (`NOTION_PLUS_HOME` moves it), in a folder per integration: `workspaces/<integration id>/`, with `journal.json` (undo history), `charts.json` (chart recipes), `automation-state.json` (which scheduled occurrences fired), and `automation-runs.jsonl` (run log). Two integrations sharing a machine never mix their history. `NOTION_PLUS_WORKSPACE` sets the folder name instead of looking up the integration; `NOTION_PLUS_STATE` moves just the automation state file. The first time a folder is created, state from older versions (kept directly in `~/.notion-plus`) is copied into it.
@@ -305,12 +351,19 @@ These files are safe to share between several servers at once (Claude Desktop, C
 ## Development
 
 ```bash
-npm test            # offline unit tests with vitest (no network)
-npm run lint        # ESLint (typescript-eslint strict)
-npm run typecheck   # src, scripts, and tests
-npm run check       # all of the above plus the build; CI runs this on every push
-npm run test:live   # live integration suite against a real workspace
+npm test                 # offline unit and property tests with vitest (no network)
+npm run test:coverage    # the same, failing if coverage drops below the thresholds in vitest.config.ts
+npm run lint             # ESLint (typescript-eslint strict)
+npm run typecheck        # src, scripts, and tests
+npm run check            # lint, typecheck, tests with coverage, build; CI runs this on Node 22 and 24
+npm run check:version    # package.json, manifest.json, package-lock.json, and CHANGELOG.md agree
+npm run test:live        # live integration suite against a real workspace
+npm run bundle && node scripts/bundle-smoke.mjs   # build this platform's bundle and install-test it
 ```
+
+CI also fails on known high-severity advisories in runtime dependencies, reviews new dependencies in pull requests, and Dependabot proposes updates weekly. Every GitHub Action is pinned to a commit. A release builds a bundle on each platform, install-tests it (unpack, start, list every tool, render a chart), and publishes it with `sha256sums.txt`, an SBOM, and build provenance.
+
+**Live tests in CI.** `.github/workflows/live.yml` runs the smoke and acceptance suites nightly and on release tags once two repository secrets exist: `NOTION_TOKEN` (an integration used only for testing, in a throwaway workspace) and `NOTION_TEST_PAGE` (a page shared with it). Until then it passes with a notice. It never runs for pull requests, so forks can't reach the secrets.
 
 ### Evaluations and acceptance tests
 
@@ -319,7 +372,7 @@ npm run test:live   # live integration suite against a real workspace
 
 `npm run test:live` (also `npm run smoke`) needs `NOTION_TOKEN` and `NOTION_TEST_PAGE` (a page shared with the integration), from the environment or a local `.env` file (gitignored). It creates two throwaway databases under that page, runs every tool including dry runs and `notion_undo` for each write type, then moves them to the trash. It never writes outside the test page, and its undo journal goes to a temp folder. Set `SMOKE_KEEP=1` to keep the databases for inspection.
 
-Versions follow semver; see [CHANGELOG.md](CHANGELOG.md).
+Versions follow semver; see [CHANGELOG.md](CHANGELOG.md) and, for supported versions and deprecations, [SUPPORT.md](SUPPORT.md).
 
 ## Roadmap
 

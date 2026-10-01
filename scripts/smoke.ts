@@ -30,6 +30,7 @@ const { registerDatabaseTools } = await import("../src/tools/database.js");
 const { registerVisualTools } = await import("../src/tools/visuals.js");
 const { registerDoctorTools } = await import("../src/tools/doctor.js");
 const { registerTemplateTools } = await import("../src/tools/templates.js");
+const { registerWorkflowTools } = await import("../src/tools/workflows.js");
 const { runAll } = await import("../src/services/automations.js");
 const { journalWrites, unwrap } = await import("../src/tools/util.js");
 
@@ -42,7 +43,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools, registerDoctorTools, registerTemplateTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools, registerDoctorTools, registerTemplateTools, registerWorkflowTools]) {
   register(journalWrites(registry as never) as never);
 }
 
@@ -1190,6 +1191,21 @@ async function main(): Promise<void> {
     const kids = (await call(() => n.blocks.children.list({ block_id: r.page_id }))) as unknown as Json;
     expect(kids.results.some((b: Json) => b.type === "image") && kids.results.some((b: Json) => b.type === "toggle"), "chart image or data table missing");
     await must("notion_undo", { undo_id: r.undo_id });
+  });
+  await step("notion_workflow: save, run (query, foreach, comment), check outputs; undo", async () => {
+    const w = {
+      version: 2,
+      id: `smoke-${stamp}`.toLowerCase().replace(/[^a-z0-9-]/g, "-"),
+      steps: [
+        { id: "rows", query: { database: main.db, limit: 2 } },
+        { id: "each", foreach: { items: "${steps.rows.rows}", as: "row", steps: [{ id: "note", comment: { page: "${row}", text: "Workflow smoke: ${row.title}" } }] } },
+      ],
+    };
+    await must("notion_workflow", { action: "save", workflow: w });
+    const r = await must("notion_workflow", { action: "run", id: w.id });
+    expect(r.status === "succeeded" && (r.undo_ids?.length ?? 0) === 1, JSON.stringify(r).slice(0, 400));
+    for (const id of r.undo_ids) await must("notion_undo", { undo_id: id });
+    await must("notion_workflow", { action: "delete", id: w.id });
   });
   await step("notion_doctor: every check passes against the test workspace", async () => {
     const r = await tool("notion_doctor", {});

@@ -30,6 +30,7 @@ concurrency:
 env:
   NOTION_PLUS_HOME: ${{ github.workspace }}/.notion-plus
   NOTION_PLUS_RULES: ${{ github.workspace }}/automations/rules.json
+  NOTION_PLUS_WORKFLOWS: ${{ github.workspace }}/automations/workflows.json
   STATE_BRANCH: notion-automations-state
 
 jobs:
@@ -95,7 +96,7 @@ jobs:
             git -C "$dir" rm -rqf .
           fi
           if [ -d .notion-plus/workspaces ]; then
-            (cd .notion-plus && find workspaces -name automation-state.json -exec cp --parents {} "$dir" \;)
+            (cd .notion-plus && find workspaces \( -name automation-state.json -o -name workflow-runs.json \) -exec cp --parents {} "$dir" \;)
           fi
           cd "$dir"
           git add -A

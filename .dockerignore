@@ -1,0 +1,7 @@
+node_modules
+dist
+bundles
+coverage
+.notion-plus
+.env
+.env.*

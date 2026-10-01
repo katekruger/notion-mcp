@@ -3,6 +3,8 @@
 //   [--max-minutes <n>] [--require-state]
 import { access, appendFile } from "node:fs/promises";
 import { rulesPath, runAll, statePath, summarize } from "./services/automations.js";
+import { tick } from "./services/workflow/engine.js";
+import { envSinks, notify } from "./services/workflow/notify.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -47,10 +49,24 @@ async function main(): Promise<number> {
   const report = await runAll({ dryRun, force, limits, ...(ruleId ? { ruleId } : {}) });
   const text = `Run ${report.run_id}: ${report.status}\n\n${summarize(report.results)}${report.warnings.length ? `\n\nWarnings:\n- ${report.warnings.join("\n- ")}` : ""}`;
   console.log(text);
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    await appendFile(process.env.GITHUB_STEP_SUMMARY, `## Notion automations${dryRun ? " (dry run)" : ""}${force ? " (forced)" : ""}\n\n${text}\n`);
+  // Workflows (v2): resume waiting runs and start scheduled ones. Dry runs and single-rule runs leave them alone.
+  let wfText = "";
+  let wfFailed = false;
+  if (!dryRun && !ruleId) {
+    const t = await tick();
+    const all = [...t.started, ...t.resumed];
+    wfFailed = all.some((r) => r.status === "failed");
+    if (all.length) wfText = `\n\nWorkflows:\n${all.map((r) => `- ${r.workflow_id} ${r.run_id}: ${r.status}${r.waiting ? ` (waiting: ${r.waiting.kind} at ${r.waiting.step})` : ""}${r.error ? ` — ${r.error}` : ""}`).join("\n")}`;
+    console.log(wfText.trim());
   }
-  return report.status === "succeeded" ? 0 : 1;
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    await appendFile(process.env.GITHUB_STEP_SUMMARY, `## Notion automations${dryRun ? " (dry run)" : ""}${force ? " (forced)" : ""}\n\n${text}${wfText}\n`);
+  }
+  const sinks = envSinks();
+  if (!dryRun && sinks.length && report.status !== "succeeded") {
+    await notify(sinks, `Notion automations run ${report.run_id} was ${report.status}.\n${summarize(report.results.filter((r) => r.status !== "succeeded" && r.status !== "skipped")).slice(0, 2500)}`);
+  }
+  return report.status === "succeeded" && !wfFailed ? 0 : 1;
 }
 
 main().then(

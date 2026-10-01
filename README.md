@@ -121,6 +121,7 @@ Only `status`, `summary`, and `data` are always there. Results that would be too
 - `notion_views`: list, read, create, update, and delete views: table, board, list, calendar, timeline, gallery, form, map, dashboard, and Notion's native chart views (column, bar, line, donut, number, with stacking). A view can be a database tab, a linked view placed anywhere on a page, or a dashboard widget.
 - `notion_create_chart`: render a chart image (bar, column, stacked, grouped, line, area, pie, donut, scatter) from inline data or a database query, and refresh it in place later.
 - `notion_build_report`: a report page for a database: summary, KPI numbers, live and image charts, a table of key rows (such as overdue items), and a Mermaid Gantt chart.
+- `notion_workflow`: multi-step workflows with schedule, manual, or webhook triggers (see [Workflows](#workflows)).
 - `notion_template`: build pages from reusable templates (see [Templates](#templates)): list, get, validate, preview (outline, counts, and a diff against an existing page), render, save, delete, export, import.
 
 **Safety**
@@ -369,7 +370,51 @@ GitHub may start scheduled runs a few minutes late, and turns off schedules in r
 | Interactive | Claude Desktop, Cowork, or Claude Code, through this server | Edited with `notion_automation`, kept in your home folder | Local state folder |
 | Local scheduled | `npm run automations` from cron or a task scheduler | Same file as interactive | Same folder |
 | GitHub runner | `.github/workflows/automations.yml`, hourly | The committed `automations/rules.json` (use `notion_automation` `deploy`) | `notion-automations-state` branch, journal in the Actions cache |
-| Webhook (planned) | A small service that reacts to Notion events | | |
+| Webhook | `npm run webhook` or the `Dockerfile`, reacting to Notion events | Workflows in your home folder (or `NOTION_PLUS_WORKFLOWS`) | The server's `NOTION_PLUS_HOME` (mount a volume) |
+
+## Workflows
+
+Workflows are version 2 of automations: a trigger and a list of steps that run in order, with outputs that later steps use. Manage them with `notion_workflow` (`save`, `run`, `runs`, `run_status`, `resume`, `cancel`, `convert`, …); they're kept in `workflows.json` in the home folder (`NOTION_PLUS_WORKFLOWS` moves it; the GitHub workflow uses the repo's `automations/workflows.json`). Rules keep working, and `convert` turns a rule into an equivalent workflow (saved disabled, so you can check it first).
+
+```json
+{
+  "version": 2,
+  "id": "launch-review",
+  "trigger": { "webhook": { "events": ["page.properties_updated"], "database": "https://www.notion.so/…" } },
+  "steps": [
+    { "id": "ready", "query": { "database": "https://www.notion.so/…", "where": { "Status": "Ready for review" } } },
+    { "id": "each", "foreach": { "items": "${steps.ready.rows}", "as": "row", "steps": [
+      { "id": "ask", "approval": { "page": "${row}", "property": "Approved", "message": "Approve ${row.title} for launch?" } },
+      { "id": "ship", "set": { "page": "${row}", "values": { "Status": "Launched", "Launched on": "${today}" } } },
+      { "id": "tell", "slack": { "webhook": "${secret:launch_slack}", "text": "Launched: ${row.title} ${row.url}" }, "retry": { "attempts": 3 } }
+    ] } }
+  ],
+  "on_failure": [{ "comment": "https://www.notion.so/…ops-page" }]
+}
+```
+
+**Triggers:** `manual` (always available through `run`), `schedule` (same forms as rules, in the server's time zone), and `webhook` (Notion events, optionally only for one database).
+
+**Steps:** each has an `id`, and may have `if` (a `${…}` reference that must be set and not empty), `retry` (`attempts`, `backoff_seconds`), `timeout_seconds`, and `continue_on_error`. Actions:
+- Notion: `query` (rows with `id`, `url`, `title`, and every property), `set`, `append`, `comment`, `create_page`, `move_page`, `duplicate_page`, `trash`, `replace_text`, `export_markdown`, `render_template`.
+- Outside: `http` (to hosts listed in `NOTION_PLUS_HTTP_ALLOW`, comma-separated, `*.example.com` allowed) and `slack` (an incoming-webhook URL, best kept as a secret).
+- Control: `foreach` (over a list, `${item}` or the `as` name), `switch` (cases by value), `approval` (pauses until a checkbox is checked or a comment containing a keyword is posted; optional request comment and expiry), `delay` (pauses for minutes), and `run_workflow` (another workflow, with inputs).
+
+**References:** `${steps.<id>.<path>}`, `${trigger.*}` (for webhooks: `event`, `page_id`, `entity`, `data`), `${inputs.*}`, `${today}`, `${now}`, and `${secret:NAME}`, read from the environment variable `NOTION_PLUS_SECRET_NAME`. Secret values are replaced with `***` everywhere a run is stored or shown.
+
+**Durable runs.** Every step's state is saved as it changes. A run that fails, pauses, or is interrupted continues after the last finished step (`resume`, or the next scheduler pass). A step that started but didn't finish is retried as a resume: creating steps first look for what the interrupted attempt already made (a page with the same title, a comment with the same text, appended blocks created since it started) and adopt or remove it, so retries don't duplicate content; HTTP steps send an `Idempotency-Key` header for the same reason. (Rules get the same protection for retried appends.) Each run records undo for what it wrote, and `on_failure` reports failed runs to Slack, an HTTP endpoint, or a page comment. Set `NOTION_PLUS_NOTIFY` (for example `slack:ops_slack,comment:<page>`) to be told about failed or partial rule runs too.
+
+**Scheduling.** Each `npm run automations` (hourly in GitHub Actions) also starts scheduled workflows that are due and continues waiting runs whose approval or delay has come. Run state is saved on the `notion-automations-state` branch with the rules' state.
+
+### Webhook mode
+
+`npm run webhook` (or the `Dockerfile`) runs a small server that reacts to Notion events within seconds instead of within the hour:
+
+1. Run it somewhere Notion can reach over HTTPS (behind a reverse proxy, a tunnel such as Cloudflare Tunnel, or a platform that terminates TLS), with `NOTION_TOKEN`, a persistent `NOTION_PLUS_HOME` (the container uses `/data`), and optionally `NOTION_PLUS_WEBHOOK_PORT` (default 8787).
+2. In the integration's settings, add a webhook subscription to `https://<your host>/notion/webhook`. Notion sends a verification token; the server logs it. Paste it into Notion to verify, and set `NOTION_PLUS_WEBHOOK_TOKEN` to it (restart).
+3. Give workflows a `webhook` trigger.
+
+Every delivery must carry a valid `X-Notion-Signature` (HMAC-SHA256 of the body with that token). Events are accepted once (by id, remembered for a week), only if they're less than 10 minutes old, and acknowledged right away; a worker then starts the matching workflows, retrying with backoff, and moves an event that fails five times to dead letters. `notion_workflow` `events` lists the queue, `replay` retries an event, and `discard` drops one. `GET /healthz` reports queued and dead events. The same worker continues waiting runs and starts scheduled workflows every minute, so hourly polling becomes a fallback.
 
 ## Local state
 
@@ -414,4 +459,4 @@ Built in phases, each ending with the build, unit tests, and the live suite pass
 5. Automations: schedules, run state, more actions, full management from Claude. (done, 0.6.0)
 6. Distribution: MCP Bundle, tool evaluations, acceptance tests, API version 2026-03-11. (done, 0.7.0)
 
-Possible next steps: webhooks through a small hosted relay for instant automations.
+Next: hosted team mode (multi-user, OAuth, a shared database); see [docs/hosted-design.md](docs/hosted-design.md).

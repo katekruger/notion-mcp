@@ -2,7 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { call, mapLimited, normalizeId, notion, read } from "../services/notion.js";
 import { dataSourceTitle, resolveDataSource } from "../services/schema.js";
-import type { ChartRow } from "../services/charts.js";
+import { CHART_DATA_SHAPES, renderCustom, type ChartRow } from "../services/charts.js";
+import { appendSpecs } from "../services/blocks.js";
 import { pointsFromDatabase } from "../services/chartdata.js";
 import { saveChart } from "../services/chartstore.js";
 import { describeView, viewRequest, viewRestorePayload, viewSpecSchema } from "../services/views.js";
@@ -11,6 +12,7 @@ import { insertedBlocks, record } from "../services/journal.js";
 import {
   buildReport,
   captionFor,
+  chartDataBlocks,
   chartSourceSchema,
   chartSpecSchema,
   createView,
@@ -19,6 +21,7 @@ import {
   renderAndUpload,
   ReportError,
   reportArgsShape,
+  uploadChart,
   rowSchema,
   type Placement,
 } from "../services/visualops.js";
@@ -118,12 +121,15 @@ export function registerVisualTools(server: McpServer): void {
     {
       title: "Create or Refresh Chart Image",
       description:
-        "Render a chart as a PNG and put it on a page, or refresh an existing chart image in place. Types: bar, column, " +
-        "stacked_bar, stacked_column, grouped_column, line, area, stacked_area, pie, donut, scatter. Data is inline `data` " +
-        "([{x, y, series?}]) or a `source` query that groups a database (x, y like \"count\" or \"sum:Estimate\", optional series). " +
-        "Uses one validated, colorblind-safe palette. The chart's recipe is remembered, so `refresh_block_id` re-renders it from " +
-        "current data. Prefer notion_views chart views when a live, clickable Notion chart is enough; use this for chart types " +
-        "Notion lacks, data from outside Notion, or a fixed snapshot. Reversible with notion_undo.",
+        "Render a chart image (PNG, or SVG) and put it on a page, or refresh an existing chart image in place. Types: bar, column, " +
+        "stacked_bar, stacked_column, grouped_column, line, area, stacked_area, pie, donut, scatter, and " +
+        Object.entries(CHART_DATA_SHAPES).map(([t, shape]) => `${t} (${shape})`).join("; ") +
+        ". Data is inline `data` ([{x, y, series?}]) or a `source` query that groups a database (x, y like \"count\" or " +
+        "\"sum:Estimate\", optional series). `annotations` add labeled reference lines; `palette` picks colors (default is a " +
+        "validated colorblind-safe order). `data_table` adds a toggle under the chart with a description and the numbers, for " +
+        "readers who can't see the image. For anything the types don't cover, pass a full Vega-Lite spec as `vega_lite` (data " +
+        "inline only; nothing is fetched). The recipe is remembered, so `refresh_block_id` re-renders it from current data. " +
+        "Prefer notion_views chart views when a live Notion chart is enough. Reversible with notion_undo.",
       inputSchema: {
         chart: chartSpecSchema.optional().describe("Required for a new chart; optional on refresh (keeps the stored one)."),
         data: z.array(rowSchema).max(5000).optional(),
@@ -133,11 +139,36 @@ export function registerVisualTools(server: McpServer): void {
         after_block_id: z.string().optional(),
         refresh_block_id: z.string().optional().describe("An image block made by this tool: re-render it in place."),
         caption: z.string().optional(),
+        format: z.enum(["png", "svg"]).default("png").describe("png (default) or svg (sharp at any zoom)."),
+        data_table: z.boolean().default(false).describe("Add a toggle under the chart with a description and the data, as a text alternative."),
+        vega_lite: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe("Advanced: a complete Vega-Lite spec (data in data.values) instead of chart + data. Not refreshable."),
       },
       annotations: WRITE,
     },
-    safe(async ({ chart, data, source, parent, position, after_block_id, refresh_block_id, caption }) => {
+    safe(async ({ chart, data, source, parent, position, after_block_id, refresh_block_id, caption, format, data_table, vega_lite }) => {
       if (data && source) throw new Error("Give `data` or `source`, not both.");
+      if (vega_lite) {
+        if (chart || data || source || refresh_block_id) throw new Error("`vega_lite` replaces chart, data, and source, and can't refresh an existing chart.");
+        if (!parent) throw new Error("A new chart needs `parent` (the page or block to put it in).");
+        if (position === "after_block" && !after_block_id) throw new Error("position=after_block needs after_block_id.");
+        const { bytes } = await renderCustom(vega_lite, "light", format);
+        const title = typeof (vega_lite.title as { text?: string } | string | undefined) === "string" ? (vega_lite.title as string) : (vega_lite.title as { text?: string } | undefined)?.text;
+        const uploadId = await uploadChart(bytes, title, format);
+        const parentId = normalizeId(parent);
+        const res = await call(() =>
+          notion().blocks.children.append({
+            block_id: parentId,
+            children: [{ type: "image", image: { type: "file_upload", file_upload: { id: uploadId }, caption: textToTitle(caption ?? title ?? "Chart") } }],
+            position: position === "after_block" ? { type: "after_block", after_block: { id: normalizeId(after_block_id as string) } } : { type: position },
+          } as never)
+        );
+        const blockId = res.results[0].id;
+        const journalId = await record("notion_create_chart", `Added a custom Vega-Lite chart to ${parentId}`, insertedBlocks([blockId], parentId));
+        return ok({ block_id: blockId, format, undo_id: journalId, note: "Custom specs aren't refreshable; call again with an updated spec to replace it." });
+      }
       if (refresh_block_id) {
         const r = await refreshChart({ block_id: refresh_block_id, ...(chart ? { chart } : {}), ...(data ? { data } : {}), ...(source ? { source } : {}), ...(caption ? { caption } : {}) });
         const { undo, ...rest } = r;
@@ -150,7 +181,7 @@ export function registerVisualTools(server: McpServer): void {
       if (position === "after_block" && !after_block_id) throw new Error("position=after_block needs after_block_id.");
       const got = source ? await pointsFromDatabase(source) : null;
       const points = got?.points ?? (data as ChartRow[]);
-      const { uploadId, notes } = await renderAndUpload(chart, points);
+      const { uploadId, notes, alt } = await renderAndUpload(chart, points, format);
       const parentId = normalizeId(parent);
       const res = await call(() =>
         notion().blocks.children.append({
@@ -160,11 +191,16 @@ export function registerVisualTools(server: McpServer): void {
         } as never)
       );
       const blockId = res.results[0].id;
+      const inserted = [blockId];
+      if (data_table) inserted.push(...(await appendSpecs(parentId, [chartDataBlocks(alt, points)], { type: "after_block", after_block_id: blockId })));
       const now = new Date().toISOString();
-      await saveChart({ block_id: blockId, page_id: parentId, spec: chart, ...(source ? { source } : { data: points }), created: now, updated: now });
-      const journalId = await record("notion_create_chart", `Added ${chart.type} chart "${chart.title ?? ""}" to ${parentId}`, insertedBlocks([blockId], parentId));
+      await saveChart({ block_id: blockId, page_id: parentId, spec: chart, format, ...(source ? { source } : { data: points }), created: now, updated: now });
+      const journalId = await record("notion_create_chart", `Added ${chart.type} chart "${chart.title ?? ""}" to ${parentId}`, insertedBlocks(inserted, parentId));
       return ok({
         block_id: blockId,
+        format,
+        alt_text: alt,
+        ...(data_table ? { data_table_block: inserted[1] } : {}),
         points: points.length,
         ...(got ? { rows_scanned: got.rows, ...(got.more ? { warning: "More rows matched than max_rows; the chart uses the first ones." } : {}) } : {}),
         ...(notes.length ? { notes } : {}),

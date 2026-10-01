@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 const tools = new Map<string, { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean }>();
 const registry = { registerTool: (name: string, c: { annotations?: object }) => tools.set(name, c.annotations ?? {}) };
 for (const m of await Promise.all(
-  ["read", "pages", "blocks", "schema", "automations", "content", "database", "visuals", "doctor"].map((f) => import(`../src/tools/${f}.ts`))
+  ["read", "pages", "blocks", "schema", "automations", "content", "database", "visuals", "doctor", "templates"].map((f) => import(`../src/tools/${f}.ts`))
 )) {
   for (const [k, fn] of Object.entries(m)) if (k.startsWith("register") && typeof fn === "function") (fn as (r: unknown) => void)(registry);
 }
@@ -15,7 +15,7 @@ const DESTRUCTIVE = ["notion_trash_page", "notion_delete_blocks", "notion_bulk_u
 const IDEMPOTENT_WRITES = ["notion_update_properties", "notion_bulk_update", "notion_patch_block", "notion_update_page"];
 
 test("every tool declares its annotations", () => {
-  assert.equal(tools.size, 31);
+  assert.equal(tools.size, 32);
   for (const [name, a] of tools) {
     for (const k of ["readOnlyHint", "destructiveHint", "idempotentHint"] as const) assert.equal(typeof a[k], "boolean", `${name}.${k}`);
   }

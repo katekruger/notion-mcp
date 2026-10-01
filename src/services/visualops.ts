@@ -216,6 +216,61 @@ export const reportArgsShape = {
 export const reportArgsSchema = z.object(reportArgsShape);
 export type ReportArgs = z.infer<typeof reportArgsSchema>;
 
+/** What a report needs to know about a database: its title, status and due-date properties, and row helpers. */
+export function reportFacts(ds: DataSourceObjectResponse) {
+  const titleProp = Object.values(ds.properties).find((p) => p.type === "title")?.name as string;
+  const statusProp = Object.values(ds.properties).find((p) => p.type === "status");
+  const completeIds = statusProp && statusProp.type === "status" ? statusProp.status.groups.find((g) => g.name === "Complete")?.option_ids ?? [] : [];
+  const completeNames = statusProp && statusProp.type === "status" ? statusProp.status.options.filter((o) => completeIds.includes(o.id)).map((o) => o.name) : [];
+  const isComplete = (p: PageObjectResponse) => Boolean(statusProp && completeNames.includes(String(simplify(p.properties[statusProp.name]) ?? "")));
+  const dueProp = Object.values(ds.properties).find((p) => p.type === "date" && /due|deadline|end|target/i.test(p.name)) ?? Object.values(ds.properties).find((p) => p.type === "date");
+  const dateOf = (p: PageObjectResponse, name: string): string | null => {
+    const v = simplify(p.properties[name]);
+    return typeof v === "string" ? v.slice(0, 10) : v && typeof v === "object" ? String((v as { start: string }).start).slice(0, 10) : null;
+  };
+  return { titleProp, statusProp, dueProp, isComplete, dateOf };
+}
+
+/** "**12** rows · **5** complete (42%) · **2** overdue": completion needs a status property, overdue a date too. */
+export function summaryLine(ds: DataSourceObjectResponse, pages: PageObjectResponse[], now: string): string {
+  const { statusProp, dueProp, isComplete, dateOf } = reportFacts(ds);
+  const parts = [`**${pages.length}** ${pages.length === 1 ? "row" : "rows"}`];
+  if (statusProp) {
+    const done = pages.filter(isComplete).length;
+    parts.push(`**${done}** complete (${pages.length ? Math.round((done / pages.length) * 100) : 0}%)`);
+  }
+  if (statusProp && dueProp) {
+    const overdue = pages.filter((p) => !isComplete(p) && (dateOf(p, dueProp.name) ?? "9999") < now).length;
+    parts.push(`**${overdue}** overdue`);
+  }
+  return parts.join(" · ");
+}
+
+/** Gantt tasks from dated rows, earliest first: done rows marked done, overdue ones critical. */
+export function ganttTasks(ds: DataSourceObjectResponse, pages: PageObjectResponse[], g: { start: string; end?: string; section?: string; limit: number }, now: string): GanttTask[] {
+  const { titleProp, dueProp, isComplete, dateOf } = reportFacts(ds);
+  const start = resolvePropertyName(ds, g.start).name;
+  const end = g.end ? resolvePropertyName(ds, g.end).name : undefined;
+  const section = g.section ? resolvePropertyName(ds, g.section).name : undefined;
+  return pages
+    .map((p) => {
+      const raw = simplify(p.properties[start]);
+      const s = typeof raw === "string" ? raw : raw && typeof raw === "object" ? (raw as { start: string }).start : null;
+      const e = end ? dateOf(p, end) : raw && typeof raw === "object" ? ((raw as { end?: string | null }).end ?? null) : null;
+      return { p, s, e };
+    })
+    .filter((r) => r.s)
+    .sort((x, y) => String(x.s).localeCompare(String(y.s)))
+    .slice(0, g.limit)
+    .map(({ p, s, e }) => ({
+      name: plain((p.properties[titleProp] as { title: Parameters<typeof plain>[0] }).title) || "(untitled)",
+      start: String(s),
+      end: e,
+      ...(section ? { section: groupKeys(p.properties[section])[0] } : {}),
+      status: isComplete(p) ? "done" : dueProp && (dateOf(p, dueProp.name) ?? "9999") < now ? "crit" : null,
+    }));
+}
+
 /** Build a report page. Returns what was built and the undo ops (trash the page). */
 export async function buildReport(a: ReportArgs) {
   const ds = await resolveDataSource(a.database, a.data_source_name);
@@ -224,17 +279,8 @@ export async function buildReport(a: ReportArgs) {
   const { pages: all, more } = await queryAll(ds.id, { ...(scope ? { filter: scope } : {}), max: 10_000 });
   const notes: string[] = [];
   if (more) notes.push("More than 10,000 rows matched; the report covers the first 10,000.");
-  const titleProp = Object.values(ds.properties).find((p) => p.type === "title")?.name as string;
-  const statusProp = Object.values(ds.properties).find((p) => p.type === "status");
-  const completeIds = statusProp && statusProp.type === "status" ? statusProp.status.groups.find((g) => g.name === "Complete")?.option_ids ?? [] : [];
-  const completeNames = statusProp && statusProp.type === "status" ? statusProp.status.options.filter((o) => completeIds.includes(o.id)).map((o) => o.name) : [];
-  const isComplete = (p: PageObjectResponse) => Boolean(statusProp && completeNames.includes(String(simplify(p.properties[statusProp.name]) ?? "")));
-  const dueProp = Object.values(ds.properties).find((p) => p.type === "date" && /due|deadline|end|target/i.test(p.name)) ?? Object.values(ds.properties).find((p) => p.type === "date");
+  const { titleProp, statusProp, dueProp } = reportFacts(ds);
   const now = today();
-  const dateOf = (p: PageObjectResponse, name: string): string | null => {
-    const v = simplify(p.properties[name]);
-    return typeof v === "string" ? v.slice(0, 10) : v && typeof v === "object" ? String((v as { start: string }).start).slice(0, 10) : null;
-  };
   const filterPages = async (where?: Record<string, unknown>): Promise<PageObjectResponse[]> => {
     if (!where) return all;
     const f = await buildWhereFilter(ds, where);
@@ -245,18 +291,7 @@ export async function buildReport(a: ReportArgs) {
   const dbMention = `<mention-database url="${(ds.parent as { database_id?: string }).database_id ?? ds.id}"/>`;
   specs.push({ type: "paragraph", text: `Built from ${dbMention} on <mention-date start="${now}"/>${a.where ? " (filtered)" : ""}.`, color: "gray" });
 
-  if (a.summary) {
-    const parts = [`**${all.length}** ${all.length === 1 ? "row" : "rows"}`];
-    if (statusProp) {
-      const done = all.filter(isComplete).length;
-      parts.push(`**${done}** complete (${all.length ? Math.round((done / all.length) * 100) : 0}%)`);
-    }
-    if (statusProp && dueProp) {
-      const overdue = all.filter((p) => !isComplete(p) && (dateOf(p, dueProp.name) ?? "9999") < now).length;
-      parts.push(`**${overdue}** overdue`);
-    }
-    specs.push({ type: "callout", icon: "📊", color: "gray_background", text: parts.join(" · ") });
-  }
+  if (a.summary) specs.push({ type: "callout", icon: "📊", color: "gray_background", text: summaryLine(ds, all, now) });
 
   // KPIs: numbers side by side.
   let kpis = a.kpis;
@@ -342,31 +377,10 @@ export async function buildReport(a: ReportArgs) {
   // Gantt of dated work.
   if (a.gantt) {
     const g = a.gantt;
-    const start = resolvePropertyName(ds, g.start).name;
-    const end = g.end ? resolvePropertyName(ds, g.end).name : undefined;
-    const section = g.section ? resolvePropertyName(ds, g.section).name : undefined;
-    const rows = (await filterPages(g.where))
-      .map((p) => {
-        const raw = simplify(p.properties[start]);
-        const s = typeof raw === "string" ? raw : raw && typeof raw === "object" ? (raw as { start: string }).start : null;
-        const e = end ? dateOf(p, end) : raw && typeof raw === "object" ? ((raw as { end?: string | null }).end ?? null) : null;
-        return { p, s, e };
-      })
-      .filter((r) => r.s)
-      .sort((x, y) => String(x.s).localeCompare(String(y.s)))
-      .slice(0, g.limit);
+    const tasks = ganttTasks(ds, await filterPages(g.where), g, now);
     specs.push({ type: "heading_2", text: g.title });
-    if (rows.length === 0) specs.push({ type: "paragraph", text: "No dated rows match.", color: "gray" });
-    else {
-      const tasks: GanttTask[] = rows.map(({ p, s, e }) => ({
-        name: plain((p.properties[titleProp] as { title: Parameters<typeof plain>[0] }).title) || "(untitled)",
-        start: String(s),
-        end: e,
-        ...(section ? { section: groupKeys(p.properties[section])[0] } : {}),
-        status: isComplete(p) ? "done" : dueProp && (dateOf(p, dueProp.name) ?? "9999") < now ? "crit" : null,
-      }));
-      specs.push({ type: "code", language: "mermaid", text: ganttChart(undefined, tasks) });
-    }
+    if (tasks.length === 0) specs.push({ type: "paragraph", text: "No dated rows match.", color: "gray" });
+    else specs.push({ type: "code", language: "mermaid", text: ganttChart(undefined, tasks) });
   }
   specs.push({ type: "divider" }, { type: "paragraph", text: `Rebuild this report to refresh the numbers. Image charts refresh with notion_create_chart.`, color: "gray" });
 

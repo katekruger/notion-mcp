@@ -146,7 +146,6 @@ export const BUILTIN_TEMPLATES: unknown[] = [
       findings: { type: "list", default: [], description: "[{finding, evidence, source}]" },
       method: { type: "string" },
       data: { type: "list", default: [], description: "Optional chart rows [{x, y, series?}]" },
-      chart_type: { type: "string", default: "column" },
       chart_title: { type: "string", default: "Data" },
       open_questions: { type: "list", default: [] },
       sources: { type: "list", default: [] },
@@ -170,6 +169,51 @@ export const BUILTIN_TEMPLATES: unknown[] = [
       { if: "open_questions", then: [{ heading: "Open questions", level: 3 }, { each: "open_questions", as: "q", blocks: [{ markdown: "- {{q}}" }] }] },
       { if: "sources", then: [{ heading: "Sources", level: 3 }, { each: "sources", as: "s", blocks: [{ markdown: "{{s_index}}. {{s}}" }] }] },
       { slot: "appendix" },
+    ],
+  },
+  {
+    version: 1,
+    name: "database-report",
+    description:
+      "The report notion_build_report makes, as a template you can copy and change: a summary of a database (rows, completion, " +
+      "overdue), KPIs, one chart, a table of key rows with a live view, and a Gantt of dated work.",
+    variables: {
+      database: { type: "string", required: true, description: "Database URL or id" },
+      title: { type: "string", default: "Report" },
+      where: { type: "object", default: {}, description: "Limits the summary, chart, and table to these rows" },
+      kpis: { type: "list", default: [], description: "[{label, metric: {database, value: \"count\" | \"sum:Prop\", where}}]" },
+      chart_x: { type: "string", default: "", description: "Group the chart by this property (no chart when empty)" },
+      chart_title: { type: "string", default: "Breakdown" },
+      table_title: { type: "string", default: "Key rows" },
+      table_where: { type: "object", default: {}, description: "Rows for the table, e.g. {\"Status\": {\"not\": \"Done\"}}" },
+      table_properties: { type: "list", default: [], description: "Columns (default: the title)" },
+      gantt_start: { type: "string", default: "", description: "Date property for the Gantt (no Gantt when empty)" },
+      gantt_end: { type: "string", default: "" },
+    },
+    title: "{{title}} · {{today}}",
+    icon: "📊",
+    blocks: [
+      { summary: { database: "{{database}}", where: "{{where}}" } },
+      { if: "kpis", then: [{ kpis: "{{kpis}}" }] },
+      { if: "chart_x", then: [{ heading: "{{chart_title}}" }, { chart: { spec: { type: "column", title: "{{chart_title}}" }, source: { database: "{{database}}", x: "{{chart_x}}", where: "{{where}}" } } }] },
+      {
+        if: "table_properties",
+        then: [{ heading: "{{table_title}}" }, { table: { query: { database: "{{database}}", where: "{{table_where}}", properties: "{{table_properties}}" } } }],
+        else: [{ heading: "{{table_title}}" }, { table: { query: { database: "{{database}}", where: "{{table_where}}" } } }],
+      },
+      {
+        if: "gantt_start",
+        then: [
+          { heading: "Timeline" },
+          {
+            if: "gantt_end",
+            then: [{ gantt: { query: { database: "{{database}}", start: "{{gantt_start}}", end: "{{gantt_end}}", where: "{{where}}" } } }],
+            else: [{ gantt: { query: { database: "{{database}}", start: "{{gantt_start}}", where: "{{where}}" } } }],
+          },
+        ],
+      },
+      { divider: true },
+      { markdown: "Render this template again to refresh the numbers." },
     ],
   },
 ];

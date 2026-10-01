@@ -41,9 +41,10 @@ test("every built-in template is valid and compiles with sample values", async (
     },
     "research-dossier": { topic: "Pricing", question: "Raise prices?", summary: "Yes, modestly.", findings: [{ finding: "Low churn", evidence: "2%", source: "Data" }], data: [{ x: "A", y: 2 }] },
   };
-  assert.equal(BUILTIN_TEMPLATES.length, 4);
+  assert.equal(BUILTIN_TEMPLATES.length, 5);
   for (const raw of BUILTIN_TEMPLATES) {
     const tmpl = t.parseTemplate(raw);
+    if (tmpl.name === "database-report") continue; // reads a database; tested below with a fake client
     const c = await t.compileTemplate(tmpl, samples[tmpl.name]);
     assert.ok(c.specs.length > 3, tmpl.name);
     assert.ok(!c.title.includes("{{"), `${tmpl.name}: ${c.title}`);
@@ -155,8 +156,120 @@ test("saved templates: save, list (replacing a built-in by name), delete", async
   await t.saveTemplate(mine);
   const all = await t.listTemplates();
   assert.equal(all.find((x) => x.template.name === "content-brief")?.builtin, false);
-  assert.equal(all.length, 4);
+  assert.equal(all.length, 5);
   assert.equal(await t.deleteTemplate("content-brief"), true);
   assert.equal((await t.listTemplates()).find((x) => x.template.name === "content-brief")?.builtin, true);
   assert.equal(await t.deleteTemplate("content-brief"), false);
+});
+
+const rt = (text: string) => [{ type: "text", text: { content: text, link: null }, annotations: {}, plain_text: text, href: null }];
+const DS = "2a1b3c4d-0000-4000-8000-000000000001";
+
+/** A Tasks database (title, status with groups, due date, owner) whose queries return every row and record the filter. */
+function fakeTasks() {
+  const filters: unknown[] = [];
+  const row = (id: string, name: string, status: string, due: string | null, owner: string) => ({
+    object: "page",
+    id,
+    url: `https://notion.so/${id.replace(/-/g, "")}`,
+    parent: { type: "data_source_id", data_source_id: DS },
+    properties: {
+      Name: { id: "t", type: "title", title: rt(name) },
+      Status: { id: "s", type: "status", status: { name: status } },
+      Due: { id: "d", type: "date", date: due ? { start: due, end: null } : null },
+      Owner: { id: "o", type: "select", select: { name: owner } },
+    },
+  });
+  const rows = [
+    row("2a1b3c4d-0000-4000-8000-0000000000a1", "Spec", "Done", "2026-09-01", "Ana"),
+    row("2a1b3c4d-0000-4000-8000-0000000000a2", "Build", "In progress", "2026-09-20", "Kim"),
+    row("2a1b3c4d-0000-4000-8000-0000000000a3", "Ship", "Not started", "2099-01-01", "Kim"),
+  ];
+  const client = {
+    dataSources: {
+      retrieve: async () => ({
+        object: "data_source",
+        id: DS,
+        title: rt("Tasks"),
+        parent: { type: "database_id", database_id: DS },
+        properties: {
+          Name: { id: "t", name: "Name", type: "title", title: {} },
+          Status: {
+            id: "s",
+            name: "Status",
+            type: "status",
+            status: {
+              options: [{ id: "s1", name: "Not started", color: "gray" }, { id: "s2", name: "In progress", color: "blue" }, { id: "s3", name: "Done", color: "green" }],
+              groups: [{ id: "g1", name: "To-do", color: "gray", option_ids: ["s1"] }, { id: "g2", name: "In progress", color: "blue", option_ids: ["s2"] }, { id: "g3", name: "Complete", color: "green", option_ids: ["s3"] }],
+            },
+          },
+          Due: { id: "d", name: "Due", type: "date", date: {} },
+          Owner: { id: "o", name: "Owner", type: "select", select: { options: [{ id: "a", name: "Ana", color: "red" }, { id: "k", name: "Kim", color: "blue" }] } },
+        },
+      }),
+      query: async (a: { filter?: unknown }) => {
+        filters.push(a.filter ?? null);
+        return { object: "list", results: rows, has_more: false, next_cursor: null };
+      },
+    },
+  };
+  return { client, filters };
+}
+
+test("database-report: summary, chart, table, and Gantt come from the database; where flows into the queries", async () => {
+  const { client, filters } = fakeTasks();
+  setClientForTests(client as unknown as Client);
+  try {
+    const tmpl = t.parseTemplate(BUILTIN_TEMPLATES.find((x) => (x as { name: string }).name === "database-report"));
+    const c = await t.compileTemplate(tmpl, {
+      database: DS,
+      title: "Tasks",
+      where: { Owner: "Kim" },
+      chart_x: "Status",
+      table_where: { Status: { not: "Done" } },
+      table_properties: ["Name", "Status", "Due"],
+      gantt_start: "Due",
+    });
+    const lines = t.outline(c.specs);
+    // Summary: 3 rows (the fake ignores filters), 1 complete, 1 overdue (Build: due 2026-09-20, not done).
+    assert.match(lines[0], /\*\*3\*\* rows · \*\*1\*\* complete \(33%\) · \*\*1\*\* overdue/);
+    assert.ok(lines.some((l) => /\[chart: Breakdown\]/.test(l)), lines.join("\n"));
+    assert.equal(c.charts.length, 1);
+    assert.deepEqual(c.charts[0].rows.map((r) => r.x).sort(), ["Done", "In progress", "Not started"]);
+    const table = c.specs.find((s) => s.type === "table") as BlockSpec & { rows: string[][] };
+    assert.deepEqual(table.rows[0], ["Name", "Status", "Due"]);
+    const gantt = c.specs.find((s) => s.type === "code") as BlockSpec;
+    assert.match(gantt.text ?? "", /gantt[\s\S]*Spec[\s\S]*:done[\s\S]*Build[\s\S]*:crit/);
+    // The `where` variable reached the queries as a real filter, not text.
+    assert.ok(filters.some((f) => JSON.stringify(f).includes("Kim")), JSON.stringify(filters));
+    assert.ok(!JSON.stringify(c.specs).includes("{{"));
+  } finally {
+    setClientForTests(null);
+  }
+});
+
+test("database-report with only the database: summary and table, no chart or Gantt", async () => {
+  const { client } = fakeTasks();
+  setClientForTests(client as unknown as Client);
+  try {
+    const tmpl = t.parseTemplate(BUILTIN_TEMPLATES.find((x) => (x as { name: string }).name === "database-report"));
+    const c = await t.compileTemplate(tmpl, { database: DS });
+    assert.equal(c.charts.length, 0);
+    assert.ok(!c.specs.some((s) => s.type === "code"));
+    assert.ok(c.specs.some((s) => s.type === "table"));
+  } finally {
+    setClientForTests(null);
+  }
+});
+
+test("a {{variable}} where an object is expected must hold an object", async () => {
+  const { client } = fakeTasks();
+  setClientForTests(client as unknown as Client);
+  try {
+    const x = tpl([{ summary: { database: DS, where: "{{w}}" } }], { variables: { w: { type: "string" } } });
+    await assert.rejects(t.compileTemplate(x, { w: "Status = Done" }), /should be an object/);
+    assert.throws(() => tpl([{ summary: { database: DS, where: "Status = Done" } }]), /value or a \{\{variable\}\}/);
+  } finally {
+    setClientForTests(null);
+  }
 });

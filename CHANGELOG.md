@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 1.0.0-beta.2
+
+Finishes the two items batch 5 left open.
+
+### Added
+- **Chart types `sankey` and `network`.**
+  - Both are laid out in `src/services/graphlayout.ts`, so the same data always draws the same picture, then drawn with Vega marks.
+  - **Sankey:** columns by depth with sinks last, one scale for all node heights, ribbons in the source node's color, and labels with values. Loops and self-flows are refused with a clear message.
+  - **Network:** nodes on a circle, sized by total link weight, with lines as thick as their weight.
+  - Both are capped at 60 nodes, and both write their own alt text.
+- **Template nodes:**
+  - `summary`: a database's rows, completion and overdue count, the same line `notion_build_report` writes.
+  - `gantt.query`: a Gantt of a database's dated rows (start, optional end, `where`, `limit`).
+- **Whole-variable values in templates:** fields that take an object or list (`where`, `properties`) accept a whole `"{{variable}}"`. It's checked again once filled in.
+- **Built-in template `database-report`:** `notion_build_report`'s page as a template (summary, KPIs, a chart, a table of key rows, a Gantt), ready to copy and change.
+
+### Changed
+- `notion_build_report` and templates now share the summary and Gantt code (`reportFacts`, `summaryLine`, `ganttTasks` in `visualops.ts`), so the two can't drift apart. The tool keeps its arguments and output.
+- **CI:**
+  - Dependency review is skipped, with a notice, when the repository's Dependency graph is off, instead of failing.
+  - A new `docker` job builds the webhook image and checks that it starts, answers `/healthz` and rejects unsigned deliveries.
+
 ## 1.0.0-beta.1
 
 Workflows, webhooks, and retries that don't duplicate (audit batch 6: P2-01, P2-02; P2-16 designed).
@@ -68,8 +90,7 @@ Templates and a wider chart catalog (audit batch 5: P2-03, P2-04, P3-07).
 - Chart rendering has a 20-second time limit and can't load anything: the renderer's loader refuses every request.
 
 ### Not done (planned)
-- Sankey and network diagrams. They need layout code that Vega doesn't provide.
-- Rebuilding `notion_build_report` on top of templates. It keeps its own implementation for now.
+- Sankey and network diagrams, and `notion_build_report` on templates (both done in 1.0.0-beta.2).
 
 ## 0.11.0
 

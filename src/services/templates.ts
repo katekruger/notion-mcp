@@ -15,7 +15,7 @@ import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyNa
 import { queryAll } from "./query.js";
 import { computeMetric } from "./aggregate.js";
 import { parseMetric, pointsFromDatabase, chartSourceSchema, type ChartSource } from "./chartdata.js";
-import { chartDataBlocks, chartSpecSchema, createView, databaseIdOf, renderAndUpload, rowSchema, type Placement } from "./visualops.js";
+import { chartDataBlocks, chartSpecSchema, createView, databaseIdOf, ganttTasks, renderAndUpload, rowSchema, summaryLine, type Placement } from "./visualops.js";
 import { viewSpecSchema, type ViewSpec } from "./views.js";
 import { ganttChart } from "./mermaid.js";
 import { type ChartRow, type ChartSpec } from "./charts.js";
@@ -49,6 +49,9 @@ const conditionSchema = z.union([
     .strict(),
 ]);
 
+/** An object or list, or a whole "{{variable}}" that holds one (resolved before use). */
+type Where = Record<string, unknown> | string;
+
 export type TemplateNode =
   | { markdown: string }
   | { heading: string; level?: 1 | 2 | 3 }
@@ -57,15 +60,27 @@ export type TemplateNode =
   | { columns: TemplateNode[][] }
   | { divider: true }
   | { kpis: { label: string; value?: string | number; metric?: { database: string; data_source_name?: string; value: string; where?: Record<string, unknown> } }[] | string }
-  | { chart: { spec: ChartSpec; data?: ChartRow[] | string; source?: ChartSource; data_table?: boolean; format?: "png" | "svg" } }
+  | { chart: { spec: ChartSpec; data?: ChartRow[] | string; source?: Omit<ChartSource, "where"> & { where?: Where }; data_table?: boolean; format?: "png" | "svg" } }
   | { view: { database: string; data_source_name?: string; view: ViewSpec } }
-  | { table: { header?: string[]; rows?: (string | number)[][] | string; query?: { database: string; data_source_name?: string; properties?: string[]; where?: Record<string, unknown>; limit?: number } } }
-  | { gantt: { title?: string; tasks: { name: string; start: string; end?: string | null; section?: string; status?: "done" | "active" | "crit" | null }[] | string } }
+  | { table: { header?: string[]; rows?: (string | number)[][] | string; query?: { database: string; data_source_name?: string; properties?: string[] | string; where?: Where; limit?: number } } }
+  | { summary: { database: string; data_source_name?: string; where?: Where; icon?: string } }
+  | {
+      gantt: {
+        title?: string;
+        tasks?: { name: string; start: string; end?: string | null; section?: string; status?: "done" | "active" | "crit" | null }[] | string;
+        query?: { database: string; data_source_name?: string; start: string; end?: string; section?: string; where?: Where; limit?: number };
+      };
+    }
   | { each: string; as: string; blocks: TemplateNode[] }
   | { if: z.infer<typeof conditionSchema>; then: TemplateNode[]; else?: TemplateNode[] }
   | { part: string; with?: Record<string, unknown> }
   | { slot: string; default?: TemplateNode[] }
   | { blocks: BlockSpec[] };
+
+/** A value, or a whole "{{variable}}" holding it (checked again once filled in). */
+const VAR_REF = /^\{\{\s*[a-z_][a-z0-9_.]*\s*\}\}$/i;
+const orVar = <T extends z.ZodTypeAny>(schema: T) => z.union([schema, z.string().regex(VAR_REF, "Expected a value or a {{variable}}.")]);
+const whereOrVar = orVar(z.record(z.string(), z.unknown())).optional();
 
 const kpiItem = z
   .object({
@@ -84,6 +99,14 @@ export const nodeSchema: z.ZodType<TemplateNode> = z.lazy(() =>
     z.object({ toggle: z.string(), children: z.array(nodeSchema) }).strict(),
     z.object({ columns: z.array(z.array(nodeSchema)).min(2).max(5) }).strict(),
     z.object({ divider: z.literal(true) }).strict(),
+    z
+      .object({
+        summary: z
+          .object({ database: z.string(), data_source_name: z.string().optional(), where: whereOrVar, icon: z.string().optional() })
+          .strict()
+          .describe("A callout with the row count, completion, and overdue count of a database."),
+      })
+      .strict(),
     z.object({ kpis: z.union([z.array(kpiItem).min(1).max(6), z.string().describe("A {{variable}} holding the list")]) }).strict(),
     z
       .object({
@@ -91,7 +114,7 @@ export const nodeSchema: z.ZodType<TemplateNode> = z.lazy(() =>
           .object({
             spec: chartSpecSchema,
             data: z.union([z.array(rowSchema), z.string()]).optional(),
-            source: chartSourceSchema.optional(),
+            source: chartSourceSchema.extend({ where: whereOrVar }).optional(),
             data_table: z.boolean().optional(),
             format: z.enum(["png", "svg"]).optional(),
           })
@@ -110,8 +133,8 @@ export const nodeSchema: z.ZodType<TemplateNode> = z.lazy(() =>
               .object({
                 database: z.string(),
                 data_source_name: z.string().optional(),
-                properties: z.array(z.string()).optional(),
-                where: z.record(z.string(), z.unknown()).optional(),
+                properties: orVar(z.array(z.string())).optional(),
+                where: whereOrVar,
                 limit: z.number().int().min(1).max(100).optional(),
               })
               .strict()
@@ -139,9 +162,22 @@ export const nodeSchema: z.ZodType<TemplateNode> = z.lazy(() =>
                   .strict()
               ),
               z.string(),
-            ]),
+            ]).optional(),
+            query: z
+              .object({
+                database: z.string(),
+                data_source_name: z.string().optional(),
+                start: z.string().describe("Start (or only) date property"),
+                end: z.string().optional(),
+                section: z.string().optional().describe("Group tasks by this property"),
+                where: whereOrVar,
+                limit: z.number().int().min(1).max(80).optional(),
+              })
+              .strict()
+              .optional(),
           })
-          .strict(),
+          .strict()
+          .refine((g) => (g.tasks === undefined) !== (g.query === undefined), { message: "A gantt needs `tasks` or `query`." }),
       })
       .strict(),
     z.object({ each: z.string(), as: z.string().regex(/^[a-z_][a-z0-9_]*$/i), blocks: z.array(nodeSchema) }).strict(),
@@ -318,7 +354,8 @@ async function dataSource(st: CompileState, database: string, name?: string): Pr
   return ds;
 }
 
-async function rowsFor(st: CompileState, ds: DataSourceObjectResponse, where: Record<string, unknown> | undefined, max: number): Promise<PageObjectResponse[]> {
+async function rowsFor(st: CompileState, ds: DataSourceObjectResponse, where: Where | undefined, max: number): Promise<PageObjectResponse[]> {
+  if (typeof where === "string") throw new Error(`"where" should be an object like {"Status": "Done"}; got the text "${where}".`);
   const filter = where ? await buildWhereFilter(ds, where) : undefined;
   st.reads++;
   return (await queryAll(ds.id, { ...(filter ? { filter } : {}), max })).pages;
@@ -439,8 +476,13 @@ async function compileNodes(nodes: TemplateNode[], ctx: Context, st: CompileStat
       const c = node.chart;
       let rows: ChartRow[];
       if (c.source) {
+        const source = chartSourceSchema.safeParse(c.source);
+        if (!source.success) {
+          st.problems.push(`${at}.chart.source: ${source.error.issues[0]?.message ?? "invalid"}`);
+          continue;
+        }
         st.reads++;
-        rows = (await pointsFromDatabase(c.source)).points;
+        rows = (await pointsFromDatabase(source.data)).points;
       } else {
         const parsed = z.array(rowSchema).safeParse(c.data);
         if (!parsed.success) {
@@ -463,7 +505,12 @@ async function compileNodes(nodes: TemplateNode[], ctx: Context, st: CompileStat
       if (t.query) {
         const ds = await dataSource(st, t.query.database, t.query.data_source_name);
         const titleProp = Object.values(ds.properties).find((p) => p.type === "title")?.name as string;
-        const props = (t.query.properties ?? [titleProp]).map((p) => resolvePropertyName(ds, p).name);
+        const given = t.query.properties;
+        if (typeof given === "string") {
+          st.problems.push(`${at}.table.query.properties: expected a list of property names.`);
+          continue;
+        }
+        const props = (given?.length ? given : [titleProp]).map((p) => resolvePropertyName(ds, p).name);
         const rows = await rowsFor(st, ds, t.query.where, t.query.limit ?? 20);
         const body = rows.map((p) => props.map((name) => (name === titleProp ? `<mention-page url="${p.id}"/>` : cellText(simplify(p.properties[name])).replace(/\|/g, "/"))));
         out.push(body.length ? { type: "table", header_row: true, rows: [t.header ?? props, ...body] } : { type: "paragraph", text: `Nothing in "${dataSourceTitle(ds)}" matches.`, color: "gray" });
@@ -476,7 +523,18 @@ async function compileNodes(nodes: TemplateNode[], ctx: Context, st: CompileStat
         const body = (rows as unknown[][]).map((r) => r.map(cellText));
         out.push({ type: "table", header_row: Boolean(t.header), rows: t.header ? [t.header, ...body] : body });
       }
+    } else if ("summary" in node) {
+      const ds = await dataSource(st, node.summary.database, node.summary.data_source_name);
+      const rows = await rowsFor(st, ds, node.summary.where, 10_000);
+      out.push({ type: "callout", icon: node.summary.icon ?? "📊", color: "gray_background", text: summaryLine(ds, rows, today(st.tz)) });
     } else if ("gantt" in node) {
+      if (node.gantt.query) {
+        const q = node.gantt.query;
+        const ds = await dataSource(st, q.database, q.data_source_name);
+        const tasks = ganttTasks(ds, await rowsFor(st, ds, q.where, 10_000), { start: q.start, ...(q.end ? { end: q.end } : {}), ...(q.section ? { section: q.section } : {}), limit: q.limit ?? 40 }, today(st.tz));
+        out.push(tasks.length ? { type: "code", language: "mermaid", text: ganttChart(node.gantt.title, tasks) } : { type: "paragraph", text: "No dated rows match.", color: "gray" });
+        continue;
+      }
       const tasks = node.gantt.tasks;
       if (!Array.isArray(tasks)) {
         st.problems.push(`${at}.gantt.tasks: expected a list of tasks.`);

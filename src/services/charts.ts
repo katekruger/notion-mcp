@@ -5,10 +5,12 @@
 // Rendering libraries load on first use: resvg ships a native binary per platform, so a bundle built for another
 // platform still starts and serves every other tool, and only chart images report the problem.
 import type * as vl from "vega-lite";
+import { circleLayout, sankeyLayout, type Edge } from "./graphlayout.js";
 
 export const CHART_TYPES = [
   "bar", "column", "stacked_bar", "stacked_column", "grouped_column", "line", "area", "stacked_area", "pie", "donut", "scatter",
   "histogram", "heatmap", "boxplot", "waterfall", "funnel", "bullet", "small_multiples", "dual_axis", "treemap",
+  "sankey", "network",
 ] as const;
 
 /**
@@ -24,6 +26,8 @@ export const CHART_DATA_SHAPES: Partial<Record<(typeof CHART_TYPES)[number], str
   small_multiples: "x and y as for a line chart; one small panel per series.",
   dual_axis: "exactly two series: the first as columns (left axis), the second as a line (right axis).",
   treemap: "x = item, y = size; optional series groups items (one color per group).",
+  sankey: "one row per flow: x = from, series = to, y = amount. Flows must only go forward (no loops).",
+  network: "one row per link: x = one end, series = the other, y = weight (line thickness).",
 };
 
 /** Named palettes: the default validated order plus brand-neutral alternatives. Each keeps 8 distinct slots. */
@@ -163,8 +167,12 @@ export function checkChart(spec: ChartSpec, rows: ChartRow[]): string[] {
   if (spec.type === "small_multiples" && series.length < 2) throw new Error("Small multiples need at least two series (one panel each).");
   if (spec.type === "bullet" && !rows.some((r) => r.series === "target")) throw new Error(`Bullet charts need target rows (${CHART_DATA_SHAPES.bullet})`);
   if ((spec.type === "funnel" || spec.type === "treemap") && rows.some((r) => r.y < 0)) throw new Error(`${spec.type} charts can't show negative values.`);
+  if ((spec.type === "sankey" || spec.type === "network") && rows.some((r) => r.series === undefined || r.series === "")) {
+    throw new Error(`${spec.type === "sankey" ? "Sankey" : "Network"} charts need a series on every row (${CHART_DATA_SHAPES[spec.type]})`);
+  }
+  if ((spec.type === "sankey" || spec.type === "network") && rows.some((r) => r.y <= 0)) throw new Error(`${spec.type} charts need positive values.`);
   if (spec.type === "small_multiples" && series.length > 12) notes.push("More than 12 panels get small; consider filtering to the ones that matter.");
-  if (spec.annotations?.length && ["pie", "donut", "treemap", "heatmap", "funnel", "small_multiples"].includes(spec.type)) {
+  if (spec.annotations?.length && ["pie", "donut", "treemap", "heatmap", "funnel", "small_multiples", "sankey", "network"].includes(spec.type)) {
     notes.push(`Annotations aren't drawn on ${spec.type} charts.`);
   }
   if (spec.type === "dual_axis" && spec.annotations?.some((a) => a.value !== undefined)) {
@@ -176,6 +184,14 @@ export function checkChart(spec: ChartSpec, rows: ChartRow[]): string[] {
 /** Build the Vega-Lite spec. Pure, so it can be unit-tested. */
 export function vegaLiteSpec(spec: ChartSpec, input: ChartRow[]): { spec: vl.TopLevelSpec; notes: string[]; engine?: "vega" } {
   const notes = checkChart(spec, input);
+  // Flow charts color by node, not series, so they skip the series folding below.
+  if (spec.type === "sankey" || spec.type === "network") {
+    const th = THEMES[spec.theme ?? "light"];
+    const pal = resolvePalette(spec.palette);
+    const edges: Edge[] = input.map((r) => ({ from: String(r.x), to: String(r.series), value: r.y }));
+    const built = spec.type === "sankey" ? sankeySpec(spec, edges, pal, th) : networkSpec(spec, edges, pal, th);
+    return { spec: built as unknown as vl.TopLevelSpec, notes, engine: "vega" };
+  }
   const cap = spec.type === "scatter" ? MAX_SCATTER_SERIES : MAX_SERIES;
   const { rows, folded } = foldSeries(input, cap);
   if (folded.length) notes.push(`${folded.length} smaller series were combined into "Other" (${folded.slice(0, 5).join(", ")}${folded.length > 5 ? ", …" : ""}).`);
@@ -488,7 +504,7 @@ function heatMid(rows: ChartRow[]): number {
 
 /** Add reference lines to a chart with x and y axes. */
 function annotate(out: Record<string, unknown>, spec: ChartSpec, rows: ChartRow[], th: Theme, temporal: boolean): Record<string, unknown> {
-  const skip = ["pie", "donut", "treemap", "heatmap", "funnel", "small_multiples"];
+  const skip = ["pie", "donut", "treemap", "heatmap", "funnel", "small_multiples", "sankey", "network"];
   if (skip.includes(spec.type)) return out;
   const horizontal = spec.type === "bar" || spec.type === "stacked_bar" || spec.type === "bullet";
   const valueCh = horizontal ? "x" : "y";
@@ -593,6 +609,117 @@ function treemapSpec(spec: ChartSpec, rows: ChartRow[], pal: string[], th: Theme
   };
 }
 
+function vegaTitle(spec: ChartSpec, th: Theme): Record<string, unknown> {
+  return spec.title ? { title: { text: spec.title, ...(spec.subtitle ? { subtitle: spec.subtitle } : {}), anchor: "start", fontSize: 16, fontWeight: 600, color: th.text, subtitleColor: th.text2, font: FONT, offset: 12 } } : {};
+}
+
+/** Sankey: laid out here (graphlayout.ts), drawn with plain Vega marks. Ribbons take their source node's color. */
+function sankeySpec(spec: ChartSpec, edges: Edge[], pal: string[], th: Theme): Record<string, unknown> {
+  const width = spec.width ?? 640;
+  const height = spec.height ?? 360;
+  const fmt = d3Format(spec.value_format);
+  // Room for labels beside the first and last columns.
+  const inset = 110;
+  const { nodes, links } = sankeyLayout(edges, width - 2 * inset, height);
+  const last = Math.max(...nodes.map((n) => n.column));
+  const color = (i: number) => pal[i % pal.length];
+  return {
+    $schema: "https://vega.github.io/schema/vega/v6.json",
+    width,
+    height,
+    padding: 16,
+    background: th.surface ?? "transparent",
+    ...vegaTitle(spec, th),
+    data: [
+      { name: "links", values: links.map((l) => ({ ...l, fill: color(l.index) })) },
+      // Outer columns label outward (into the inset), inner ones to the right of the node.
+      { name: "nodes", values: nodes.map((n) => ({ ...n, fill: color(n.index), labelLeft: n.column === 0 && last > 0 })) },
+    ],
+    marks: [
+      {
+        type: "path",
+        from: { data: "links" },
+        encode: { enter: { path: { field: "path" }, x: { value: inset }, fill: { field: "fill" }, fillOpacity: { value: 0.35 } } },
+      },
+      {
+        type: "rect",
+        from: { data: "nodes" },
+        encode: { enter: { x: { signal: `datum.x0 + ${inset}` }, x2: { signal: `datum.x1 + ${inset}` }, y: { field: "y0" }, y2: { field: "y1" }, fill: { field: "fill" } } },
+      },
+      {
+        type: "text",
+        from: { data: "nodes" },
+        encode: {
+          enter: {
+            x: { signal: `datum.labelLeft ? datum.x0 + ${inset} - 6 : datum.x1 + ${inset} + 6` },
+            y: { signal: "(datum.y0 + datum.y1) / 2 - 7" }, // two lines, centered on the node
+            align: { signal: "datum.labelLeft ? 'right' : 'left'" },
+            baseline: { value: "middle" },
+            text: { signal: `[datum.name, format(datum.value, '${fmt}')]` },
+            fill: { value: th.text },
+            font: { value: FONT },
+            fontSize: { value: 11 },
+            lineHeight: { value: 14 },
+            limit: { value: inset - 10 },
+          },
+        },
+      },
+    ],
+  };
+}
+
+/** Network: nodes on a circle sized by how connected they are, links as lines as thick as their weight. */
+function networkSpec(spec: ChartSpec, edges: Edge[], pal: string[], th: Theme): Record<string, unknown> {
+  const width = spec.width ?? 640;
+  const height = spec.height ?? 480;
+  const { nodes, edges: lines } = circleLayout(edges, width, height);
+  const maxW = Math.max(...lines.map((e) => e.value));
+  const maxD = Math.max(...nodes.map((n) => n.degree));
+  const r = (n: number) => Math.round(n * 100) / 100;
+  return {
+    $schema: "https://vega.github.io/schema/vega/v6.json",
+    width,
+    height,
+    padding: 16,
+    background: th.surface ?? "transparent",
+    ...vegaTitle(spec, th),
+    data: [
+      { name: "edges", values: lines.map((e) => ({ ...e, w: r(1 + (5 * e.value) / maxW) })) },
+      // Area, not radius, tracks connectedness.
+      { name: "nodes", values: nodes.map((n) => ({ ...n, size: r(60 + (540 * n.degree) / maxD), dx: n.align === "left" ? 12 : n.align === "right" ? -12 : 0, dy: n.baseline === "top" ? 12 : n.baseline === "bottom" ? -12 : 0 })) },
+    ],
+    marks: [
+      {
+        type: "rule",
+        from: { data: "edges" },
+        encode: { enter: { x: { field: "x1" }, y: { field: "y1" }, x2: { field: "x2" }, y2: { field: "y2" }, stroke: { value: th.text2 }, strokeOpacity: { value: 0.45 }, strokeWidth: { field: "w" } } },
+      },
+      {
+        type: "symbol",
+        from: { data: "nodes" },
+        encode: { enter: { x: { field: "x" }, y: { field: "y" }, size: { field: "size" }, fill: { value: pal[0] }, stroke: { value: th.surface ?? "transparent" }, strokeWidth: { value: 1.5 } } },
+      },
+      {
+        type: "text",
+        from: { data: "nodes" },
+        encode: {
+          enter: {
+            x: { signal: "datum.x + datum.dx" },
+            y: { signal: "datum.y + datum.dy" },
+            align: { field: "align" },
+            baseline: { field: "baseline" },
+            text: { field: "name" },
+            fill: { value: th.text },
+            font: { value: FONT },
+            fontSize: { value: 11 },
+            limit: { value: 100 },
+          },
+        },
+      },
+    ],
+  };
+}
+
 const RENDER_TIMEOUT_MS = 20_000;
 
 async function libs() {
@@ -662,7 +789,7 @@ export async function renderChart(spec: ChartSpec, rows: ChartRow[], format: Cha
 
 const TYPE_NAMES: Partial<Record<ChartType, string>> = {
   stacked_bar: "stacked bar", stacked_column: "stacked column", grouped_column: "grouped column", stacked_area: "stacked area",
-  small_multiples: "small-multiples", dual_axis: "dual-axis", boxplot: "box plot",
+  small_multiples: "small-multiples", dual_axis: "dual-axis", boxplot: "box plot", sankey: "Sankey",
 };
 
 /** One or two plain sentences that say what a chart shows: for alt text and the data table under it. */
@@ -686,6 +813,14 @@ export function describeChart(spec: ChartSpec, rows: ChartRow[]): string {
   if (spec.type === "funnel" && rows.length > 1) {
     const last = rows[rows.length - 1];
     return `${head}: ${rows.length} stages from ${rows[0].x} (${fmt(rows[0].y)}) to ${last.x} (${fmt(last.y)}), ${Math.round((last.y / (rows[0].y || 1)) * 100)}% of the first.`;
+  }
+  if (spec.type === "sankey" || spec.type === "network") {
+    const names = new Set(rows.flatMap((r) => [String(r.x), String(r.series)]));
+    const top = [...rows].sort((a, b) => b.y - a.y)[0];
+    const total = rows.reduce((n, r) => n + r.y, 0);
+    return spec.type === "sankey"
+      ? `${head}: ${rows.length} flows between ${names.size} stages, ${fmt(total)} in all. Largest: ${top.x} to ${top.series} (${fmt(top.y)}).`
+      : `${head}: ${names.size} nodes and ${rows.length} links. Strongest: ${top.x} and ${top.series} (${fmt(top.y)}).`;
   }
   const byX = new Map<string, number>();
   for (const r of rows) if (r.series !== "target") byX.set(String(r.x), (byX.get(String(r.x)) ?? 0) + r.y);

@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Client } from "@notionhq/client";
 
 process.env.NOTION_PLUS_HOME = mkdtempSync(path.join(os.tmpdir(), "notion-plus-store-test-"));
@@ -21,7 +21,10 @@ const { stateDir } = await import("../src/services/workspace.js");
 
 const run = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const tsx = path.join(root, "node_modules", ".bin", "tsx");
+// Child scripts run with node's tsx loader (node_modules/.bin/tsx is a .cmd on Windows) and import sources by file
+// URL (Windows ESM refuses bare drive paths).
+const runTs = (script: string) => run(process.execPath, ["--import", "tsx", script], { cwd: root });
+const srcUrl = (rel: string) => JSON.stringify(pathToFileURL(path.join(root, rel)).href);
 const tmp = () => mkdtempSync(path.join(os.tmpdir(), "notion-plus-store-"));
 const asObject = (raw: unknown) => {
   if (!raw || typeof raw !== "object") throw new Error("expected an object");
@@ -70,10 +73,10 @@ test("updateJson: two processes incrementing 100 times each lose no updates", as
   const script = path.join(dir, "inc.mts");
   writeFileSync(
     script,
-    `import { updateJson } from ${JSON.stringify(path.join(root, "src/services/store.ts"))};\n` +
+    `import { updateJson } from ${srcUrl("src/services/store.ts")};\n` +
       `for (let i = 0; i < 100; i++) await updateJson(${JSON.stringify(f)}, (r) => r as { n: number }, () => ({ n: 0 }), (d) => ({ data: { n: d.n + 1 }, result: null }));\n`
   );
-  await Promise.all([run(tsx, [script]), run(tsx, [script])]);
+  await Promise.all([runTs(script), runTs(script)]);
   assert.deepEqual(JSON.parse(readFileSync(f, "utf8")), { n: 200 });
 }, 120_000);
 
@@ -120,11 +123,11 @@ test("journal: a process that dies mid-write leaves an interrupted entry with it
   writeFileSync(
     script,
     `process.env.NOTION_PLUS_HOME = ${JSON.stringify(home)};\nprocess.env.NOTION_PLUS_WORKSPACE = "test";\n` +
-      `const { runJournaled } = await import(${JSON.stringify(path.join(root, "src/services/journal.ts"))});\n` +
-      `const { call } = await import(${JSON.stringify(path.join(root, "src/services/notion.ts"))});\n` +
+      `const { runJournaled } = await import(${srcUrl("src/services/journal.ts")});\n` +
+      `const { call } = await import(${srcUrl("src/services/notion.ts")});\n` +
       `await runJournaled("notion_bulk_update", { database: "db-crash" }, async () => { await call(async () => process.exit(9)); return { content: [] }; });\n`
   );
-  await assert.rejects(run(tsx, [script]), (e: unknown) => (e as { code?: number }).code === 9);
+  await assert.rejects(runTs(script), (e: unknown) => (e as { code?: number }).code === 9);
   const saved = process.env.NOTION_PLUS_HOME;
   process.env.NOTION_PLUS_HOME = home;
   try {

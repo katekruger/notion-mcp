@@ -9,7 +9,7 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       reporter: ["text-summary", "json-summary"],
       // Just below the current numbers, so coverage can only go up. Raise them as tests are added.
-      thresholds: { statements: 51, branches: 42, functions: 50, lines: 54 },
+      thresholds: { statements: 59, branches: 48, functions: 62, lines: 62 },
     },
   },
 });

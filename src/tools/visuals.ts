@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { call, mapLimited, normalizeId, notion, read } from "../services/notion.js";
 import { dataSourceTitle, resolveDataSource } from "../services/schema.js";
-import { CHART_DATA_SHAPES, renderCustom, type ChartRow } from "../services/charts.js";
+import { CHART_DATA_SHAPES, CHART_THEMES, renderCustom, type ChartRow } from "../services/charts.js";
 import { appendSpecs } from "../services/blocks.js";
 import { pointsFromDatabase } from "../services/chartdata.js";
 import { saveChart } from "../services/chartstore.js";
@@ -145,16 +145,17 @@ export function registerVisualTools(server: McpServer): void {
           .record(z.string(), z.unknown())
           .optional()
           .describe("Advanced: a complete Vega-Lite spec (data in data.values) instead of chart + data. Not refreshable."),
+        vega_lite_theme: z.enum(CHART_THEMES).optional().describe("vega_lite only: light (default), dark, or transparent, applied where the spec sets no colors of its own."),
       },
       annotations: WRITE,
     },
-    safe(async ({ chart, data, source, parent, position, after_block_id, refresh_block_id, caption, format, data_table, vega_lite }) => {
+    safe(async ({ chart, data, source, parent, position, after_block_id, refresh_block_id, caption, format, data_table, vega_lite, vega_lite_theme }) => {
       if (data && source) throw new Error("Give `data` or `source`, not both.");
       if (vega_lite) {
         if (chart || data || source || refresh_block_id) throw new Error("`vega_lite` replaces chart, data, and source, and can't refresh an existing chart.");
         if (!parent) throw new Error("A new chart needs `parent` (the page or block to put it in).");
         if (position === "after_block" && !after_block_id) throw new Error("position=after_block needs after_block_id.");
-        const { bytes } = await renderCustom(vega_lite, "light", format);
+        const { bytes } = await renderCustom(vega_lite, vega_lite_theme ?? "light", format);
         const title = typeof (vega_lite.title as { text?: string } | string | undefined) === "string" ? (vega_lite.title as string) : (vega_lite.title as { text?: string } | undefined)?.text;
         const uploadId = await uploadChart(bytes, title, format);
         const parentId = normalizeId(parent);

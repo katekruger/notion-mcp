@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 1.0.0
+
+The first stable release. Every finding in the v0.8.0 audit has been checked against the code. [docs/AUDIT-STATUS.md](docs/AUDIT-STATUS.md) maps each one to its fix and the test that shows it, and lists what is still open.
+
+### Highlights since 0.8
+- **Durable local state:** atomic, locked JSON files that stop on corruption instead of reading it as empty; a write-ahead journal; one folder per integration.
+- **Automations:** retries that can't double-fire, the marker written last, and run limits. State is kept on a branch in GitHub Actions.
+- **Every tool result** has the same shape (`status`, `summary`, `data`, `warnings`, `undo`, `pagination`).
+- **Safety:** safe downloads, config checked at startup, `notion_doctor` and `notion_capabilities`.
+- **Content:** templates (`notion_template`) with five built-ins, and 22 chart types, including Sankey and network.
+- **Workflows and webhooks:** workflows (`notion_workflow`) with durable runs, approvals and retries that don't duplicate; webhook mode, also as a Docker image.
+- **Releases:** install-tested on four operating systems, with checksums, an SBOM and build provenance.
+
+### Changed in 1.0.0
+- **Stricter typecheck:** dependency type declarations are now checked too (`skipLibCheck: false`, audit P3-01). Batch 4 had been listed as fixing this, but it hadn't.
+- **Coverage thresholds** raised to statements 59, branches 48, functions 62, lines 62.
+- `notion_create_chart` takes `vega_lite_theme` for raw Vega-Lite specs. They no longer always render light.
+- **`SUPPORT.md`:** defines the stable 1.x surface (tool names and arguments, the result envelope, the spec and template formats, environment variables, state files) and the fix policy.
+
+### Tests added
+- Rules: the default location, export → import onto a fresh machine, deploy, and refusing a bad file.
+- Read results with page text are marked untrusted.
+- `notion_views` list paging, with no reads for views it doesn't return.
+- `notion_doctor` with a bad token.
+- The runner stops when required state is missing.
+- `readDatabase` on 500, 503 and timeouts.
+
+### Not verified
+- **No live run.** The live Notion suites haven't been run against a real workspace for this release; every test uses fake Notion clients. Set the `NOTION_TOKEN` and `NOTION_TEST_PAGE` repository secrets to make `live.yml` run them.
+- **Docker image.** Checked only by the CI `docker` job.
+
 ## 1.0.0-beta.2
 
 Finishes the two items batch 5 left open.

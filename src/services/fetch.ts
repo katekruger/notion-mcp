@@ -24,6 +24,10 @@ export interface SafeFetchOptions {
   allowHttp?: boolean;
   /** Tests only: addresses to allow although they're private (such as a local test server). */
   allowAddress?: (address: string) => boolean;
+  /** Defaults to GET. Other methods send `body` and never follow redirects (a redirect can't safely repeat a write). */
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | Uint8Array;
   /** Tests only: replace DNS. */
   lookup?: (host: string) => Promise<{ address: string; family: number }[]>;
 }
@@ -109,10 +113,11 @@ function checkUrl(raw: string, opts: SafeFetchOptions): URL {
 function once(url: URL, opts: SafeFetchOptions, deadline: number, maxBytes: number): Promise<{ status: number; location?: string; contentType: string | null; body?: Uint8Array }> {
   return new Promise((resolve, reject) => {
     const mod = url.protocol === "https:" ? https : http;
-    const req = mod.request(url, { method: "GET", agent: false, lookup: guardedLookup(opts), headers: { "user-agent": "notion-plus-mcp-server", accept: "*/*" } }, (res) => {
+    const method = opts.method ?? "GET";
+    const req = mod.request(url, { method, agent: false, lookup: guardedLookup(opts), headers: { "user-agent": "notion-plus-mcp-server", accept: "*/*", ...(opts.headers ?? {}) } }, (res) => {
       const status = res.statusCode ?? 0;
       const contentType = res.headers["content-type"]?.split(";")[0].trim() ?? null;
-      if (status >= 300 && status < 400 && res.headers.location) {
+      if (status >= 300 && status < 400 && res.headers.location && method === "GET") {
         res.resume();
         resolve({ status, location: res.headers.location, contentType });
         return;
@@ -145,6 +150,7 @@ function once(url: URL, opts: SafeFetchOptions, deadline: number, maxBytes: numb
     }
     req.setTimeout(left, () => req.destroy(new FetchBlockedError(`The download took longer than ${Math.round((opts.timeoutMs ?? 60_000) / 1000)}s and was stopped.`)));
     req.on("error", reject);
+    if (opts.body !== undefined && method !== "GET") req.write(opts.body);
     req.end();
   });
 }

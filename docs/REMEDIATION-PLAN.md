@@ -1,5 +1,22 @@
 # Notion Plus MCP: remediation and extension plan
 
+## Fix the failing Dependency review check on PR #12
+
+### Context
+PR #5 was merged at commit `23d17a0`, before the follow-up commit `de52575`, which made the job skip on private repos, was pushed. So that fix never reached `main`. Batch 5's branch was restarted from `main`, which means PR #12 runs the old workflow and fails with the same error: "Dependency graph not enabled".
+
+### Fix
+1. Cherry-pick `de52575` ("Dependency review: skip on private repos without Code Security") onto `claude/jolly-heisenberg-dx08r6`. If the commit is no longer around, re-apply the same change by hand:
+   - In `.github/workflows/dependency-review.yml`: `if: ${{ !github.event.repository.private || vars.DEPENDENCY_REVIEW == 'true' }}` on the `review` job, plus the explanatory comment.
+   - The matching README sentence in Development.
+2. Check that the workflow YAML parses and that `npm run check` still passes. There are no source changes.
+3. Push to the branch. PR #12 updates, and the Dependency review job should show as skipped.
+
+### Verification
+- After the push, the check runs on PR #12 show "Dependency review" as skipped and the CI checks green. Confirm with `get_check_runs` on PR #12.
+
+---
+
 ## Fix the failing check on PR #5, round 2 (Dependency review still fails)
 
 ### Context

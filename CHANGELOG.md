@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 1.0.0-beta.1
+
+Workflows, webhooks, and retries that don't duplicate (audit batch 6: P2-01, P2-02; P2-16 designed).
+
+### Added
+- **`notion_workflow`**: multi-step workflows (spec version 2).
+  - **Triggers:** schedule, manual, or Notion webhook events.
+  - **Notion steps:** `query`, `set`, `append`, `comment`, `create_page`, `move_page`, `duplicate_page`, `trash`, `replace_text`, `export_markdown`, `render_template`.
+  - **Outside steps:** `http` and `slack`.
+  - **Control steps:** `foreach`, `switch`, `approval`, `delay`, `run_workflow`.
+  - **Per-step options:** `if`, `retry`, `timeout_seconds`, `continue_on_error`.
+  - **References:** steps read each other with `${steps.<id>…}`, and the trigger, inputs, loop items, and `${secret:NAME}` the same way.
+- **Durable runs.** Step state is saved as it changes.
+  - Failed, paused, or interrupted runs continue after the last finished step.
+  - Approvals wait for a checkbox or a comment keyword. Delays wait for their time.
+  - Both are picked up by `npm run automations` or the webhook server.
+- **No duplicates on retry.** A step that started but didn't finish checks what it already made before acting again, and adopts or removes it:
+  - pages with the same title;
+  - comments with the same text;
+  - leftover appended blocks.
+
+  HTTP steps send an `Idempotency-Key` header.
+- **Webhook mode:** `npm run webhook`, plus a `Dockerfile`.
+  - Checks Notion's `X-Notion-Signature`.
+  - Drops duplicate events by id and rejects deliveries more than 10 minutes old.
+  - Keeps a durable queue with retries and backoff, and a dead-letter list.
+  - `notion_workflow` actions `events`, `replay`, `discard`; `GET /healthz`.
+- **Failure notifications:**
+  - per workflow (`on_failure`: Slack, HTTP, or a page comment);
+  - for rule runs, through `NOTION_PLUS_NOTIFY`.
+- **Settings:** `NOTION_PLUS_HTTP_ALLOW` (hosts HTTP steps may call), `NOTION_PLUS_SECRET_<NAME>` (workflow secrets, redacted wherever runs are stored or shown), `NOTION_PLUS_WORKFLOWS`, `NOTION_PLUS_WEBHOOK_TOKEN`, `NOTION_PLUS_WEBHOOK_PORT`, `NOTION_PLUS_NOTIFY`.
+- **`convert`** turns a v1 rule into an equivalent workflow, saved disabled.
+- **`docs/hosted-design.md`:** the design for a hosted, multi-user mode. Not built.
+
+### Changed
+- `safeFetch` can send POST/PUT/PATCH/DELETE with headers and a body. Those requests never follow redirects.
+- The GitHub workflow runs `automations/workflows.json` and saves workflow run state on the state branch, alongside the rules' state.
+
+### Fixed
+- A rule row whose `append` failed part-way no longer duplicates blocks on retry. The retry removes what the failed attempt left first.
+
 ## 0.12.0
 
 Templates and a wider chart catalog (audit batch 5: P2-03, P2-04, P3-07).

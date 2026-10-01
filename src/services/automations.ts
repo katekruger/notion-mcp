@@ -9,6 +9,7 @@ import { z } from "zod";
 import { randomBytes } from "node:crypto";
 import { call, isNotFound, normalizeId, notion, requestCount, updatePage } from "./notion.js";
 import { log } from "./log.js";
+import { removeLeftovers } from "./workflow/actions.js";
 import { appendSpecs, markdownToSpecs, PartialWriteError } from "./blocks.js";
 import { blockSpecSchema } from "./specSchema.js";
 import { forApi, fromInlineMarkdown, plain, textToTitle } from "./richtext.js";
@@ -260,6 +261,8 @@ export interface RowCheckpoint {
   attempts: number;
   run_id: string;
   last_error?: string;
+  /** When the latest attempt started, so a retried append can find blocks the failed attempt left. */
+  last_attempt_at?: string;
 }
 
 /** A firing whose `then` actions (or rows, for a schedule) haven't all finished. */
@@ -878,6 +881,7 @@ interface RowContext {
   undo: UndoOp[];
   opts: RunOptions;
   persist: () => Promise<void>;
+  retrySince?: Map<string, string | undefined>;
 }
 
 async function runRows(rule: Rule, ds: DataSourceObjectResponse, filter: Record<string, unknown>, c: RowContext): Promise<void> {
@@ -892,6 +896,8 @@ async function runRows(rule: Rule, ds: DataSourceObjectResponse, filter: Record<
   }
   const markerName = rule.marker ? resolvePropertyName(ds, rule.marker).name : null;
   const checked = rule.when ? conditionProperties(ds, rule.when) : new Map<string, unknown>();
+  const retrySince = new Map<string, string | undefined>();
+  c.retrySince = retrySince;
 
   for (const page of pages) {
     const ctx: TemplateContext = { now, timezone, page };
@@ -913,8 +919,11 @@ async function runRows(rule: Rule, ds: DataSourceObjectResponse, filter: Record<
       continue;
     }
     const cp: RowCheckpoint = saved && saved.rule_rev === c.rev ? saved : { rule_rev: c.rev, done: [], attempts: 0, run_id: c.runId };
+    // A row retried after a failure: appends clean up what the failed attempt may have left.
+    retrySince.set(page.id, cp.attempts > 0 ? cp.last_attempt_at : undefined);
     cp.attempts++;
     cp.run_id = c.runId;
+    cp.last_attempt_at = new Date().toISOString();
     try {
       for (const step of steps) {
         if (done.has(step.id)) continue;
@@ -974,6 +983,8 @@ function rowSteps(
         describe: describeAction({ append: content }),
         run: async () => {
           const specs = typeof content === "string" ? markdownToSpecs(content) : content;
+          const since = c.retrySince?.get(page.id);
+          if (since) await removeLeftovers(page.id, specs, since);
           let ids: string[];
           try {
             ids = await appendSpecs(page.id, specs);

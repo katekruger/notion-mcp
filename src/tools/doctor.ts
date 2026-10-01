@@ -247,6 +247,10 @@ export function registerDoctorTools(server: McpServer): void {
               "lines, palettes, PNG or SVG, data tables as text alternatives; report pages",
             templates: "reusable page templates with variables, loops, conditions, parts, slots, KPIs, charts, views, tables, Gantt; preview with diff",
             automations: "rules on conditions and schedules, resumable runs, export/import/deploy to GitHub Actions",
+            workflows:
+              "multi-step workflows: schedule, manual, or webhook triggers; query, set, append, comment, create/move/duplicate/trash pages, " +
+              "find and replace, export markdown, render templates, HTTP and Slack (allow-listed), foreach, switch, approvals, delays, " +
+              "sub-workflows; durable runs that resume without duplicating; failure notifications",
             safety: "dry runs, undo journal with conflict checks, notion_doctor",
           },
           limits: { automation_run_defaults: { max_rows: 200, max_requests: 3000, max_blocks: 5000, max_minutes: 20 } },

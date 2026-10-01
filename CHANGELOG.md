@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here. Versions follow [semver](https://semver.org).
 
+## 0.12.0
+
+Templates and a wider chart catalog (audit batch 5: P2-03, P2-04, P3-07).
+
+### Added
+- **`notion_template`** builds pages from reusable, versioned templates.
+  - **Inputs:** checked variables, `each` loops, `if`/`else` conditions, reusable `parts`, and `slots` filled at render time.
+  - **Blocks:** markdown, callouts, toggles, columns, KPI numbers (fixed or computed from a database), charts, live views, tables (fixed or queried), Gantt charts, and raw block specs.
+  - **Actions:** `list`, `get`, `validate`, `preview`, `render`, `save`, `delete`, `export`, `import`.
+    - `preview` shows the outline, counts, and estimated requests, and with `compare_to` a line diff against an existing page.
+    - `render` creates a page or appends to one. `notion_undo` removes it.
+  - **Built-in templates:** `weekly-executive-report`, `content-brief`, `launch-plan`, `research-dossier`.
+- **New chart types:** `histogram`, `heatmap`, `boxplot`, `waterfall`, `funnel`, `bullet`, `small_multiples`, `dual_axis`, `treemap`.
+- **Other chart options:**
+  - `annotations` add labeled reference lines at a category or a value.
+  - `palette` picks named palettes (`default`, `cool`, `warm`, `mono`) or your own hex colors.
+  - `format: "svg"` makes vector images.
+  - `data_table` adds a "Chart data" toggle under the chart with a description and the numbers, as a text alternative.
+  - Every chart returns `alt_text`.
+- **`vega_lite` on `notion_create_chart`** renders a whole Vega-Lite spec. It is checked first: inline data only, no URLs, links, or image marks, and size limits. The server's theme applies.
+
+### Changed
+- Chart rendering has a 20-second time limit and can't load anything: the renderer's loader refuses every request.
+
+### Not done (planned)
+- Sankey and network diagrams. They need layout code that Vega doesn't provide.
+- Rebuilding `notion_build_report` on top of templates. It keeps its own implementation for now.
+
 ## 0.11.0
 
 Safe to operate and verify (audit batch 4: P1-07, P2-05 to P2-09, P2-13, P2-14, P2-17, P3-01 to P3-06).

@@ -13,6 +13,8 @@ export interface StoredChart {
   spec: ChartSpec;
   source?: ChartSource;
   data?: ChartRow[];
+  /** Image format it was made in; refreshes keep it. */
+  format?: "png" | "svg";
   created: string;
   updated: string;
 }

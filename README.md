@@ -121,6 +121,7 @@ Only `status`, `summary`, and `data` are always there. Results that would be too
 - `notion_views`: list, read, create, update, and delete views: table, board, list, calendar, timeline, gallery, form, map, dashboard, and Notion's native chart views (column, bar, line, donut, number, with stacking). A view can be a database tab, a linked view placed anywhere on a page, or a dashboard widget.
 - `notion_create_chart`: render a chart image (bar, column, stacked, grouped, line, area, pie, donut, scatter) from inline data or a database query, and refresh it in place later.
 - `notion_build_report`: a report page for a database: summary, KPI numbers, live and image charts, a table of key rows (such as overdue items), and a Mermaid Gantt chart.
+- `notion_template`: build pages from reusable templates (see [Templates](#templates)): list, get, validate, preview (outline, counts, and a diff against an existing page), render, save, delete, export, import.
 
 **Safety**
 - `notion_history`: changes and their undo ids, newest first, paged with `cursor`. Each says whether it's undoable, partly undoable, undone, or was interrupted part-way (with the tool's input, to check by hand).
@@ -166,7 +167,12 @@ The undo journal is stored in `~/.notion-plus/workspaces/<integration id>/journa
 
 1. **Native Notion content** for structure and diagrams: callouts, columns, tables, equations, and Mermaid diagrams (```` ```mermaid ```` code blocks: flowcharts, sequence, Gantt, pie, timeline). Mermaid is checked before writing so a typo doesn't leave an error box.
 2. **Chart views** (`notion_views` with `type: "chart"`) when the data lives in a Notion database: they stay live, filter with the database, and people can click through. They can sit on any page as a linked view.
-3. **Chart images** (`notion_create_chart`) for chart types Notion lacks (area, scatter, grouped, multi-line), data from outside Notion, or a fixed snapshot. Images use one colorblind-checked palette, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark` (Notion's dark background), or `transparent` (no background and mid-gray text that reads on either). `build_report` charts take the same `theme`. The recipe is stored in `charts.json` in the [local state](#local-state) folder, and `refresh_block_id` redraws a chart from current data in the same block.
+3. **Chart images** (`notion_create_chart`) for chart types Notion lacks, data from outside Notion, or a fixed snapshot. Types: bar, column, stacked and grouped columns, line, area, stacked area, pie, donut, scatter, and:
+   - `histogram` (one row per observation; `bins`), `boxplot` (x = group, y = observation), `heatmap` (x = column, series = row, y = value)
+   - `waterfall` (rows in order, y = change; a row with series `"total"` shows the running total), `funnel` (stages in order), `bullet` (`actual` and `target` rows per category)
+   - `small_multiples` (one panel per series), `dual_axis` (two series: columns on the left axis, a line on the right), `treemap` (x = item, y = size, series = group)
+
+   `annotations` add labeled reference lines (`{at: "Q2", label: "Launch"}` or `{value: 100, label: "Target"}`). Images use a colorblind-checked palette by default, thin marks, direct value labels, and a legend whenever there's more than one series; past eight series the smallest fold into "Other". `palette` switches to `cool`, `warm`, `mono`, or your own hex colors. Notion shows an image the same way in light and dark mode, so pick the surface with `theme`: `light` (default), `dark`, or `transparent`. `format: "svg"` uploads a vector image instead of a PNG. `data_table: true` adds a "Chart data" toggle under the chart with a one-line description and the numbers, so the chart has a text alternative (the description is also returned as `alt_text`). For anything else, pass a whole Vega-Lite spec as `vega_lite`: data must be inline, and specs that load URLs, link out, or use image marks are refused. The recipe of a regular chart is stored in `charts.json` in the [local state](#local-state) folder, and `refresh_block_id` redraws it from current data in the same block.
 4. **Embeds** (`embed` blocks) for interactive charts hosted elsewhere, when neither of the above fits.
 
 `notion_build_report` combines these: it uses a live chart view where Notion supports the chart type and renders an image otherwise.
@@ -210,6 +216,29 @@ Undo is best effort: it covers the writes below, from a snapshot taken at write 
 | Automation runs | Everything above that the run did, as one entry |
 
 Results say `coverage: "partial"` when part of a write can't be reverted (the entry names what), and `none` when nothing can. Undo can't see edits in the same minute as the original change (Notion reports edit times to the minute), entries roll off after 500 changes, and comments by other integrations, re-created unique IDs, and Notion-hosted files that expired can't be restored. A write interrupted by a crash is journaled as `interrupted` before it starts, so it's visible but may have nothing to undo.
+
+## Templates
+
+`notion_template` builds a page from a declarative template, so a recurring page (a weekly update, a brief, a launch plan) is one call with values rather than dozens of block calls. Four ship with the server: `weekly-executive-report`, `content-brief`, `launch-plan`, and `research-dossier`; `get` shows any of them as a starting point for your own, and `save` keeps yours in `templates.json` in the home folder (a saved template with a built-in's name replaces it).
+
+A template declares its variables (type, required, default), then lists blocks:
+
+```json
+{
+  "version": 1,
+  "name": "weekly-update",
+  "variables": { "week_of": { "type": "date", "required": true }, "wins": { "type": "list", "default": [] } },
+  "title": "Week of {{week_of}}",
+  "blocks": [
+    { "kpis": [{ "label": "Open tasks", "metric": { "database": "https://www.notion.so/…", "value": "count", "where": { "Status": { "not": "Done" } } } }] },
+    { "if": "wins", "then": [{ "heading": "Wins" }, { "each": "wins", "as": "w", "blocks": [{ "markdown": "- {{w}}" }] }] },
+    { "chart": { "spec": { "type": "line", "title": "Signups" }, "source": { "database": "https://www.notion.so/…", "x": { "property": "Created", "by": "week" }, "y": "count" } } },
+    { "slot": "notes" }
+  ]
+}
+```
+
+Blocks can be markdown, headings, callouts, toggles, columns, dividers, KPI numbers (fixed, or computed from a database), charts (any `notion_create_chart` type, from data or a database query), live database views (top level), tables (fixed rows or a database query), Mermaid Gantt charts, and raw block specs. `each` repeats blocks for every item of a list (`{{item.field}}`, `{{item_index}}`), `if` picks blocks by a condition (`"var"` for set and non-empty, or `{var, equals | not | in | gt | lt | empty}`), `parts` are named block lists a template reuses with `{part, with}`, and `slots` are filled at render time with markdown or blocks. Every variable is checked before anything is written, and a reference to a value that doesn't exist is an error rather than a blank in the page. `preview` shows the outline, the charts and views it would make, an estimate of the Notion requests, and, with `compare_to`, a line diff against an existing page; `render` creates the page under `parent` or appends to `append_to`, and `notion_undo` removes what it wrote.
 
 ## Known Notion API limits
 

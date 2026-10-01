@@ -29,6 +29,7 @@ const { registerContentTools } = await import("../src/tools/content.js");
 const { registerDatabaseTools } = await import("../src/tools/database.js");
 const { registerVisualTools } = await import("../src/tools/visuals.js");
 const { registerDoctorTools } = await import("../src/tools/doctor.js");
+const { registerTemplateTools } = await import("../src/tools/templates.js");
 const { runAll } = await import("../src/services/automations.js");
 const { journalWrites, unwrap } = await import("../src/tools/util.js");
 
@@ -41,7 +42,7 @@ const registry = {
     tools.set(name, { schema: z.object(config.inputSchema), handler });
   },
 };
-for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools, registerDoctorTools]) {
+for (const register of [registerReadTools, registerPageTools, registerBlockTools, registerContentTools, registerSchemaTools, registerDatabaseTools, registerVisualTools, registerSafetyTools, registerAutomationTools, registerDoctorTools, registerTemplateTools]) {
   register(journalWrites(registry as never) as never);
 }
 
@@ -1179,6 +1180,16 @@ async function main(): Promise<void> {
     await must("notion_undo", { undo_id: r.undo_id });
     const p = (await call(() => n.pages.retrieve({ page_id: r.page_id }))) as unknown as Json;
     expect(p.in_trash === true, "sub-page not trashed");
+  });
+  await step("notion_template: preview and render a built-in template with a chart; undo", async () => {
+    const vars = { topic: `${stamp} smoke`, question: "Does it render?", summary: "Yes.", data: [{ x: "A", y: 2 }, { x: "B", y: 5 }], findings: [{ finding: "Works", evidence: "This run", source: "smoke" }] };
+    const pv = await must("notion_template", { action: "preview", name: "research-dossier", variables: vars });
+    expect(pv.charts?.length === 1 && pv.blocks > 5, JSON.stringify(pv).slice(0, 300));
+    const r = await must("notion_template", { action: "render", name: "research-dossier", variables: vars, parent: pageId });
+    createdPages.push(r.page_id);
+    const kids = (await call(() => n.blocks.children.list({ block_id: r.page_id }))) as unknown as Json;
+    expect(kids.results.some((b: Json) => b.type === "image") && kids.results.some((b: Json) => b.type === "toggle"), "chart image or data table missing");
+    await must("notion_undo", { undo_id: r.undo_id });
   });
   await step("notion_doctor: every check passes against the test workspace", async () => {
     const r = await tool("notion_doctor", {});

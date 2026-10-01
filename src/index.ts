@@ -10,6 +10,7 @@ import { registerContentTools } from "./tools/content.js";
 import { registerDatabaseTools } from "./tools/database.js";
 import { registerVisualTools } from "./tools/visuals.js";
 import { registerDoctorTools } from "./tools/doctor.js";
+import { registerTemplateTools } from "./tools/templates.js";
 import { VERSION } from "./version.js";
 import { journalWrites } from "./tools/util.js";
 import { config, redactedSummary } from "./config.js";
@@ -46,6 +47,7 @@ registerVisualTools(server);
 registerSafetyTools(server);
 registerAutomationTools(server);
 registerDoctorTools(server);
+registerTemplateTools(server);
 
 async function main(): Promise<void> {
   // Settings are checked once here. A bad value is logged with every problem listed; the server still starts, so

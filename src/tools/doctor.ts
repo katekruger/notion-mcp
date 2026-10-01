@@ -241,7 +241,11 @@ export function registerDoctorTools(server: McpServer): void {
             edit: "patch one block, insert at an exact spot, replace text, delete blocks, page title/icon/cover/lock/move",
             data: "update properties, bulk update and create (CSV), create databases, change schemas, templates",
             copy: `duplicate pages with sub-pages and databases (up to ${MAX_COPY_ROWS} rows per data source, ${MAX_COPY_BLOCKS} blocks per copy), copy or move blocks`,
-            visuals: "native database views (including charts), chart images (bar, line, area, scatter, pie, grouped, stacked), report pages",
+            visuals:
+              "native database views (including charts); chart images: bar, column, line, area, pie, donut, scatter, stacked and grouped, " +
+              "histogram, heatmap, box plot, waterfall, funnel, bullet, small multiples, dual-axis, treemap, plus raw Vega-Lite; reference " +
+              "lines, palettes, PNG or SVG, data tables as text alternatives; report pages",
+            templates: "reusable page templates with variables, loops, conditions, parts, slots, KPIs, charts, views, tables, Gantt; preview with diff",
             automations: "rules on conditions and schedules, resumable runs, export/import/deploy to GitHub Actions",
             safety: "dry runs, undo journal with conflict checks, notion_doctor",
           },

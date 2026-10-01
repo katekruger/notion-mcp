@@ -9,7 +9,7 @@ import type { DataSourceObjectResponse, PageObjectResponse } from "@notionhq/cli
 import { call, createPage, normalizeId, notion, read, updateBlock } from "./notion.js";
 import { buildWhereFilter, dataSourceTitle, resolveDataSource, resolvePropertyName, simplify } from "./schema.js";
 import { appendSpecs, type BlockSpec } from "./blocks.js";
-import { CHART_THEMES, CHART_TYPES, renderChart, type ChartRow, type ChartSpec } from "./charts.js";
+import { CHART_THEMES, CHART_TYPES, PALETTES, renderChart, type ChartFormat, type ChartRow, type ChartSpec } from "./charts.js";
 import { chartSourceSchema, parseMetric, pointsFromDatabase, pointsFromPages, type ChartSource } from "./chartdata.js";
 import { getChart, saveChart, saveImageCopy } from "./chartstore.js";
 import { viewRequest, type ViewSpec } from "./views.js";
@@ -49,6 +49,20 @@ export const chartSpecSchema = z
       .enum(CHART_THEMES)
       .optional()
       .describe("Image surface: light (default), dark (Notion's dark background), or transparent with gray text that reads in both themes"),
+    palette: z
+      .union([z.enum(Object.keys(PALETTES) as [string, ...string[]]), z.array(z.string().regex(/^#[0-9a-fA-F]{6}$/)).min(2).max(12)])
+      .optional()
+      .describe("Colors: default (validated colorblind-safe order), cool, warm, mono, or your brand's hex colors in slot order"),
+    bins: z.number().int().min(2).max(100).optional().describe("histogram: number of bins (default 20)"),
+    annotations: z
+      .array(
+        z
+          .object({ at: z.union([z.string(), z.number()]).optional(), value: z.number().optional(), label: z.string() })
+          .refine((a) => (a.at === undefined) !== (a.value === undefined), { message: "Give `at` (a category or x value) or `value` (a level), not both." })
+      )
+      .max(10)
+      .optional()
+      .describe('Reference lines with labels: {at: "Q2", label: "Launch"} marks a category; {value: 100, label: "Target"} marks a level'),
   })
   .strict();
 
@@ -80,12 +94,30 @@ export async function databaseIdOf(ds: DataSourceObjectResponse): Promise<string
   throw new Error("Couldn't find the database this data source belongs to.");
 }
 
-/** Render a chart image and upload it; returns the upload id and the PNG. */
-export async function renderAndUpload(spec: ChartSpec, points: ChartRow[]): Promise<{ uploadId: string; png: Uint8Array; notes: string[] }> {
-  const { png, notes } = await renderChart(spec, points);
-  const name = `${(spec.title ?? "chart").replace(/[^\w-]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "chart"}.png`;
-  const uploadId = await uploadBytes(png, name, "image/png");
-  return { uploadId, png, notes };
+function chartFileName(title: string | undefined, format: ChartFormat): string {
+  return `${(title ?? "chart").replace(/[^\w-]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "chart"}.${format}`;
+}
+
+/** Upload rendered chart bytes as an image file. */
+export async function uploadChart(bytes: Uint8Array, title: string | undefined, format: ChartFormat): Promise<string> {
+  return uploadBytes(bytes, chartFileName(title, format), format === "svg" ? "image/svg+xml" : "image/png");
+}
+
+/** Render a chart image and upload it; returns the upload id, the image, and a sentence describing it. */
+export async function renderAndUpload(spec: ChartSpec, points: ChartRow[], format: ChartFormat = "png"): Promise<{ uploadId: string; png: Uint8Array; notes: string[]; alt: string }> {
+  const r = await renderChart(spec, points, format);
+  const uploadId = await uploadChart(r.bytes, spec.title, format);
+  return { uploadId, png: r.bytes, notes: r.notes, alt: r.alt };
+}
+
+/** Blocks that carry a chart's data in text: its description and a table (first 100 rows), in a toggle. */
+export function chartDataBlocks(alt: string, rows: ChartRow[]): BlockSpec {
+  const hasSeries = rows.some((r) => r.series !== undefined);
+  const header = hasSeries ? ["Category", "Series", "Value"] : ["Category", "Value"];
+  const body = rows.slice(0, 100).map((r) => (hasSeries ? [String(r.x), r.series ?? "", String(r.y)] : [String(r.x), String(r.y)]));
+  const children: BlockSpec[] = [{ type: "paragraph", text: alt }, { type: "table", header_row: true, rows: [header, ...body] }];
+  if (rows.length > 100) children.push({ type: "paragraph", text: `…and ${rows.length - 100} more rows.`, color: "gray" });
+  return { type: "toggle", text: "Chart data", children };
 }
 
 function today(): string {
@@ -130,7 +162,7 @@ export async function refreshChart(args: RefreshArgs): Promise<{ undo: UndoOp[];
         // Without a copy, the refresh still happens; it's just recorded as not undoable.
       }
     }
-    const { uploadId, notes } = await renderAndUpload(spec, points);
+    const { uploadId, notes } = await renderAndUpload(spec, points, stored?.format ?? "png");
     const cap = caption ? textToTitle(caption) : captionFor(spec, got?.label);
     await call(() => updateBlock({ block_id: blockId, image: { file_upload: { id: uploadId }, caption: cap } }));
     const now = new Date().toISOString();

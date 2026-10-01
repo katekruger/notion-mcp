@@ -28,7 +28,7 @@ if (!bundle) {
 // What the server should expose: the same tool modules, registered in-process from the build.
 const expected = new Map();
 const registry = { registerTool: (name, config) => expected.set(name, config) };
-for (const f of ["read", "pages", "blocks", "schema", "automations", "content", "database", "visuals", "doctor"]) {
+for (const f of ["read", "pages", "blocks", "schema", "automations", "content", "database", "visuals", "doctor", "templates"]) {
   const mod = await import(pathToFileURL(path.join(root, "dist", "tools", `${f}.js`)).href);
   for (const [k, fn] of Object.entries(mod)) if (k.startsWith("register") && typeof fn === "function") fn(registry);
 }

@@ -26,6 +26,7 @@ const mods = await Promise.all([
   import("../src/tools/visuals.js"),
   import("../src/tools/automations.js"),
   import("../src/tools/doctor.js"),
+  import("../src/tools/templates.js"),
 ]);
 for (const m of mods) for (const [k, fn] of Object.entries(m)) if (k.startsWith("register") && typeof fn === "function") fn(registry as never);
 

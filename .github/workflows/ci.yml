@@ -27,3 +27,20 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
       - name: Lint, typecheck, tests with coverage thresholds, build
         run: npm run check
+
+  docker:
+    # Builds the webhook-mode image and checks that it starts, verifies signatures, and answers /healthz.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: docker build -t notion-plus:ci .
+      - name: Container starts and serves the webhook endpoint
+        run: |
+          docker run -d --name np -p 8787:8787 -e NOTION_TOKEN=secret_dummy -e NOTION_PLUS_WORKSPACE=ci \
+            -e NOTION_PLUS_WEBHOOK_TOKEN=ci_token_123456 notion-plus:ci
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8787/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8787/healthz | grep -q '"ok":true'
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{"id":"x"}' http://127.0.0.1:8787/notion/webhook)
+          test "$code" = 401
+      - if: always()
+        run: docker logs np || true

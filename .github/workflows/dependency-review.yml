@@ -17,7 +17,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The review needs the Dependency graph (Settings → Advanced Security). When it's off, say so and skip
+      # rather than fail every PR on a repository setting; CI's `npm audit` still guards runtime dependencies.
+      - name: Check that the Dependency graph is on
+        id: graph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${{ github.repository }}/dependency-graph/sbom" --silent 2>/dev/null; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Dependency graph is off, so dependency review was skipped. Turn it on at https://github.com/${{ github.repository }}/settings/security_analysis"
+            {
+              echo "## Dependency review skipped"
+              echo "Turn on **Dependency graph** in Settings → Advanced Security (https://github.com/${{ github.repository }}/settings/security_analysis) to enable it."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        if: steps.graph.outputs.enabled == 'true'
         with:
           fail-on-severity: high
           comment-summary-in-pr: on-failure

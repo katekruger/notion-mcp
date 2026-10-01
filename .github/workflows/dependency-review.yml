@@ -17,3 +17,11 @@ jobs:
         with:
           fail-on-severity: high
           comment-summary-in-pr: on-failure
+      - name: Explain a setup failure
+        if: failure()
+        run: |
+          {
+            echo "## Dependency review failed"
+            echo "If the log says *Dependency review is not supported on this repository*, turn on **Dependency graph** in"
+            echo "Settings → Advanced Security (https://github.com/${{ github.repository }}/settings/security_analysis), then re-run this job."
+          } >> "$GITHUB_STEP_SUMMARY"

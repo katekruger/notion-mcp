@@ -37,8 +37,9 @@ jobs:
 
   release:
     needs: bundle
-    # Publish whatever bundles were built; a missing platform shows up as a failed bundle job.
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    # Publish whatever bundles were built; a missing platform shows up as a failed bundle job. A manual run (a dry
+    # run) goes through the checksums and SBOM too, and only a tag attests and publishes.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -54,11 +55,15 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - run: cd src && npm ci --omit=dev --ignore-scripts && npm sbom --omit=dev --sbom-format cyclonedx > ../bundles/sbom.cdx.json
+      # npm sbom checks the whole installed tree, dev dependencies included, so install everything and leave the dev
+      # ones out of the SBOM itself. Scripts stay off: nothing here needs to build.
+      - run: cd src && npm ci --ignore-scripts && npm sbom --omit=dev --sbom-format cyclonedx > ../bundles/sbom.cdx.json
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           subject-path: bundles/*.mcpb
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: |
             bundles/*.mcpb

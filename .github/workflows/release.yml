@@ -58,7 +58,7 @@ jobs:
       # npm sbom checks the whole installed tree, dev dependencies included, so install everything and leave the dev
       # ones out of the SBOM itself. Scripts stay off: nothing here needs to build.
       - run: cd src && npm ci --ignore-scripts && npm sbom --omit=dev --sbom-format cyclonedx > ../bundles/sbom.cdx.json
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           subject-path: bundles/*.mcpb

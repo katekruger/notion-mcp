@@ -36,7 +36,7 @@
     "@notionhq/client": "^5.26.0",
     "@resvg/resvg-js": "^2.6.2",
     "vega": "^6.4.0",
-    "vega-lite": "^6.4.3",
+    "vega-lite": "^6.5.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
